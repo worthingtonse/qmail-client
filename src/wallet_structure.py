@@ -41,6 +41,7 @@ WALLET_SUBFOLDERS = [
     "Gallery",              # Gallery storage
     "Personal",             # Personal items
     "Attachments",          # Email attachments
+    "Bank",                 # Authenticated CloudCoins (good coins)
     "Bucket",               # Temporary bucket storage
     "Contacts",             # Contact information
     "Duplicates",           # Duplicate coins

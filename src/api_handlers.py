@@ -2491,6 +2491,118 @@ def handle_draft_update(request_handler, context):
 
 
 # ============================================================================
+# WALLET BALANCE ENDPOINTS
+# ============================================================================
+
+def handle_wallet_balance(request_handler, context):
+    """
+    GET /api/wallet/balance - Get wallet balance for Default wallet
+
+    No parameters needed - QMail uses fixed wallet location at Data/Wallets/Default.
+    Scans Bank, Fracked, and Limbo folders for .bin CloudCoin files.
+
+    Returns:
+        200 with JSON balance information:
+        {
+            "status": "success",
+            "type": "wallet-balance",
+            "wallet_path": "Data/Wallets/Default",
+            "wallet_name": "Default",
+            "total_coins": 247,
+            "total_value": 1250.5,
+            "folders": {
+                "bank_coins": 200,
+                "bank_value": 1000.0,
+                "fracked_coins": 45,
+                "fracked_value": 225.5,
+                "limbo_coins": 2,
+                "limbo_value": 25.0
+            },
+            "denominations": {
+                "bank": {"1": 50, "100": 10, "0.1": 5, ...},
+                "fracked": {"1": 10, "100": 1, ...},
+                "limbo": {"1": 2, ...}
+            }
+        }
+
+        500 if wallet structure doesn't exist or scan fails
+    """
+    from src.wallet_structure import get_wallet_subfolder, get_wallet_path, DEFAULT_WALLET
+    from src.coin_scanner import scan_wallet_folders
+
+    app_ctx = request_handler.server_instance.app_context
+    logger = app_ctx.logger_handle if hasattr(app_ctx, 'logger_handle') else None
+
+    try:
+        # Get wallet paths - QMail uses fixed "Default" wallet
+        wallet_name = DEFAULT_WALLET
+        wallet_base_path = get_wallet_path(wallet_name)
+
+        # Build folder paths
+        bank_path = get_wallet_subfolder(wallet_name, "Bank")
+        fracked_path = get_wallet_subfolder(wallet_name, "Fracked")
+        limbo_path = get_wallet_subfolder(wallet_name, "Limbo")
+
+        # Check if wallet exists
+        if not os.path.exists(wallet_base_path):
+            request_handler.send_json_response(500, {
+                "status": "error",
+                "error": "Wallet not initialized",
+                "details": f"Wallet directory not found: {wallet_base_path}",
+                "suggestion": "Initialize wallet structure first"
+            })
+            return
+
+        # Validate critical folder structure
+        missing_folders = []
+        warnings = []
+
+        for folder_name, folder_path in [("Bank", bank_path), ("Fracked", fracked_path), ("Limbo", limbo_path)]:
+            if not os.path.exists(folder_path):
+                missing_folders.append(folder_name)
+                if logger:
+                    from src.logger import log_warning
+                    log_warning(logger, "API", f"Missing wallet folder: {folder_name} at {folder_path}")
+
+        # If critical folders are missing, warn but continue (will return 0 balance for those folders)
+        if missing_folders:
+            warnings.append(f"Missing folders: {', '.join(missing_folders)}. Wallet may not be properly initialized.")
+
+        # Scan all folders
+        balance_info = scan_wallet_folders(bank_path, fracked_path, limbo_path, logger)
+
+        # Build response matching C API format
+        response = {
+            "status": "success",
+            "type": "wallet-balance",
+            "wallet_path": wallet_base_path,
+            "wallet_name": wallet_name,
+            "total_coins": balance_info["total_coins"],
+            "total_value": balance_info["total_value"],
+            "folders": balance_info["folders"],
+            "denominations": balance_info["denominations"]
+        }
+
+        # Add warnings if any folders are missing
+        if warnings:
+            response["warnings"] = warnings
+
+        request_handler.send_json_response(200, response)
+
+    except Exception as e:
+        # Log error and return 500
+        if logger:
+            from src.logger import log_error
+            log_error(logger, "API", f"Wallet balance error: {e}")
+
+        request_handler.send_json_response(500, {
+            "status": "error",
+            "error": "Failed to calculate wallet balance",
+            "details": str(e)
+        })
+
+
+# ============================================================================
 # ROUTE REGISTRATION HELPER
 # ============================================================================
 
@@ -2533,6 +2645,9 @@ def register_all_routes(server):
     server.register_route('POST', '/api/admin/sync', handle_sync)
     server.register_route('GET', '/api/admin/servers/parity', handle_get_parity_server)
     server.register_route('POST', '/api/admin/servers/parity', handle_set_parity_server)
+
+    # Wallet operations
+    server.register_route('GET', '/api/wallet/balance', handle_wallet_balance)
 
     # Task operations
     server.register_route('GET', '/api/task/status/{id}', handle_task_status)
