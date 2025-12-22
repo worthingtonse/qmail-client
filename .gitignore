@@ -1,0 +1,9 @@
+txp/
+docs/
+Data/
+build/
+logs/
+config/
+.claude/
+nul
+*.txt

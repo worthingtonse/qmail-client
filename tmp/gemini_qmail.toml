@@ -1,0 +1,242 @@
+# ==============================================================================
+# QMail Client Core - Configuration File
+# Format: TOML (https://toml.io)
+# Version: Phase I
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# PATHS & FILES
+# All paths are relative to the application root.
+# ------------------------------------------------------------------------------
+[paths]
+db_path = "Data/qmail.db"              # SQLite database
+log_path = "Data/mail.mlog"            # Application log file
+attachments_path = "Data/attachments"  # External attachment storage
+
+# ------------------------------------------------------------------------------
+# USER IDENTITY
+# Defines the active user mailbox for the client.
+# This info is required for all server communications.
+# Note: Available wallets are discovered at runtime from 'build/Data/Wallets/'.
+# The user must select one and configure the details here.
+# ------------------------------------------------------------------------------
+[identity]
+coin_type = 6                          # 0x0006 = CloudCoin V3
+denomination = 1                       # Coin denomination (e.g., 1, 5, 25)
+serial_number = 0                      # 4-byte mailbox serial number. MUST BE SET BY USER.
+device_id = 1                          # 16-bit device identifier for this client instance.
+
+# ------------------------------------------------------------------------------
+# ENCRYPTION
+# Mode determines the authentication method for server requests.
+# ------------------------------------------------------------------------------
+[encryption]
+enabled = true
+mode = 1                               # 1 = Mode B (AN-based auth), 6 = Mode A (Session-based auth)
+
+# ------------------------------------------------------------------------------
+# BEACON MONITORING
+# The beacon is a long-polling service that notifies the client of new mail.
+# ------------------------------------------------------------------------------
+[beacon]
+url = "tcp://168.220.219.199:50014"     # The default beacon server is RAIDA #14.
+interval_sec = 600                     # Poll interval if not using a persistent connection (10 minutes).
+timeout_sec = 600                      # Timeout for the long-poll request itself.
+
+# ------------------------------------------------------------------------------
+# RAID / STRIPING
+# Configuration for how data is split across the QMail storage servers.
+# The stripe size is calculated dynamically at runtime, not configured here.
+# ------------------------------------------------------------------------------
+[raid]
+data_stripe_count = 4                  # Number of data stripes.
+parity_stripe_count = 1                # Number of parity stripes for redundancy.
+
+# ------------------------------------------------------------------------------
+# NETWORK
+# Default connection settings for server communication.
+# ------------------------------------------------------------------------------
+[network]
+connection_timeout_ms = 5000           # How long to wait for a TCP connection to be established.
+read_timeout_ms = 30000                # How long to wait for a response from a server.
+max_retries = 3                        # Default number of retries on a failed network operation.
+
+# ------------------------------------------------------------------------------
+# THREAD POOL
+# Manages worker threads for parallel operations like uploading/downloading stripes.
+# ------------------------------------------------------------------------------
+[threading]
+pool_size = 5                          # Must be at least 5 to handle all QMail stripe servers concurrently.
+
+# ------------------------------------------------------------------------------
+# REST API SERVER
+# The local HTTP server that exposes the client's functionality to a GUI.
+# The port is intentionally not set here. It must be specified via a
+# command-line argument: --port <number>
+# ------------------------------------------------------------------------------
+[api]
+enabled = true
+host = "127.0.0.1"                     # Bind address. '127.0.0.1' is recommended for security.
+
+# ------------------------------------------------------------------------------
+# LOGGING
+# Configuration for the application's log file.
+# ------------------------------------------------------------------------------
+[logging]
+level = "info"                         # Verbosity level: "debug", "info", "warning", "error".
+max_size_mb = 10                       # Log file size at which to rotate the log.
+backup_count = 3                       # Number of old log files to keep after rotation.
+
+# ------------------------------------------------------------------------------
+# QMAIL SERVERS (5 total)
+# These are the designated storage servers for stripe distribution (4 data + 1 parity).
+# ------------------------------------------------------------------------------
+[[qmail_servers]]
+address = "47.229.9.94"
+port = 50001
+
+[[qmail_servers]]
+address = "124.187.106.233"
+port = 50009
+
+[[qmail_servers]]
+address = "113.30.247.109"
+port = 50013
+
+[[qmail_servers]]
+address = "168.220.219.199"
+port = 50014
+
+[[qmail_servers]]
+address = "125.236.210.184"
+port = 50021
+
+# ------------------------------------------------------------------------------
+# RAIDA / GUARDIAN SERVERS (25 total)
+# Used for RAIDA network discovery and various CloudCoin operations.
+# Index 14 is the designated beacon server for QMail.
+# ------------------------------------------------------------------------------
+[[raida_servers]]
+index = 0
+address = "78.46.170.45"
+port = 50000
+
+[[raida_servers]]
+index = 1
+address = "47.229.9.94"
+port = 50001
+
+[[raida_servers]]
+index = 2
+address = "209.46.126.167"
+port = 50002
+
+[[raida_servers]]
+index = 3
+address = "116.203.157.233"
+port = 50003
+
+[[raida_servers]]
+index = 4
+address = "95.183.51.104"
+port = 50004
+
+[[raida_servers]]
+index = 5
+address = "31.163.201.90"
+port = 50005
+
+[[raida_servers]]
+index = 6
+address = "52.14.83.91"
+port = 50006
+
+[[raida_servers]]
+index = 7
+address = "161.97.169.229"
+port = 50007
+
+[[raida_servers]]
+index = 8
+address = "13.234.55.11"
+port = 50008
+
+[[raida_servers]]
+index = 9
+address = "124.187.106.233"
+port = 50009
+
+[[raida_servers]]
+index = 10
+address = "94.130.179.247"
+port = 50010
+
+[[raida_servers]]
+index = 11
+address = "67.181.90.11"
+port = 50011
+
+[[raida_servers]]
+index = 12
+address = "3.16.169.178"
+port = 50012
+
+[[raida_servers]]
+index = 13
+address = "113.30.247.109"
+port = 50013
+
+[[raida_servers]]
+index = 14
+address = "168.220.219.199"
+port = 50014
+
+[[raida_servers]]
+index = 15
+address = "185.37.61.73"
+port = 50015
+
+[[raida_servers]]
+index = 16
+address = "193.7.195.250"
+port = 50016
+
+[[raida_servers]]
+index = 17
+address = "5.161.63.179"
+port = 50017
+
+[[raida_servers]]
+index = 18
+address = "76.114.47.144"
+port = 50018
+
+[[raida_servers]]
+index = 19
+address = "190.105.235.113"
+port = 50019
+
+[[raida_servers]]
+index = 20
+address = "184.18.166.118"
+port = 50020
+
+[[raida_servers]]
+index = 21
+address = "125.236.210.184"
+port = 50021
+
+[[raida_servers]]
+index = 22
+address = "5.161.123.254"
+port = 50022
+
+[[raida_servers]]
+index = 23
+address = "130.255.77.156"
+port = 50023
+
+[[raida_servers]]
+index = 24
+address = "209.205.66.24"
+port = 50024
