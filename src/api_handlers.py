@@ -18,6 +18,8 @@ import json
 import re
 from math import ceil
 from typing import Any, Dict, Optional, Tuple
+from src.task_manager import create_task, start_task, TaskErrorCode
+import time
 
 # Database imports for real implementations
 from src.database import (
@@ -144,7 +146,6 @@ def handle_ping(request_handler, context):
 # ============================================================================
 # MAIL ENDPOINTS
 # ============================================================================
-
 def handle_mail_send(request_handler, context):
     """
     POST /api/mail/send - Send an email
@@ -175,9 +176,7 @@ def handle_mail_send(request_handler, context):
 
     Returns 202 Accepted with task_id for async processing.
     """
-    from src.email_sender import (
-        send_email_async, validate_request, SendEmailErrorCode
-    )
+    from src.email_sender import send_email_async, SendEmailErrorCode, validate_request
     from src.qmail_types import SendEmailRequest
 
     app_ctx = request_handler.server_instance.app_context
@@ -242,7 +241,17 @@ def handle_mail_send(request_handler, context):
         request_obj.storage_weeks = email_data.get('storage_weeks', 8)
 
     # Validate request
-    err, err_msg = validate_request(request_obj, app_ctx.logger_handle)
+    try:
+        # We call it without the second argument to avoid the LoggerHandle mismatch
+        err, err_msg = validate_request(request=request_obj)
+    except Exception as e:
+        print(f"CRITICAL: Validation crashed! Error: {e}")
+        request_handler.send_json_response(500, {
+            "error": f"Validation logic error: {e}",
+            "status": "error"
+        })
+        return
+
     if err != SendEmailErrorCode.SUCCESS:
         request_handler.send_json_response(400, {
             "error": err_msg,
@@ -266,53 +275,60 @@ def handle_mail_send(request_handler, context):
             for i in range(5)
         ]
 
-    # Send email asynchronously
-    # Note: In production, this would be dispatched to a background task
-    # For now, we process synchronously but return immediately with task_id
-    task_id = f"send_{int(time.time() * 1000)}"
+    # 1. Register the task with the actual Task Manager
+    try:
+        err_task, task_id = create_task(
+            app_ctx.task_manager,
+            task_type="send",
+            params={"subject": request_obj.subject}
+        )
+    except NameError:
+        request_handler.send_json_response(500, {"error": "TaskManager functions not imported"})
+        return
+
+    # 2. Mark it as starting (transitions state from PENDING to RUNNING)
+    start_task(app_ctx.task_manager, task_id, "Initializing send process")
 
     # Get identity from config
     identity = app_ctx.config.identity if hasattr(app_ctx, 'config') and app_ctx.config else None
 
-    # For async processing, we would submit to thread pool here
-    # For now, return accepted immediately and let client poll for status
     response = {
         "status": "accepted",
         "task_id": task_id,
         "message": "Email queued for sending",
-        "file_group_guid": "",  # Will be set when processing starts
+        "file_group_guid": "",
         "file_count": 1 + len(request_obj.attachment_paths),
-        "estimated_cost": 0.0  # Will be calculated during processing
+        "estimated_cost": 0.0
     }
 
     # If thread pool is available, submit for background processing
     if hasattr(app_ctx, 'thread_pool') and app_ctx.thread_pool:
-        def process_send():
-            err, result = send_email_async(
-                request_obj, identity, app_ctx.db_handle, servers,
-                app_ctx.thread_pool, None, app_ctx.logger_handle
-            )
-            # Store result for polling via /api/task/status/{task_id}
-            if hasattr(app_ctx, 'task_results'):
-                app_ctx.task_results[task_id] = {
-                    'status': 'COMPLETED' if result.success else 'FAILED',
-                    'result': {
-                        'success': result.success,
-                        'error_code': int(result.error_code),
-                        'error_message': result.error_message,
-                        'file_group_guid': result.file_group_guid.hex() if result.file_group_guid else '',
-                        'file_count': result.file_count,
-                        'total_cost': result.total_cost
-                    }
-                }
+            def process_send():
+                from src.task_manager import update_task_progress, complete_task, fail_task
 
-        app_ctx.thread_pool.submit(process_send)
+                # This is the "messenger" that send_email_async uses to report progress
+                def update_progress(internal_state):
+                    update_task_progress(app_ctx.task_manager, task_id, internal_state.progress, internal_state.message)
+
+                err, result = send_email_async(
+                    request_obj, identity, app_ctx.db_handle, servers,
+                    app_ctx.thread_pool.executor, 
+                    update_progress, # <--- We pass the messenger here
+                    app_ctx.logger
+                )
+                
+                # FINAL STEP: Move the task to a finished state
+                if result.success:
+                    # result.__dict__ stores all the final GUIDs and costs for the user to see
+                    complete_task(app_ctx.task_manager, task_id, result.__dict__, "Email sent successfully")
+                else:
+                    fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
+
+            app_ctx.thread_pool.executor.submit(process_send)
     else:
-        # Synchronous processing (for testing without thread pool)
         response["message"] = "Email queued (no thread pool - will process on next poll)"
 
     request_handler.send_json_response(202, response)
-
 
 def handle_mail_download(request_handler, context):
     """

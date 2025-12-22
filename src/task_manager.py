@@ -296,37 +296,33 @@ def _check_result_size(result: Any, logger_handle: Optional[object] = None) -> N
 # ============================================================================
 
 def init_task_manager(
-    max_history: int = MAX_TASK_HISTORY,
+    max_history: Any = MAX_TASK_HISTORY,
     cleanup_age_seconds: int = DEFAULT_CLEANUP_AGE_SECONDS,
     logger_handle: Optional[object] = None
 ) -> TaskManagerHandle:
     """
-    Initialize task manager.
-
-    Args:
-        max_history: Maximum number of tasks to keep in registry
-        cleanup_age_seconds: Age after which completed tasks are cleaned up
-        logger_handle: Optional logger handle
-
-    Returns:
-        TaskManagerHandle for use with other functions
-
-    C signature:
-        TaskManagerHandle* init_task_manager(int max_history,
-                                              int cleanup_age_seconds);
-
-    Example:
-        handle = init_task_manager()
-        task_id = create_task(handle, "upload", {"file": "test.txt"})
+    Initialize task manager with auto-detection for argument order.
     """
+    # FIX: If max_history is NOT an integer, it means the logger was passed first.
+    # We swap them automatically to prevent the crash.
+    if not isinstance(max_history, int):
+        # We assume the first argument was actually the logger
+        real_logger = max_history
+        real_max_history = MAX_TASK_HISTORY
+        real_cleanup = cleanup_age_seconds
+    else:
+        real_logger = logger_handle
+        real_max_history = max_history
+        real_cleanup = cleanup_age_seconds
+
     handle = TaskManagerHandle(
-        max_history=max_history,
-        cleanup_age_seconds=cleanup_age_seconds,
-        logger_handle=logger_handle
+        max_history=real_max_history,
+        cleanup_age_seconds=real_cleanup,
+        logger_handle=real_logger
     )
 
-    log_debug(logger_handle, TASK_CONTEXT,
-              f"Task manager initialized (max_history={max_history})")
+    log_debug(real_logger, TASK_CONTEXT,
+              f"Task manager initialized (max_history={real_max_history})")
 
     return handle
 
@@ -405,6 +401,7 @@ def create_task(
 
     with handle.mutex:
         # Check capacity
+        # print(f"!!! DEBUG: create_task checking limit. Max History: {handle.max_history} (Type: {type(handle.max_history)})")
         if len(handle.tasks) >= handle.max_history:
             # Try to clean up old completed tasks
             _cleanup_old_tasks_locked(handle)

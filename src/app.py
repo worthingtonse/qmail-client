@@ -21,9 +21,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-# Ensure proper path setup for imports
-_src_dir = os.path.dirname(os.path.abspath(__file__))
-_project_root = os.path.dirname(_src_dir)
+# Detect if running as a bundled EXE or as a script
+if getattr(sys, 'frozen', False):
+    # Running as EXE: Use the directory of the executable
+    _project_root = os.path.dirname(sys.executable)
+else:
+    # Running as script: Use the directory of app.py and go up one level
+    _src_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_root = os.path.dirname(_src_dir)
 
 # Add project root to path so 'src' can be imported as a package
 if _project_root not in sys.path:
@@ -313,7 +318,8 @@ def initialize_application(args):
 
     # Initialize task manager
     print("[INIT] Initializing task manager...")
-    task_manager = init_task_manager(logger)
+    task_manager = init_task_manager(logger_handle= logger)
+    # print(f"!!! DEBUG: Task Manager Max History is {task_manager.max_history} (Should be 1000) !!!")
     if task_manager is None:
         log_error(logger, "App", "Failed to initialize task manager")
         print("[ERROR] Failed to initialize task manager")
