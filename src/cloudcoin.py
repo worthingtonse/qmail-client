@@ -1138,6 +1138,260 @@ def transfer_coins(
 
 
 # ============================================================================
+# CLOUDCOIN BINARY FILE FORMAT
+# ============================================================================
+# Binary file format for CloudCoin .bin files:
+#   - File Header: 32 bytes
+#   - Coin Header: 7 bytes
+#   - Coin Body: 400 bytes (25 ANs x 16 bytes each)
+# Total: 439 bytes per single-coin file
+
+# File format constants
+CC_FILE_FORMAT_VERSION = 0x01
+CC_COIN_ID = 0x0006  # CloudCoin identifier
+CC_ENCRYPTION_NONE = 0x00
+CC_RAIDA_COUNT = 25
+CC_AN_LENGTH = 16
+CC_POWN_STRING_LENGTH = 25
+
+# POWN status nibble values (4 bits per RAIDA)
+POWN_PASS = 0x0      # 'p' - passed authentication
+POWN_FAIL = 0x1      # 'f' - failed authentication
+POWN_UNTRIED = 0x2   # 'u' - not yet tried
+POWN_ERROR = 0x3     # 'e' - network error
+POWN_NO_RESPONSE = 0x4  # 'n' - no response
+
+
+@dataclass
+class LockerCoin:
+    """
+    Represents a CloudCoin downloaded from a locker.
+
+    This class holds all the data needed to save a coin to a .bin file.
+    """
+    serial_number: int = 0
+    denomination: int = 0  # Signed int8: -7 to 11 (10^denom = value)
+    ans: List[bytes] = field(default_factory=lambda: [bytes(16)] * CC_RAIDA_COUNT)
+    pown_string: str = 'u' * CC_POWN_STRING_LENGTH  # 25 chars: p/f/u/e/n
+
+    def get_value(self) -> float:
+        """Calculate coin value from denomination code."""
+        if self.denomination == 11:  # Key/NFT coin
+            return 0.0
+        return 10.0 ** self.denomination
+
+
+def _char_to_pown_nibble(char: str) -> int:
+    """Convert POWN character to 4-bit nibble value."""
+    char = char.lower()
+    if char == 'p':
+        return POWN_PASS
+    elif char == 'f':
+        return POWN_FAIL
+    elif char == 'u':
+        return POWN_UNTRIED
+    elif char == 'e':
+        return POWN_ERROR
+    elif char == 'n':
+        return POWN_NO_RESPONSE
+    else:
+        return POWN_UNTRIED  # Default to untried
+
+
+def _encode_pown_bytes(pown_string: str) -> bytes:
+    """
+    Encode 25-character POWN string to 13 bytes.
+
+    Each nibble (4 bits) represents one RAIDA result.
+    Byte layout:
+    - Byte 0: RAIDA 0 (high nibble) | RAIDA 1 (low nibble)
+    - Byte 1: RAIDA 2 (high nibble) | RAIDA 3 (low nibble)
+    - ...
+    - Byte 11: RAIDA 22 (high nibble) | RAIDA 23 (low nibble)
+    - Byte 12: RAIDA 24 (high nibble) | 0x9 (low nibble, padding marker)
+    """
+    if len(pown_string) < CC_POWN_STRING_LENGTH:
+        pown_string = pown_string.ljust(CC_POWN_STRING_LENGTH, 'u')
+
+    pown_bytes = bytearray(13)
+
+    for i in range(CC_POWN_STRING_LENGTH):
+        nibble = _char_to_pown_nibble(pown_string[i])
+        byte_idx = i // 2
+        if i % 2 == 0:
+            # High nibble
+            pown_bytes[byte_idx] = (nibble << 4) & 0xF0
+        else:
+            # Low nibble
+            pown_bytes[byte_idx] |= nibble & 0x0F
+
+    # Set padding marker in last byte's low nibble
+    pown_bytes[12] = (pown_bytes[12] & 0xF0) | 0x09
+
+    return bytes(pown_bytes)
+
+
+def generate_coin_filename(
+    denomination: int,
+    serial_number: int,
+    pown_string: str
+) -> str:
+    """
+    Generate filename for CloudCoin .bin file.
+
+    Format: {denomination}.{serial_number}.{pown_string}.bin
+    Example: 1.12345678.ppppppppppppppppppppppppp.bin
+
+    Args:
+        denomination: Coin denomination code (signed int8)
+        serial_number: Coin serial number
+        pown_string: 25-character POWN string
+
+    Returns:
+        Filename string
+    """
+    return f"{denomination}.{serial_number}.{pown_string}.bin"
+
+
+def write_coin_file(
+    filepath: str,
+    coin: LockerCoin,
+    logger_handle: Optional[object] = None
+) -> CloudCoinErrorCode:
+    """
+    Write a CloudCoin to .bin file format.
+
+    Binary format (439 bytes total):
+    - File Header: 32 bytes
+    - Coin Header: 7 bytes
+    - Coin Body: 400 bytes (25 ANs x 16 bytes)
+
+    File Header (32 bytes):
+    - [0]: File format version (0x01)
+    - [1]: Reserved (0x01)
+    - [2-3]: Coin ID (0x00 0x06, big-endian)
+    - [4]: Encryption type (0x00 = none)
+    - [5-7]: Reserved (zeros)
+    - [8-9]: Token count (0x00 0x01, big-endian, 1 coin)
+    - [10-15]: Reserved (zeros)
+    - [16-28]: POWN bytes (13 bytes)
+    - [29-31]: Padding (0x99 0x99 0x99)
+
+    Coin Header (7 bytes):
+    - [0]: Split (0x00)
+    - [1]: Denomination (int8, signed)
+    - [2-5]: Serial number (uint32, big-endian)
+    - [6]: Reserved (0x00)
+
+    Coin Body (400 bytes):
+    - [0-399]: 25 ANs, 16 bytes each
+
+    Args:
+        filepath: Path to write .bin file
+        coin: LockerCoin object with denomination, serial_number, ans[], pown_string
+        logger_handle: Optional logger handle
+
+    Returns:
+        CloudCoinErrorCode
+    """
+    import struct
+
+    try:
+        # Build file header (32 bytes)
+        file_header = bytearray(32)
+        file_header[0] = CC_FILE_FORMAT_VERSION  # Version
+        file_header[1] = 0x01  # Reserved
+        file_header[2] = (CC_COIN_ID >> 8) & 0xFF  # Coin ID high byte
+        file_header[3] = CC_COIN_ID & 0xFF  # Coin ID low byte
+        file_header[4] = CC_ENCRYPTION_NONE  # No encryption
+        # [5-7] reserved, already zeros
+        file_header[8] = 0x00  # Token count high byte
+        file_header[9] = 0x01  # Token count low byte (1 coin)
+        # [10-15] reserved, already zeros
+
+        # POWN bytes (13 bytes at positions 16-28)
+        pown_bytes = _encode_pown_bytes(coin.pown_string)
+        file_header[16:29] = pown_bytes
+
+        # Padding (0x99 0x99 0x99)
+        file_header[29] = 0x99
+        file_header[30] = 0x99
+        file_header[31] = 0x99
+
+        # Build coin header (7 bytes)
+        coin_header = bytearray(7)
+        coin_header[0] = 0x00  # Split
+        coin_header[1] = coin.denomination & 0xFF  # Denomination (signed int8)
+        # Serial number (uint32, big-endian)
+        coin_header[2:6] = struct.pack('>I', coin.serial_number)
+        coin_header[6] = 0x00  # Reserved
+
+        # Build coin body (400 bytes - 25 ANs)
+        coin_body = bytearray(400)
+        for i in range(CC_RAIDA_COUNT):
+            if i < len(coin.ans) and coin.ans[i]:
+                an = coin.ans[i]
+                if len(an) >= CC_AN_LENGTH:
+                    coin_body[i * CC_AN_LENGTH:(i + 1) * CC_AN_LENGTH] = an[:CC_AN_LENGTH]
+                else:
+                    # Pad short AN with zeros
+                    coin_body[i * CC_AN_LENGTH:i * CC_AN_LENGTH + len(an)] = an
+
+        # Write to file
+        with open(filepath, 'wb') as f:
+            f.write(file_header)
+            f.write(coin_header)
+            f.write(coin_body)
+
+        log_debug(logger_handle, CC_CONTEXT,
+                  f"Wrote coin file: SN={coin.serial_number}, DN={coin.denomination}")
+
+        return CloudCoinErrorCode.SUCCESS
+
+    except IOError as e:
+        log_error(logger_handle, CC_CONTEXT,
+                  f"Failed to write coin file: {filepath}", str(e))
+        return CloudCoinErrorCode.ERR_IO_ERROR
+    except Exception as e:
+        log_error(logger_handle, CC_CONTEXT,
+                  f"Unexpected error writing coin file: {filepath}", str(e))
+        return CloudCoinErrorCode.ERR_IO_ERROR
+
+
+def read_coin_denomination(filepath: str) -> Tuple[CloudCoinErrorCode, int]:
+    """
+    Read just the denomination from a coin file.
+
+    This is a quick way to get the value without reading the full file.
+    Denomination is at byte offset 34 (0-indexed).
+
+    Args:
+        filepath: Path to .bin file
+
+    Returns:
+        Tuple of (error_code, denomination)
+    """
+    import struct
+
+    try:
+        with open(filepath, 'rb') as f:
+            # Seek to denomination byte (32 header + 1 split + 1 denom = byte 34)
+            f.seek(33)
+            denom_byte = f.read(1)
+            if not denom_byte:
+                return CloudCoinErrorCode.ERR_IO_ERROR, 0
+
+            # Unpack as signed int8
+            denomination = struct.unpack('b', denom_byte)[0]
+            return CloudCoinErrorCode.SUCCESS, denomination
+
+    except IOError as e:
+        return CloudCoinErrorCode.ERR_IO_ERROR, 0
+    except Exception as e:
+        return CloudCoinErrorCode.ERR_IO_ERROR, 0
+
+
+# ============================================================================
 # MAIN (for testing)
 # ============================================================================
 

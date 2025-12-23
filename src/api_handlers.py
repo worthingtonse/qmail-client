@@ -2603,6 +2603,157 @@ def handle_wallet_balance(request_handler, context):
 
 
 # ============================================================================
+# LOCKER DOWNLOAD ENDPOINT
+# ============================================================================
+
+def handle_locker_download(request_handler, context):
+    """
+    POST /api/locker/download - Download CloudCoins from a RAIDA locker
+
+    Downloads coins using a locker code received from a Tell notification.
+    Coins are saved to the Fracked folder in the default wallet.
+
+    Request body:
+        {
+            "locker_code": "0102030405060708"  # 16 hex chars (8 bytes)
+        }
+
+    Returns:
+        200 with JSON success response:
+        {
+            "status": "success",
+            "type": "locker-download",
+            "coins_downloaded": 5,
+            "total_value": 127.0,
+            "coins": [
+                {
+                    "serial_number": 12345678,
+                    "denomination": 1,
+                    "value": 1.0,
+                    "pown": "ppppppppppppppppppppppppp",
+                    "pass_count": 25
+                },
+                ...
+            ]
+        }
+
+        400 if locker_code is missing or invalid
+        500 if download fails
+    """
+    import asyncio
+    from src.locker_download import download_from_locker, LockerDownloadResult
+    from src.wallet_structure import get_wallet_path, DEFAULT_WALLET
+
+    app_ctx = request_handler.server_instance.app_context
+    logger = app_ctx.logger_handle if hasattr(app_ctx, 'logger_handle') else None
+    db_handle = app_ctx.db_handle if hasattr(app_ctx, 'db_handle') else None
+
+    # Get request body
+    body = context.json if context.json else {}
+
+    # Validate locker_code
+    locker_code_hex = body.get('locker_code', '')
+    if not locker_code_hex:
+        request_handler.send_json_response(400, {
+            "status": "error",
+            "error": "Missing locker_code",
+            "details": "Request body must include 'locker_code' as 16-character hex string"
+        })
+        return
+
+    # Parse locker code
+    try:
+        locker_code = bytes.fromhex(locker_code_hex)
+        if len(locker_code) < 8:
+            raise ValueError("Locker code must be at least 8 bytes")
+    except ValueError as e:
+        request_handler.send_json_response(400, {
+            "status": "error",
+            "error": "Invalid locker_code format",
+            "details": str(e)
+        })
+        return
+
+    # Get wallet path
+    wallet_path = get_wallet_path(DEFAULT_WALLET)
+
+    # Run the async download function
+    try:
+        result, coins = asyncio.run(download_from_locker(
+            locker_code=locker_code,
+            wallet_path=wallet_path,
+            db_handle=db_handle,
+            logger_handle=logger
+        ))
+    except Exception as e:
+        if logger:
+            log_error(logger, "API", f"Locker download exception: {e}")
+        request_handler.send_json_response(500, {
+            "status": "error",
+            "error": "Locker download failed",
+            "details": str(e)
+        })
+        return
+
+    # Handle result
+    if result == LockerDownloadResult.SUCCESS:
+        # Build coin list for response
+        coin_list = []
+        total_value = 0.0
+        for coin in coins:
+            # Calculate value from denomination
+            value = 10.0 ** coin.denomination if coin.denomination != 11 else 0.0
+            total_value += value
+            pass_count = coin.pown_string.count('p')
+
+            coin_list.append({
+                "serial_number": coin.serial_number,
+                "denomination": coin.denomination,
+                "value": value,
+                "pown": coin.pown_string,
+                "pass_count": pass_count
+            })
+
+        request_handler.send_json_response(200, {
+            "status": "success",
+            "type": "locker-download",
+            "coins_downloaded": len(coins),
+            "total_value": total_value,
+            "coins": coin_list
+        })
+
+    elif result == LockerDownloadResult.ERR_LOCKER_EMPTY:
+        request_handler.send_json_response(200, {
+            "status": "success",
+            "type": "locker-download",
+            "coins_downloaded": 0,
+            "total_value": 0.0,
+            "coins": [],
+            "message": "Locker is empty"
+        })
+
+    else:
+        # Map error codes to messages
+        error_messages = {
+            LockerDownloadResult.ERR_INVALID_LOCKER_CODE: "Invalid locker code",
+            LockerDownloadResult.ERR_LOCKER_NOT_FOUND: "Locker not found",
+            LockerDownloadResult.ERR_NETWORK_ERROR: "Network error communicating with RAIDA",
+            LockerDownloadResult.ERR_INSUFFICIENT_RESPONSES: "Insufficient RAIDA responses for consensus",
+            LockerDownloadResult.ERR_FILE_WRITE_ERROR: "Failed to save coin files",
+            LockerDownloadResult.ERR_NO_RAIDA_SERVERS: "Could not get RAIDA server list",
+            LockerDownloadResult.ERR_KEY_DERIVATION_FAILED: "Key derivation failed",
+            LockerDownloadResult.ERR_PROTOCOL_ERROR: "Protocol error",
+        }
+        error_msg = error_messages.get(result, f"Unknown error ({result})")
+
+        request_handler.send_json_response(500, {
+            "status": "error",
+            "error": error_msg,
+            "error_code": int(result)
+        })
+
+
+# ============================================================================
 # ROUTE REGISTRATION HELPER
 # ============================================================================
 
@@ -2648,6 +2799,9 @@ def register_all_routes(server):
 
     # Wallet operations
     server.register_route('GET', '/api/wallet/balance', handle_wallet_balance)
+
+    # Locker operations
+    server.register_route('POST', '/api/locker/download', handle_locker_download)
 
     # Task operations
     server.register_route('GET', '/api/task/status/{id}', handle_task_status)

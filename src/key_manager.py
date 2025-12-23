@@ -13,6 +13,7 @@ def get_keys_from_locker_code(locker_code: Union[str, bytes]) -> List[bytes]:
     Generates 25 128-bit (16-byte) keys from a given locker code.
 
     Key derivation: key[i] = MD5(str(i) + locker_code) for i in 0..24
+    Then last 4 bytes are set to 0xFF (required by RAIDA locker protocol).
 
     The server ID is prepended to the locker code before hashing.
     Server ID is determined by port number: port 50011 -> server ID 11.
@@ -24,11 +25,14 @@ def get_keys_from_locker_code(locker_code: Union[str, bytes]) -> List[bytes]:
     For bytes input, the locker code is converted to hex string before
     key derivation to ensure consistent key generation.
 
+    IMPORTANT: The last 4 bytes are ALWAYS set to 0xFF as required by
+    the RAIDA locker protocol. This is not optional.
+
     Args:
         locker_code: The locker code as string or 8 bytes.
 
     Returns:
-        A list of 25 128-bit keys as bytes.
+        A list of 25 128-bit keys as bytes, each with last 4 bytes = 0xFF.
 
     Raises:
         ValueError: If locker code is empty or None.
@@ -36,9 +40,16 @@ def get_keys_from_locker_code(locker_code: Union[str, bytes]) -> List[bytes]:
     if not locker_code:
         raise ValueError("Locker code cannot be empty.")
 
-    # Convert bytes to hex string for consistent key derivation
+    # Convert bytes to string for key derivation
+    # Per the documentation, the locker code is used as a plain text string
+    # e.g., "QWV-ZKVY" becomes MD5("0QWV-ZKVY"), MD5("1QWV-ZKVY"), etc.
     if isinstance(locker_code, bytes):
-        locker_code_str = locker_code.hex()
+        # Try to decode as UTF-8/ASCII first (for string locker codes passed as bytes)
+        try:
+            locker_code_str = locker_code.decode('utf-8')
+        except UnicodeDecodeError:
+            # Fall back to hex only for truly binary data
+            locker_code_str = locker_code.hex()
     else:
         locker_code_str = str(locker_code)
 
@@ -47,7 +58,16 @@ def get_keys_from_locker_code(locker_code: Union[str, bytes]) -> List[bytes]:
         h = hashlib.md5()
         h.update(str(i).encode('utf-8'))           # Server ID FIRST
         h.update(locker_code_str.encode('utf-8'))  # Locker code SECOND
-        keys.append(h.digest())
+        key = bytearray(h.digest())
+
+        # Set last 4 bytes to 0xFF (required by RAIDA locker protocol)
+        # This is ALWAYS applied - it's a protocol requirement, not optional
+        key[12] = 0xFF
+        key[13] = 0xFF
+        key[14] = 0xFF
+        key[15] = 0xFF
+
+        keys.append(bytes(key))
     return keys
 
 
@@ -56,14 +76,14 @@ def get_decryption_key(locker_code: Union[str, bytes], server_id: int) -> bytes:
     Get the decryption key for a specific server.
 
     The key is derived from the locker code using MD5. Each server
-    has its own key based on its ID (0-24).
+    has its own key based on its ID (0-24). Last 4 bytes are set to 0xFF.
 
     Args:
         locker_code: The locker code as string or 8 bytes.
         server_id: Server ID (0-24), corresponds to RAIDA ID.
 
     Returns:
-        16-byte decryption key for the specified server.
+        16-byte decryption key for the specified server (with 0xFF padding).
 
     Raises:
         ValueError: If server_id is out of range (0-24).
