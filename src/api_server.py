@@ -1,4 +1,3 @@
-
 import http.server
 import socketserver
 import threading
@@ -51,7 +50,7 @@ class APIServer:
     This server is designed with zero external dependencies and incorporates
     feedback from peer reviews for robustness.
     """
-    def __init__(self, logger: Any, host: str = 'localhost', port: int = 8090):
+    def __init__(self, logger: Any, host: str = 'localhost', port: int = 8090, allowed_origins: List[str] = None):
         """
         Initializes the server but does not start it.
 
@@ -59,6 +58,7 @@ class APIServer:
             logger: A configured logger instance.
             host (str): The hostname or IP address to bind to.
             port (int): The port to listen on.
+            allowed_origins (List[str]): List of allowed CORS origins. If None, uses default list.
         """
         if not (1 <= port <= 65535):
             raise ValueError(f"Invalid port number: {port}. Must be between 1 and 65535.")
@@ -66,6 +66,24 @@ class APIServer:
         self.logger = logger
         self.host = host
         self.port = port
+        
+        # Default allowed origins for CORS (development + production)
+        if allowed_origins is None:
+            self.allowed_origins = [
+                # Development origins
+                'http://localhost:5173',
+                'http://127.0.0.1:5173',
+                'http://localhost:3000',
+                'http://127.0.0.1:3000',
+                'http://localhost:8080',
+                'http://127.0.0.1:8080',
+                # Production origins
+                'https://qmail.mycompany.com',         # Your actual domain
+                'https://www.qmail.mycompany.com',     # www version
+                'https://mail.mycompany.com',          # Alternative subdomain
+            ]
+        else:
+            self.allowed_origins = allowed_origins
         
         def handler_factory(*args, **kwargs):
             return RequestHandler(self, *args, **kwargs)
@@ -77,6 +95,7 @@ class APIServer:
         self.routes = []
         self.routes_lock = threading.Lock()
         log_info(self.logger, API_CONTEXT, f"API Server initialized. Ready to start on {self.host}:{self.port}")
+        log_info(self.logger, API_CONTEXT, f"CORS allowed origins: {', '.join(self.allowed_origins)}")
 
     def register_route(self, method: str, path_pattern: str, function: Callable[[RequestContext], None]):
         """
@@ -139,6 +158,26 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self.server_instance = server_instance
         self.logger = server_instance.logger
         super().__init__(*args, **kwargs)
+    
+    def _get_cors_origin(self):
+        """
+        Get appropriate CORS origin based on request Origin header.
+        
+        Returns:
+            str: The origin to include in Access-Control-Allow-Origin header
+        """
+        origin = self.headers.get('Origin', '')
+        
+        # Check if origin is in allowed list
+        if origin in self.server_instance.allowed_origins:
+            return origin
+        
+        # Default to first allowed origin (for non-browser requests without Origin header)
+        if self.server_instance.allowed_origins:
+            return self.server_instance.allowed_origins[0]
+        
+        # Fallback
+        return 'http://localhost:5173'
         
     def _dispatch(self):
         """
@@ -209,20 +248,37 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self): self._dispatch()
     def do_PUT(self): self._dispatch()
     def do_DELETE(self): self._dispatch()
+    
+    def do_OPTIONS(self):
+        """Handle OPTIONS preflight requests for CORS."""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', self._get_cors_origin())
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.send_header('Access-Control-Max-Age', '3600')
+        self.end_headers()
         
     def send_json_response(self, status_code: int, data: Any):
-        """Sends a JSON response."""
+        """Sends a JSON response with CORS headers."""
         self.send_response(status_code)
         self.send_header("Content-type", "application/json")
         self.send_header("Server", self.server_version)
+        # CORS headers
+        self.send_header('Access-Control-Allow-Origin', self._get_cors_origin())
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode('utf-8'))
 
     def send_text_response(self, status_code: int, data: str):
-        """Sends a plain text response."""
+        """Sends a plain text response with CORS headers."""
         self.send_response(status_code)
         self.send_header("Content-type", "text/plain")
         self.send_header("Server", self.server_version)
+        # CORS headers
+        self.send_header('Access-Control-Allow-Origin', self._get_cors_origin())
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
         self.wfile.write(data.encode('utf-8'))
 
