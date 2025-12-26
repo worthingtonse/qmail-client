@@ -66,6 +66,88 @@ except ImportError:
 
 
 
+# def init_beacon(
+#     identity_config: IdentityConfig,
+#     beacon_config: BeaconConfig,
+#     network_config: NetworkConfig,
+#     key_file_path: str,
+#     state_file_path: str,
+#     logger_handle: Optional[object] = None
+# ) -> Optional[BeaconHandle]:
+#     """
+#     Initializes the Beacon Manager handle. Supports .key files and keys.txt.
+#     Initializes the Beacon Manager handle.
+
+#     Args:
+#         identity_config: User's identity information.
+#         beacon_config: Beacon server configuration.
+#         network_config: Network timeout settings.
+#         key_file_path: Path to the user's key file.
+#         state_file_path: Path to store persistent state (e.g., last_check).
+#         logger_handle: Handle to the logger.
+
+#     Returns:
+#         A BeaconHandle for use with other functions, or None on failure.
+
+#     """
+#     log_debug(logger_handle, "Beacon", f"Initializing beacon from {key_file_path}...")
+    
+#     encryption_key = None
+#     try:
+#         if key_file_path.lower().endswith('.key'):
+#             # Logic for binary CloudCoin .key files
+#             ans = []
+#             with open(key_file_path, 'r') as f:
+#                 for line in f:
+#                     clean_line = line.strip()
+#                     if clean_line and len(clean_line) == 32:
+#                         ans.append(bytes.fromhex(clean_line))
+            
+#             if len(ans) >= 25:
+#                 # Get the AN for the specific RAIDA server index
+#                 encryption_key = ans[beacon_config.server_index]
+#             else:
+#                 log_error(logger_handle, "Beacon", f"Key file {key_file_path} has only {len(ans)} keys; need 25.")
+#                 return None
+#         else:
+#             # Fallback for legacy keys.txt
+#             with open(key_file_path, 'r') as f:
+#                 keys = [line.strip() for line in f.readlines() if line.strip()]
+            
+#             if len(keys) <= beacon_config.server_index:
+#                 log_error(logger_handle, "Beacon", f"Key file has too few lines for index {beacon_config.server_index}.")
+#                 return None
+            
+#             encryption_key = bytes.fromhex(keys[beacon_config.server_index])
+
+#     except (IOError, ValueError) as e:
+#         log_error(logger_handle, "Beacon", f"Failed to read or parse beacon key: {e}")
+#         return None
+
+#     # Get or generate a persistent Device ID
+#     device_id, is_new = device_id_manager.get_or_create_device_id(state_file_path, logger_handle)
+
+#     # Parse beacon server host and port
+#     try:
+#         if not beacon_config.url.startswith("tcp://"):
+#             raise ValueError("Beacon URL must start with 'tcp://'")
+#         host, port_str = beacon_config.url.replace("tcp://", "").split(":")
+#         port = int(port_str)
+#     except (ValueError, IndexError) as e:
+#         log_error(logger_handle, "Beacon", f"Invalid beacon URL format '{beacon_config.url}': {e}")
+#         return None
+
+#     return BeaconHandle(
+#         identity=identity_config,
+#         beacon_config=beacon_config,
+#         network_config=network_config,
+#         beacon_server_info=ServerConfig(address=host, port=port, index=beacon_config.server_index),
+#         encryption_key=encryption_key,
+#         device_id=device_id,
+#         state_file_path=state_file_path,
+#         logger_handle=logger_handle
+#     )
+
 def init_beacon(
     identity_config: IdentityConfig,
     beacon_config: BeaconConfig,
@@ -75,42 +157,30 @@ def init_beacon(
     logger_handle: Optional[object] = None
 ) -> Optional[BeaconHandle]:
     """
-    Initializes the Beacon Manager handle. Supports .key files and keys.txt.
-    Initializes the Beacon Manager handle.
-
-    Args:
-        identity_config: User's identity information.
-        beacon_config: Beacon server configuration.
-        network_config: Network timeout settings.
-        key_file_path: Path to the user's key file.
-        state_file_path: Path to store persistent state (e.g., last_check).
-        logger_handle: Handle to the logger.
-
-    Returns:
-        A BeaconHandle for use with other functions, or None on failure.
-
+    Initializes the Beacon Manager handle. 
+    FIXED: Supports binary .key files by skipping the 39-byte header and slicing the 400-byte key.
     """
     log_debug(logger_handle, "Beacon", f"Initializing beacon from {key_file_path}...")
     
     encryption_key = None
     try:
         if key_file_path.lower().endswith('.key'):
-            # Logic for binary CloudCoin .key files
-            ans = []
-            with open(key_file_path, 'r') as f:
-                for line in f:
-                    clean_line = line.strip()
-                    if clean_line and len(clean_line) == 32:
-                        ans.append(bytes.fromhex(clean_line))
-            
-            if len(ans) >= 25:
-                # Get the AN for the specific RAIDA server index
-                encryption_key = ans[beacon_config.server_index]
-            else:
-                log_error(logger_handle, "Beacon", f"Key file {key_file_path} has only {len(ans)} keys; need 25.")
-                return None
+            # --- FIXED: Use binary reading for CloudCoin .key files ---
+            with open(key_file_path, 'rb') as f:
+                # Skip the 39-byte header (32 bytes header + 7 bytes coin header)
+                f.seek(39) 
+                # Read all 400 bytes of key data (25 servers * 16 bytes)
+                full_key_bytes = f.read(400)
+                
+                if len(full_key_bytes) >= 400:
+                    # Extract the 16-byte slice for this specific beacon server index (e.g., RAIDA 11)
+                    start = beacon_config.server_index * 16
+                    encryption_key = full_key_bytes[start : start + 16]
+                else:
+                    log_error(logger_handle, "Beacon", f"Key file {key_file_path} is too small (got {len(full_key_bytes)} bytes).")
+                    return None
         else:
-            # Fallback for legacy keys.txt
+            # Fallback for legacy keys.txt (text-based hex lines)
             with open(key_file_path, 'r') as f:
                 keys = [line.strip() for line in f.readlines() if line.strip()]
             
