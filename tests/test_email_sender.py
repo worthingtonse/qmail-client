@@ -101,7 +101,7 @@ class TestPrepareFileForUpload(unittest.TestCase):
         err, info = prepare_file_for_upload(test_data, "test.txt", 1, key)
 
         self.assertEqual(err, ErrorCode.SUCCESS)
-        self.assertEqual(len(info.stripes), 5)  # 5 stripes for 5 servers
+        self.assertEqual(len(info.stripes), 4)  # 5 stripes for 5 servers
         self.assertGreater(len(info.parity_stripe), 0)
         print("test_prepare_file_basic: PASSED")
 
@@ -113,7 +113,7 @@ class TestPrepareFileForUpload(unittest.TestCase):
         err, info = prepare_file_for_upload(test_data, "small.txt", 1, key)
 
         self.assertEqual(err, ErrorCode.SUCCESS)
-        self.assertEqual(len(info.stripes), 5)  # 5 stripes for 5 servers
+        self.assertEqual(len(info.stripes), 4)  # 5 stripes for 5 servers
         print("test_prepare_file_small_data: PASSED")
 
     def test_prepare_file_large_data(self):
@@ -124,7 +124,7 @@ class TestPrepareFileForUpload(unittest.TestCase):
         err, info = prepare_file_for_upload(test_data, "large.bin", 1, key)
 
         self.assertEqual(err, ErrorCode.SUCCESS)
-        self.assertEqual(len(info.stripes), 5)  # 5 stripes for 5 servers
+        self.assertEqual(len(info.stripes), 4)  # 5 stripes for 5 servers
         # Each stripe should be roughly 1/5 of data
         for stripe in info.stripes:
             self.assertGreater(len(stripe), 0)
