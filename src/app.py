@@ -110,29 +110,29 @@ class AppContext:
     def refresh_server_cache(self):
         """
         Refresh the server IP cache from database.
-
-        Call this after any operation that modifies the server list,
-        such as data sync or server configuration changes.
-
-        Returns:
-            bool: True if cache was refreshed successfully
+        Handles both integer and 'RAIDAxx' string IDs.
         """
         if self.db_handle is None:
             return False
 
         err, servers = get_all_servers(self.db_handle, available_only=False)
         if err == DatabaseErrorCode.SUCCESS:
-            # Build new cache (atomic replacement)
             new_cache = {}
             for srv in servers:
-                server_id = srv.get('server_id', srv.get('id', -1))
+                # Use server_id if available, else id, else -1
+                raw_id = srv.get('server_id', srv.get('id', -1))
                 ip_address = srv.get('IPAddress', '')
-                if server_id >= 0 and ip_address:
-                    new_cache[server_id] = ip_address
-            # Replace cache atomically
+                
+                #  Verify the ID is valid (int >= 0 OR a non-empty string)
+                is_valid = (isinstance(raw_id, int) and raw_id >= 0) or \
+                           (isinstance(raw_id, str) and raw_id.strip() != "")
+                
+                if is_valid and ip_address:
+                    new_cache[raw_id] = ip_address
+            
             self._server_cache = new_cache
             if self.logger:
-                log_info(self.logger, "AppContext",
+                log_info(self.logger, "AppContext", 
                          f"Server cache refreshed: {len(new_cache)} servers")
             return True
         return False

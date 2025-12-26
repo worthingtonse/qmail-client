@@ -64,6 +64,7 @@ except ImportError:
 # PUBLIC API
 # ============================================================================
 
+
 def init_beacon(
     identity_config: IdentityConfig,
     beacon_config: BeaconConfig,
@@ -73,6 +74,7 @@ def init_beacon(
     logger_handle: Optional[object] = None
 ) -> Optional[BeaconHandle]:
     """
+    Initializes the Beacon Manager handle. Supports .key files and keys.txt.
     Initializes the Beacon Manager handle.
 
     Args:
@@ -85,30 +87,52 @@ def init_beacon(
 
     Returns:
         A BeaconHandle for use with other functions, or None on failure.
+
     """
-    log_debug(logger_handle, "Beacon", "Initializing beacon module...")
+    log_debug(logger_handle, "Beacon", f"Initializing beacon from {key_file_path}...")
+    
+    encryption_key = None
     try:
-        with open(key_file_path, 'r') as f:
-            keys = f.readlines()
-        
-        if len(keys) <= beacon_config.server_index:
-            log_error(logger_handle, "Beacon", f"Key file '{key_file_path}' has too few lines.")
-            return None
-        
-        # Get the specific key for the beacon server
-        key_hex = keys[beacon_config.server_index].strip()
-        encryption_key = bytes.fromhex(key_hex)
+        # Check if we are using a binary CloudCoin .key file
+        if key_file_path.lower().endswith('.key'):
+            ans = []
+            if not os.path.exists(key_file_path):
+                log_error(logger_handle, "Beacon", f"Key file not found: {key_file_path}")
+                return None
+                
+            with open(key_file_path, 'r') as f:
+                for line in f:
+                    clean_line = line.strip()
+                    # A valid AN is exactly 32 hex characters
+                    if clean_line and len(clean_line) == 32:
+                        ans.append(bytes.fromhex(clean_line))
+            
+            if len(ans) >= 25:
+                # Use the AN corresponding to the beacon's RAIDA index
+                encryption_key = ans[beacon_config.server_index]
+                log_info(logger_handle, "Beacon", f"Loaded AN for RAIDA {beacon_config.server_index} from .key file.")
+            else:
+                log_error(logger_handle, "Beacon", f"Expected at least 25 keys in {key_file_path}, found {len(ans)}")
+                return None
+        else:
+            # Fallback to legacy keys.txt (one key per line)
+            with open(key_file_path, 'r') as f:
+                keys = [line.strip() for line in f.readlines() if line.strip()]
+            
+            if len(keys) <= beacon_config.server_index:
+                log_error(logger_handle, "Beacon", f"Key file '{key_file_path}' has too few lines for index {beacon_config.server_index}.")
+                return None
+            
+            encryption_key = bytes.fromhex(keys[beacon_config.server_index])
 
     except (IOError, ValueError) as e:
-        log_error(logger_handle, "Beacon", f"Failed to read or parse beacon key from '{key_file_path}': {e}")
+        log_error(logger_handle, "Beacon", f"Failed to read or parse beacon key: {e}")
         return None
 
-    # Get or generate a persistent, portable Device ID
+    # Get or generate a persistent Device ID
     device_id, is_new = device_id_manager.get_or_create_device_id(state_file_path, logger_handle)
-    if is_new:
-        log_info(logger_handle, "Beacon", f"Generated new persistent device ID: {device_id}")
-
-    # Parse beacon server host and port
+    
+    # Parse beacon server host and port from URL
     try:
         if not beacon_config.url.startswith("tcp://"):
             raise ValueError("Beacon URL must start with 'tcp://'")
@@ -118,7 +142,7 @@ def init_beacon(
         log_error(logger_handle, "Beacon", f"Invalid beacon URL format '{beacon_config.url}': {e}")
         return None
 
-    handle = BeaconHandle(
+    return BeaconHandle(
         identity=identity_config,
         beacon_config=beacon_config,
         network_config=network_config,
@@ -128,10 +152,6 @@ def init_beacon(
         state_file_path=state_file_path,
         logger_handle=logger_handle
     )
-    
-    log_info(logger_handle, "Beacon", "Beacon handle initialized successfully.")
-    return handle
-
 
 def start_beacon_monitor(
     handle: BeaconHandle,
