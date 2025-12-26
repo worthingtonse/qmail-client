@@ -121,7 +121,7 @@ class AppContext:
             for srv in servers:
                 # Use server_id if available, else id, else -1
                 raw_id = srv.get('server_id', srv.get('id', -1))
-                ip_address = srv.get('IPAddress', '')
+                ip_address = srv.get('ip_address', srv.get('IPAddress', ''))
                 
                 #  Verify the ID is valid (int >= 0 OR a non-empty string)
                 is_valid = (isinstance(raw_id, int) and raw_id >= 0) or \
@@ -331,17 +331,26 @@ def initialize_application(args):
     log_info(logger, "App", "Task manager initialized")
 
     # Initialize beacon (optional - continues if fails)
+    # Initialize beacon (optional - continues if fails)
     beacon_handle = None
-    key_file_path = "Data/keys.txt"
+    
+    # NEW: Automatically build the path to your .key file based on your identity
+    wallet_key_path = f"Data/Wallets/Default/Bank/0006{config.identity.denomination:02x}{config.identity.serial_number:08x}.key".upper()
     state_file_path = "Data/beacon_state.json"
 
-    if os.path.exists(key_file_path):
-        print(f"[INIT] Initializing beacon monitor...")
+    # Check if the .key file exists; if not, fallback to legacy keys.txt
+    if os.path.exists(wallet_key_path):
+        key_file_to_use = wallet_key_path
+    else:
+        key_file_to_use = "Data/keys.txt"
+
+    if os.path.exists(key_file_to_use):
+        print(f"[INIT] Initializing beacon monitor using: {key_file_to_use}")
         beacon_handle = init_beacon(
             identity_config=config.identity,
             beacon_config=config.beacon,
             network_config=config.network,
-            key_file_path=key_file_path,
+            key_file_path=key_file_to_use,
             state_file_path=state_file_path,
             logger_handle=logger
         )

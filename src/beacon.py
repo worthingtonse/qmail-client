@@ -65,6 +65,7 @@ except ImportError:
 # ============================================================================
 
 
+
 def init_beacon(
     identity_config: IdentityConfig,
     beacon_config: BeaconConfig,
@@ -93,34 +94,28 @@ def init_beacon(
     
     encryption_key = None
     try:
-        # Check if we are using a binary CloudCoin .key file
         if key_file_path.lower().endswith('.key'):
+            # Logic for binary CloudCoin .key files
             ans = []
-            if not os.path.exists(key_file_path):
-                log_error(logger_handle, "Beacon", f"Key file not found: {key_file_path}")
-                return None
-                
             with open(key_file_path, 'r') as f:
                 for line in f:
                     clean_line = line.strip()
-                    # A valid AN is exactly 32 hex characters
                     if clean_line and len(clean_line) == 32:
                         ans.append(bytes.fromhex(clean_line))
             
             if len(ans) >= 25:
-                # Use the AN corresponding to the beacon's RAIDA index
+                # Get the AN for the specific RAIDA server index
                 encryption_key = ans[beacon_config.server_index]
-                log_info(logger_handle, "Beacon", f"Loaded AN for RAIDA {beacon_config.server_index} from .key file.")
             else:
-                log_error(logger_handle, "Beacon", f"Expected at least 25 keys in {key_file_path}, found {len(ans)}")
+                log_error(logger_handle, "Beacon", f"Key file {key_file_path} has only {len(ans)} keys; need 25.")
                 return None
         else:
-            # Fallback to legacy keys.txt (one key per line)
+            # Fallback for legacy keys.txt
             with open(key_file_path, 'r') as f:
                 keys = [line.strip() for line in f.readlines() if line.strip()]
             
             if len(keys) <= beacon_config.server_index:
-                log_error(logger_handle, "Beacon", f"Key file '{key_file_path}' has too few lines for index {beacon_config.server_index}.")
+                log_error(logger_handle, "Beacon", f"Key file has too few lines for index {beacon_config.server_index}.")
                 return None
             
             encryption_key = bytes.fromhex(keys[beacon_config.server_index])
@@ -131,8 +126,8 @@ def init_beacon(
 
     # Get or generate a persistent Device ID
     device_id, is_new = device_id_manager.get_or_create_device_id(state_file_path, logger_handle)
-    
-    # Parse beacon server host and port from URL
+
+    # Parse beacon server host and port
     try:
         if not beacon_config.url.startswith("tcp://"):
             raise ValueError("Beacon URL must start with 'tcp://'")
@@ -434,7 +429,7 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> (NetworkErrorCode, List[TellNoti
             command_code=protocol.CMD_PING,
             body_data=ping_body,
             encrypt=True, # Explicitly use encryption
-            timeout_ms=ping_timeout_ms,
+            timeout_ms=handle.beacon_config.timeout_sec * 1000,
             config=handle.network_config,
             logger_handle=handle.logger_handle
         )
