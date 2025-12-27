@@ -144,205 +144,6 @@ def handle_ping(request_handler, context):
 
 
 # ============================================================================
-# MAIL ENDPOINTS
-# ============================================================================
-# def handle_mail_send(request_handler, context):
-#     """
-#     POST /api/mail/send - Send an email
-
-#     Supports two formats:
-
-#     1. JSON body (simple text emails):
-#     {
-#         "to": ["recipient@address"],
-#         "cc": ["cc@address"],        // optional
-#         "bcc": ["bcc@address"],      // optional
-#         "subject": "Email subject",
-#         "body": "Email body text",
-#         "attachments": []            // optional - list of file paths
-#         "storage_weeks": 8           // optional - default 8
-#     }
-
-#     2. multipart/form-data (binary email files):
-#         - email_file: CBDF binary email file (required)
-#         - searchable_text: Plain text for indexing (required)
-#         - subject: Email subject (required)
-#         - subsubject: Secondary subject (optional)
-#         - to[]: Array of recipient addresses (required)
-#         - cc[]: Carbon copy recipients (optional)
-#         - bcc[]: Blind carbon copy recipients (optional)
-#         - attachments[]: Array of file paths (optional, max 200)
-#         - storage_weeks: Storage duration (optional, default 8)
-
-#     Returns 202 Accepted with task_id for async processing.
-#     """
-#     from src.email_sender import send_email_async, SendEmailErrorCode, validate_request
-#     from src.qmail_types import SendEmailRequest
-
-#     app_ctx = request_handler.server_instance.app_context
-
-#     # Parse request based on content type
-#     content_type = context.headers.get('Content-Type', '')
-#     email_data = context.json if context.json else {}
-
-#     # Build SendEmailRequest from input
-#     request_obj = SendEmailRequest()
-
-#     if 'multipart/form-data' in content_type.lower():
-#         # Handle multipart form data
-#         # Note: actual multipart parsing would be done by the server
-#         # For now, expect form fields in context.json or context.body
-#         form_data = email_data  # Simplified - real implementation needs multipart parsing
-
-#         request_obj.email_file = form_data.get('email_file', b'')
-#         request_obj.searchable_text = form_data.get('searchable_text', '')
-#         request_obj.subject = form_data.get('subject', '')
-#         request_obj.subsubject = form_data.get('subsubject')
-#         request_obj.to_recipients = form_data.get('to', [])
-#         request_obj.cc_recipients = form_data.get('cc', [])
-#         request_obj.bcc_recipients = form_data.get('bcc', [])
-#         request_obj.attachment_paths = form_data.get('attachments', [])
-#         request_obj.storage_weeks = form_data.get('storage_weeks', 8)
-#     else:
-#         # Handle JSON body - create CBDF from body text
-#         if not email_data.get("to"):
-#             request_handler.send_json_response(400, {
-#                 "error": "Missing required field: 'to'",
-#                 "status": "error"
-#             })
-#             return
-
-#         if not email_data.get("subject"):
-#             request_handler.send_json_response(400, {
-#                 "error": "Missing required field: 'subject'",
-#                 "status": "error"
-#             })
-#             return
-
-#         # Create simple CBDF-like structure from text body
-#         body_text = email_data.get('body', '')
-#         email_content = body_text.encode('utf-8') if body_text else b''
-#         request_obj.email_file = email_content
-#         request_obj.searchable_text = body_text
-#         request_obj.subject = email_data.get('subject', '')
-#         request_obj.subsubject = email_data.get('subsubject')
-
-#         # Handle recipients - can be string or list
-#         to_list = email_data.get('to', [])
-#         request_obj.to_recipients = to_list if isinstance(to_list, list) else [to_list]
-
-#         cc_list = email_data.get('cc', [])
-#         request_obj.cc_recipients = cc_list if isinstance(cc_list, list) else [cc_list] if cc_list else []
-
-#         bcc_list = email_data.get('bcc', [])
-#         request_obj.bcc_recipients = bcc_list if isinstance(bcc_list, list) else [bcc_list] if bcc_list else []
-
-#         request_obj.attachment_paths = email_data.get('attachments', [])
-#         request_obj.storage_weeks = email_data.get('storage_weeks', 8)
-
-#     # Validate request
-#     try:
-#         # We call it without the second argument to avoid the LoggerHandle mismatch
-#         err, err_msg = validate_request(request=request_obj)
-#     except Exception as e:
-#         print(f"CRITICAL: Validation crashed! Error: {e}")
-#         request_handler.send_json_response(500, {
-#             "error": f"Validation logic error: {e}",
-#             "status": "error"
-#         })
-#         return
-
-#     if err != SendEmailErrorCode.SUCCESS:
-#         request_handler.send_json_response(400, {
-#             "error": err_msg,
-#             "error_code": int(err),
-#             "status": "error"
-#         })
-#         return
-
-#     # Get servers for upload
-#     servers = []
-#     if hasattr(app_ctx, 'config') and app_ctx.config:
-#         for i, s in enumerate(app_ctx.config.qmail_servers or []):
-#             idx = getattr(s, 'index', None)
-#             if idx is None:
-#                 # Fallback: find digits in address (raida11 -> 11) or use enumeration
-#                 import re
-#                 match = re.search(r'\d+', s.address)
-#                 idx = int(match.group()) if match else i
-#             servers.append({'address': s.address, 'port': s.port, 'index': idx})
-
-#     # If no servers configured, use defaults for testing
-#     if not servers:
-#         servers = [
-#             {'address': f'raida{i}.cloudcoin.global', 'port': 443, 'index': i}
-#             for i in range(5)
-#         ]
-
-#     # 1. Register the task with the actual Task Manager
-#     try:
-#         err_task, task_id = create_task(
-#             app_ctx.task_manager,
-#             task_type="send",
-#             params={"subject": request_obj.subject}
-#         )
-#     except NameError:
-#         request_handler.send_json_response(500, {"error": "TaskManager functions not imported"})
-#         return
-
-#     # 2. Mark it as starting (transitions state from PENDING to RUNNING)
-#     start_task(app_ctx.task_manager, task_id, "Initializing send process")
-
-#     # Get identity from config
-#     identity = app_ctx.config.identity if hasattr(app_ctx, 'config') and app_ctx.config else None
-
-#     if identity and not getattr(identity, 'authenticity_number', None):
-#         if app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
-#             identity.authenticity_number = app_ctx.beacon_handle.encryption_key.hex()
-#             log_info(app_ctx.logger, "API", "Using encryption key from active Beacon for sending")
-
-#     response = {
-#         "status": "accepted",
-#         "task_id": task_id,
-#         "message": "Email queued for sending",
-#         "file_group_guid": "",
-#         "file_count": 1 + len(request_obj.attachment_paths),
-#         "estimated_cost": 0.0
-#     }
-
-#     # If thread pool is available, submit for background processing
-#     if hasattr(app_ctx, 'thread_pool') and app_ctx.thread_pool:
-#             def process_send():
-#                 from src.task_manager import update_task_progress, complete_task, fail_task
-
-#                 # This is the "messenger" that send_email_async uses to report progress
-#                 def update_progress(internal_state):
-#                     update_task_progress(app_ctx.task_manager, task_id, internal_state.progress, internal_state.message)
-
-#                 err, result = send_email_async(
-#                     request_obj, identity, 
-#                     app_ctx.db_handle, # <--- Pass the DB handle
-#                     servers,
-#                     app_ctx.thread_pool.executor, 
-#                     update_progress,
-#                     app_ctx.logger,
-#                     # Add these to ensure payment and tells have what they need
-#                     db_handle=app_ctx.db_handle,
-#                     locker_code_hex_list=None # Future use
-#                 )
-                
-#                 # FINAL STEP: Move the task to a finished state
-#                 if result.success:
-#                     # result.__dict__ stores all the final GUIDs and costs for the user to see
-#                     complete_task(app_ctx.task_manager, task_id, result.__dict__, "Email sent successfully")
-#                 else:
-#                     fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
-
-#             app_ctx.thread_pool.executor.submit(process_send)
-#     else:
-#         response["message"] = "Email queued (no thread pool - will process on next poll)"
-
-#     request_handler.send_json_response(202, response)
 
 def handle_mail_send(request_handler, context):
     """
@@ -378,7 +179,7 @@ def handle_mail_send(request_handler, context):
         if not email_data.get("to") or not email_data.get("subject"):
             request_handler.send_json_response(400, {"error": "Missing 'to' or 'subject'", "status": "error"})
             return
-
+        ## CBDF
         body_text = email_data.get('body', '')
         request_obj.email_file = body_text.encode('utf-8') if body_text else b''
         request_obj.searchable_text = body_text
@@ -451,13 +252,28 @@ def handle_mail_send(request_handler, context):
     identity = app_ctx.config.identity
     # If the full 400-byte (800 hex chars) key is missing, load it from the coin file
     if identity and (not getattr(identity, 'authenticity_number', None) or len(identity.authenticity_number) < 800):
+
+
+
+        base_name = f"0006{identity.denomination:02X}{identity.serial_number:08X}"
+        path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
+        path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY"
+    
+        key_file = path_bin if os.path.exists(path_bin) else path_key
         # Path based on your SN 6891 (0x1AEB) and Denom 3
-        key_file = f"Data/Wallets/Default/Bank/0006{identity.denomination:02x}{identity.serial_number:08x}.key".upper()
+
+        # base_name = f"0006{identity.denomination:02x}{identity.serial_number:08x}"
+        # path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
+        # path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY"
+        
+        # key_file = path_bin if os.path.exists(path_bin) else path_key
+        # key_file = f"Data/Wallets/Default/Bank/0006{identity.denomination:02x}{identity.serial_number:08x}.key".upper()
         if os.path.exists(key_file):
-            with open(key_file, 'rb') as f:
-                # The 400-byte key body starts at offset 39 (32 header + 7 coin header)
-                f.seek(39) 
-                identity.authenticity_number = f.read(400).hex()
+        # Determine offset based on the extension of the found file
+         offset = 32 if key_file.upper().endswith('.BIN') else 39
+         with open(key_file, 'rb') as f:
+            f.seek(offset)
+            identity.authenticity_number = f.read(400).hex()
         elif app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
             # Last resort fallback (will likely only work for the beacon server itself)
             identity.authenticity_number = app_ctx.beacon_handle.encryption_key.hex()

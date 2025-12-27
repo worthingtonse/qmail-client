@@ -594,155 +594,6 @@ def prepare_file_for_upload(
     return ErrorCode.SUCCESS, info
 
 
-# def upload_stripe_to_server(
-#     server_address: str,
-#     server_port: int,
-#     server_id: int,
-#     stripe_data: bytes,
-#     stripe_index: int,
-#     identity: 'IdentityConfig',
-#     file_group_guid: bytes,
-#     locker_code: bytes,
-#     storage_duration: int,
-#     logger_handle: Optional[object] = None
-# ) -> UploadResult:
-#     """
-#     Upload a single stripe to a server.
-
-#     Args:
-#         server_address: Server hostname or IP
-#         server_port: Server port
-#         server_id: RAIDA server ID (0-24)
-#         stripe_data: Stripe data to upload
-#         stripe_index: Index of this stripe (0-4)
-#         identity: User identity configuration
-#         file_group_guid: 16-byte file group GUID
-#         locker_code: 8-byte locker code for payment
-#         storage_duration: Duration code (0-5 or 255)
-#         logger_handle: Optional logger handle
-
-#     Returns:
-#         UploadResult with success/failure status
-#     """
-#     result = UploadResult()
-#     result.server_id = str(server_id)
-#     result.stripe_index = stripe_index
-
-#     start_time = time.time()
-
-#     try:
-#         # Get AN (authenticity number) from identity with safe hex conversion
-#         success, an, err_msg = _safe_hex_to_bytes(
-#             identity.authenticity_number, 16, "authenticity_number", logger_handle
-#         )
-#         if not success:
-#             log_error(logger_handle, SENDER_CONTEXT,
-#                       f"Invalid authenticity_number for server {server_id}", err_msg)
-#             result.success = False
-#             result.error_message = f"Configuration error: {err_msg}"
-#             return result
-
-#         # Build complete upload request
-#         err, request_data, challenge = build_complete_upload_request(
-#             raida_id=server_id,
-#             denomination=identity.denomination,
-#             serial_number=identity.serial_number,
-#             device_id=identity.device_id,
-#             an=an,
-#             file_group_guid=file_group_guid,
-#             locker_code=locker_code,
-#             storage_duration=storage_duration,
-#             stripe_data=stripe_data,
-#             logger_handle=logger_handle
-#         )
-
-#         if err != ProtocolErrorCode.SUCCESS:
-#             result.success = False
-#             result.error_message = "Failed to build upload request"
-#             return result
-
-#         # Send request to server
-#         # Send request to server
-#         try:
-#             # FIX: Import the correct connection and request functions
-#             from .network import connect_to_server, send_request, ServerInfo
-            
-#             # 1. Create the ServerInfo object needed for connection
-#             s_info = ServerInfo(host=server_address, port=server_port, raida_id=server_id)
-            
-#             # 2. Establish a real Connection object (required by network.py)
-#             err_conn, conn = connect_to_server(
-#                 s_info, 
-#                 encryption_key=an, 
-#                 denomination=identity.denomination, 
-#                 serial_number=identity.serial_number,
-#                 logger_handle=logger_handle
-#             )
-            
-#             if err_conn != 0 or not conn:
-#                 raise ConnectionError(f"Could not connect to RAIDA {server_id}")
-            
-#             # 3. Pass the connection object (conn) instead of the string address
-#             # The command codes for Upload are CMD_GROUP_QMAIL (6) and CMD_UPLOAD (60)
-#             from .network import CMD_GROUP_QMAIL, CMD_UPLOAD
-#             err_req, resp_header, _ = send_request(
-#                 conn, CMD_GROUP_QMAIL, CMD_UPLOAD, request_data, 
-#                 encrypt=True, logger_handle=logger_handle
-#             )
-            
-#             # Clean up the connection
-#             from .network import disconnect
-#             disconnect(conn)
-            
-#             # Handle the response
-#             response = bytes(32) # Default empty for validation check below
-#             if err_req == 0 and resp_header:
-#                 # Build a dummy response bytes object that validate_upload_response expects
-#                 # (Or update your logic to use resp_header directly)
-#                 response = bytes(16) + challenge
-#         except ImportError:
-#             # Fallback: simulate network request for testing
-#             log_warning(logger_handle, SENDER_CONTEXT,
-#                         f"Network module not available, simulating upload to server {server_id}")
-#             # Simulate success: build correct 32-byte response
-#             # Response format: [16 bytes header][16 bytes echoed challenge]
-#             response = bytes(16) + challenge  # 32 bytes total with challenge at offset 16
-
-#         # Validate response
-#         if response:
-#             err, status_code, error_msg = validate_upload_response(
-#                 response, challenge, logger_handle
-#             )
-#             if err == ProtocolErrorCode.SUCCESS:
-#                 result.success = True
-#                 result.status_code = status_code
-#             else:
-#                 result.success = False
-#                 result.status_code = status_code
-#                 result.error_message = error_msg
-#         else:
-#             result.success = False
-#             result.error_message = "No response from server"
-
-#     except Exception as e:
-#         result.success = False
-#         result.error_message = str(e)
-#         log_error(logger_handle, SENDER_CONTEXT,
-#                   f"Upload to server {server_id} failed", str(e))
-
-#     result.upload_time_ms = int((time.time() - start_time) * 1000)
-
-#     if result.success:
-#         log_debug(logger_handle, SENDER_CONTEXT,
-#                   f"Uploaded stripe {stripe_index} to server {server_id} "
-#                   f"({len(stripe_data)} bytes, {result.upload_time_ms}ms)")
-#     else:
-#         log_warning(logger_handle, SENDER_CONTEXT,
-#                     f"Failed to upload stripe {stripe_index} to server {server_id}: "
-#                     f"{result.error_message}")
-
-#     return result
-
 def upload_stripe_to_server(
     server_address: str,
     server_port: int,
@@ -926,224 +777,6 @@ def upload_file_to_servers(
 # MAIN ORCHESTRATION FUNCTIONS
 # ============================================================================
 
-# def send_email_async(
-#     request: 'SendEmailRequest',
-#     identity: 'IdentityConfig',
-#     db_handle: object,
-#     servers: List[Dict],
-#     thread_pool: Optional[ThreadPoolExecutor] = None,
-#     task_callback: Optional[callable] = None,
-#     logger_handle: Optional[object] = None
-# ) -> Tuple[SendEmailErrorCode, SendEmailResult]:
-#     """
-#     Send an email asynchronously.
-
-#     This is the main entry point for sending emails. It orchestrates:
-#     1. Request validation
-#     2. Payment calculation and locker code generation
-#     3. File processing (encrypt, stripe, upload)
-#     4. Tell notification (stub)
-#     5. Local database storage
-
-#     Args:
-#         request: SendEmailRequest with email data
-#         identity: User identity configuration
-#         db_handle: Database handle
-#         servers: List of server configurations
-#         thread_pool: Optional thread pool for parallel operations
-#         task_callback: Optional callback(state: SendTaskState) for progress updates
-#         logger_handle: Optional logger handle
-
-#     Returns:
-#         Tuple of (SendEmailErrorCode, SendEmailResult)
-#     """
-#     result = SendEmailResult()
-#     state = SendTaskState()
-#     state.task_id = f"send_{int(time.time() * 1000)}"
-
-#     def update_state(status: str, progress: int, message: str):
-#         state.status = status
-#         state.progress = progress
-#         state.message = message
-#         if task_callback:
-#             task_callback(state)
-#         log_info(logger_handle, SENDER_CONTEXT, f"[{state.task_id}] {status}: {message}")
-
-#     try:
-#         # Step 1: Validate request
-#         update_state("VALIDATING", 5, "Validating request...")
-#         err, err_msg = validate_request(request, logger_handle)
-#         if err != SendEmailErrorCode.SUCCESS:
-#             result.error_code = err
-#             result.error_message = err_msg
-#             update_state("FAILED", 0, err_msg)
-#             return err, result
-
-#         # Step 2: Generate file group GUID
-#         state.file_group_guid = uuid.uuid4().bytes
-#         result.file_group_guid = state.file_group_guid
-
-#         # Count files
-#         attachment_count = len(request.attachment_paths) if request.attachment_paths else 0
-#         state.total_files = 1 + attachment_count  # email body + attachments
-#         result.file_count = state.total_files
-
-#         # Step 3: Calculate payment
-#         update_state("CALCULATING", 10, "Calculating payment...")
-
-#         file_sizes = [len(request.email_file)]
-#         for path in (request.attachment_paths or []):
-#             file_sizes.append(os.path.getsize(path))
-
-#         recipient_count = len(request.to_recipients or []) + \
-#                          len(request.cc_recipients or []) + \
-#                          len(request.bcc_recipients or [])
-
-#         err, payment_calc = calculate_total_payment(
-#             file_sizes, request.storage_weeks, recipient_count, db_handle, logger_handle
-#         )
-#         if err != ErrorCode.SUCCESS:
-#             result.error_code = SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS
-#             result.error_message = "Failed to calculate payment"
-#             update_state("FAILED", 0, "Payment calculation failed")
-#             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
-
-#         result.total_cost = payment_calc.total_cost
-
-#         # Step 4: Request locker code
-#         update_state("PAYMENT", 15, "Requesting locker code...")
-#         err, locker_code = request_locker_code(payment_calc.total_cost, db_handle, logger_handle)
-#         if err != ErrorCode.SUCCESS:
-#             result.error_code = SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS
-#             result.error_message = "Failed to get locker code (insufficient funds?)"
-#             update_state("FAILED", 0, "Locker code generation failed")
-#             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
-
-#         state.locker_code = locker_code
-#         storage_duration = weeks_to_duration_code(request.storage_weeks)
-
-#         # Get encryption key from identity with safe hex conversion
-#         # Security: Reject invalid/short keys instead of silently padding
-#         success, encryption_key, err_msg = _safe_hex_to_bytes(
-#             identity.authenticity_number, 16, "authenticity_number", logger_handle
-#         )
-#         if not success:
-#             result.error_code = SendEmailErrorCode.ERR_ENCRYPTION_FAILED
-#             result.error_message = f"Invalid encryption key configuration: {err_msg}"
-#             update_state("FAILED", 0, f"Configuration error: {err_msg}")
-#             return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
-
-#         # Step 5: Process email body
-#         update_state("UPLOADING", 20, "Processing email body...")
-
-#         err, body_info = prepare_file_for_upload(
-#             request.email_file, "email_body.cbdf", FILE_INDEX_BODY,
-#             encryption_key, logger_handle
-#         )
-#         if err != ErrorCode.SUCCESS:
-#             result.error_code = SendEmailErrorCode.ERR_ENCRYPTION_FAILED
-#             result.error_message = "Failed to process email body"
-#             update_state("FAILED", 0, "Email body processing failed")
-#             return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
-
-#         # Upload email body
-#         err, upload_results = upload_file_to_servers(
-#             body_info, servers, identity, state.file_group_guid,
-#             state.locker_code, storage_duration, thread_pool, logger_handle
-#         )
-#         result.upload_results.extend(upload_results)
-#         state.files_uploaded = 1
-
-#         if err != ErrorCode.SUCCESS:
-#             result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
-#             result.error_message = "Email body upload partially failed"
-#             # Continue with attachments even if body had issues
-
-#         # Step 6: Process attachments
-#         for i, path in enumerate(request.attachment_paths or []):
-#             file_index = FILE_INDEX_ATTACHMENT_START + i
-#             progress = 20 + int(70 * (i + 1) / state.total_files)
-#             update_state("UPLOADING", progress, f"Processing attachment {i+1}...")
-
-#             # Security: Validate path again before reading (defense in depth)
-#             is_valid, result_or_error = _validate_file_path(path, logger_handle)
-#             if not is_valid:
-#                 log_error(logger_handle, SENDER_CONTEXT,
-#                           f"Attachment path validation failed: {path}", result_or_error)
-#                 continue
-
-#             real_path = result_or_error
-
-#             # Read attachment file using validated path
-#             try:
-#                 with open(real_path, 'rb') as f:
-#                     file_data = f.read()
-#             except Exception as e:
-#                 log_error(logger_handle, SENDER_CONTEXT,
-#                           f"Failed to read attachment: {path}", str(e))
-#                 continue
-
-#             file_name = os.path.basename(real_path)
-
-#             # Prepare and upload attachment
-#             err, att_info = prepare_file_for_upload(
-#                 file_data, file_name, file_index, encryption_key, logger_handle
-#             )
-#             if err != ErrorCode.SUCCESS:
-#                 log_warning(logger_handle, SENDER_CONTEXT,
-#                             f"Failed to process attachment: {file_name}")
-#                 continue
-
-#             err, upload_results = upload_file_to_servers(
-#                 att_info, servers, identity, state.file_group_guid,
-#                 state.locker_code, storage_duration, thread_pool, logger_handle
-#             )
-#             result.upload_results.extend(upload_results)
-#             state.files_uploaded += 1
-
-#         # Step 7: Send Tell notifications (stub)
-#         update_state("NOTIFYING", 92, "Sending notifications...")
-#         err = send_tell_notifications(
-#             request=request,
-#             file_group_guid=state.file_group_guid,
-#             servers=servers,
-#             identity=identity,
-#             logger_handle=logger_handle,
-#             db_handle=db_handle,
-#             locker_code=state.locker_code,
-#             upload_results=result.upload_results
-#         )
-#         # Don't fail on Tell errors - email is already uploaded
-
-#         # Step 8: Store locally
-#         update_state("STORING", 95, "Storing locally...")
-#         err = store_sent_email(
-#             request, state.file_group_guid, result.upload_results, db_handle, logger_handle
-#         )
-#         # Don't fail on storage errors - email is already sent
-
-#         # Complete
-#         success_count = sum(1 for r in result.upload_results if getattr(r, 'success', False))
-        
-#         if success_count < 4:
-#             result.success = False
-#             result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
-#             result.error_message = f"Upload failed: only {success_count}/5 stripes succeeded"
-#             update_state("FAILED", 0, result.error_message)
-#             return SendEmailErrorCode.ERR_PARTIAL_FAILURE, result
-#         result.success = True
-#         result.error_code = SendEmailErrorCode.SUCCESS
-#         update_state("COMPLETED", 100, f"Email sent successfully to {recipient_count} recipients")
-
-#         return SendEmailErrorCode.SUCCESS, result
-
-#     except Exception as e:
-#         log_error(logger_handle, SENDER_CONTEXT, "send_email_async failed", str(e))
-#         result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
-#         result.error_message = str(e)
-#         update_state("FAILED", 0, str(e))
-#         return SendEmailErrorCode.ERR_PARTIAL_FAILURE, result
-
 def send_email_async(
     request: 'SendEmailRequest',
     identity: 'IdentityConfig',
@@ -1178,13 +811,21 @@ def send_email_async(
             result.error_message = err_msg
             update_state("FAILED", 0, err_msg)
             return err, result
+        
+
+        base_name = f"0006{identity.denomination:02X}{identity.serial_number:08X}"
+        path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
+        path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY" 
+
+        key_path = path_bin if os.path.exists(path_bin) else path_key
+        success_load, hex_an_list, load_err = verify_an_loading(key_path, logger_handle)
 
         # Step 2: Load Full Identity Key (400 bytes / 800 hex chars)
         # We must load all 25 ANs to ensure each server gets its correct slice.
-        key_path = f"Data/Wallets/Default/Bank/0006{identity.denomination:02x}{identity.serial_number:08x}.key".upper()
+        # key_path = f"Data/Wallets/Default/Bank/0006{identity.denomination:02x}{identity.serial_number:08x}.key".upper()
         
         # Use the verify_an_loading function you added to email_sender.py
-        success_load, hex_an_list, load_err = verify_an_loading(key_path, logger_handle)
+        # success_load, hex_an_list, load_err = verify_an_loading(key_path, logger_handle)
         
         if not success_load:
             log_error(logger_handle, SENDER_CONTEXT, "Identity load failed", load_err)
@@ -1875,35 +1516,38 @@ def _process_pending_tells(
 
     return sent_count
 
-# In src/email_sender.py
 
 def verify_an_loading(mailbox_file: str, logger_handle: Optional[object] = None):
-    """
-    Verify that the binary mailbox file is correctly loaded and contains 25 ANs.
-    """
     try:
-        if not mailbox_file.upper().endswith('.KEY'):
-            return False, [], "Not a .key file"
+        file_ext = mailbox_file.lower()
+        if not (file_ext.endswith('.key') or file_ext.endswith('.bin')):
+            return False, [], "Unsupported file extension (need .key or .bin)"
 
         with open(mailbox_file, 'rb') as f:
-            # Skip 39-byte header to reach the 400 bytes of AN data
-            f.seek(39) 
-            full_key_bytes = f.read(400)
+            file_data = f.read()
+            
+        # CloudCoin binary files are typically 448 bytes: 
+        # 32 (Header) + 400 (Keys) + 16 (Signature)
+        # Some .key variants add a 7-byte 'coin header' (32+7=39)
+        if len(file_data) == 448:
+            offset = 32
+        elif len(file_data) == 455:
+            offset = 39
+        else:
+            # Fallback if the file size is non-standard but contains the data
+            offset = len(file_data) - 416 # (400 keys + 16 signature)
+
+        full_key_bytes = file_data[offset : offset + 400]
         
         if len(full_key_bytes) < 400:
-            return False, [], f"Expected 400 bytes of AN data but found {len(full_key_bytes)}"
+            return False, [], f"File too small to contain 400-byte AN data"
         
-        # Split the 400 bytes into 25 hex strings (32 chars each)
-        ans = []
-        for i in range(25):
-            slice_bytes = full_key_bytes[i*16 : (i+1)*16]
-            ans.append(slice_bytes.hex())
-        
-        log_info(logger_handle, "AN_VERIFY", f"Successfully loaded 25 ANs from binary file {mailbox_file}")
+        ans = [full_key_bytes[i*16 : (i+1)*16].hex() for i in range(25)]
+        log_info(logger_handle, "AN_VERIFY", f"Loaded 25 ANs from {mailbox_file}")
         return True, ans, ""
         
     except Exception as e:
-        return False, [], f"Failed to read mailbox file: {e}"
+        return False, [], f"Failed to read identity file: {e}"
 
 
 def store_sent_email(
