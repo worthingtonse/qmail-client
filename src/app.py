@@ -337,12 +337,21 @@ def initialize_application(args):
     # NEW: Automatically build the path to your .key file based on your identity
     wallet_key_path = f"Data/Wallets/Default/Bank/0006{config.identity.denomination:02x}{config.identity.serial_number:08x}.key".upper()
     state_file_path = "Data/beacon_state.json"
+    base_name = f"0006{config.identity.denomination:02X}{config.identity.serial_number:08X}"
+    path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
+    path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY"
 
-    # Check if the .key file exists; if not, fallback to legacy keys.txt
-    if os.path.exists(wallet_key_path):
-        key_file_to_use = wallet_key_path
+    if os.path.exists(path_bin):
+        key_file_to_use = path_bin
+    elif os.path.exists(path_key):
+        key_file_to_use = path_key
     else:
         key_file_to_use = "Data/keys.txt"
+    # # Check if the .key file exists; if not, fallback to legacy keys.txt
+    # if os.path.exists(wallet_key_path):
+    #     key_file_to_use = wallet_key_path
+    # else:
+    #     key_file_to_use = "Data/keys.txt"
 
     if os.path.exists(key_file_to_use):
         print(f"[INIT] Initializing beacon monitor using: {key_file_to_use}")

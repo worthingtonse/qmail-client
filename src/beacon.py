@@ -64,8 +64,6 @@ except ImportError:
 # PUBLIC API
 # ============================================================================
 
-
-
 def init_beacon(
     identity_config: IdentityConfig,
     beacon_config: BeaconConfig,
@@ -75,42 +73,30 @@ def init_beacon(
     logger_handle: Optional[object] = None
 ) -> Optional[BeaconHandle]:
     """
-    Initializes the Beacon Manager handle. Supports .key files and keys.txt.
-    Initializes the Beacon Manager handle.
-
-    Args:
-        identity_config: User's identity information.
-        beacon_config: Beacon server configuration.
-        network_config: Network timeout settings.
-        key_file_path: Path to the user's key file.
-        state_file_path: Path to store persistent state (e.g., last_check).
-        logger_handle: Handle to the logger.
-
-    Returns:
-        A BeaconHandle for use with other functions, or None on failure.
-
+    Initializes the Beacon Manager handle. 
+    FIXED: Supports binary .key files by skipping the 39-byte header and slicing the 400-byte key.
     """
     log_debug(logger_handle, "Beacon", f"Initializing beacon from {key_file_path}...")
     
     encryption_key = None
     try:
         if key_file_path.lower().endswith('.key'):
-            # Logic for binary CloudCoin .key files
-            ans = []
-            with open(key_file_path, 'r') as f:
-                for line in f:
-                    clean_line = line.strip()
-                    if clean_line and len(clean_line) == 32:
-                        ans.append(bytes.fromhex(clean_line))
+             if key_file_path.lower().endswith(('.key', '.bin')):
+            # Determine offset: .BIN is 32, .KEY is 39
+              offset = 32 if key_file_path.lower().endswith('.bin') else 39
             
-            if len(ans) >= 25:
-                # Get the AN for the specific RAIDA server index
-                encryption_key = ans[beacon_config.server_index]
-            else:
-                log_error(logger_handle, "Beacon", f"Key file {key_file_path} has only {len(ans)} keys; need 25.")
-                return None
+              with open(key_file_path, 'rb') as f:
+                f.seek(offset) 
+                full_key_bytes = f.read(400)
+                
+                if len(full_key_bytes) >= 400:
+                    start = beacon_config.server_index * 16
+                    encryption_key = full_key_bytes[start : start + 16]
+                else:
+                    log_error(logger_handle, "Beacon", f"Key data too short in {key_file_path}")
+                    return None
         else:
-            # Fallback for legacy keys.txt
+            # Fallback for legacy keys.txt (text-based hex lines)
             with open(key_file_path, 'r') as f:
                 keys = [line.strip() for line in f.readlines() if line.strip()]
             
