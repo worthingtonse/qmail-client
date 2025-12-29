@@ -58,6 +58,7 @@ try:
     )
     from .cloudcoin import get_locker_keys, CloudCoinErrorCode
     from .logger import log_error, log_info, log_debug, log_warning
+    from .wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     from enum import IntEnum
@@ -280,6 +281,8 @@ except ImportError:
             for i, b in enumerate(stripe):
                 parity[i] ^= b
         return ErrorCode.SUCCESS, bytes(parity)
+
+    from wallet_structure import initialize_wallet_structure
 
 
 # ============================================================================
@@ -1595,6 +1598,9 @@ def store_sent_email(
 # ============================================================================
 
 if __name__ == "__main__":
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
+
     print("=" * 60)
     print("email_sender.py - Test Suite")
     print("=" * 60)

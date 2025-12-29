@@ -37,6 +37,7 @@ try:
     from .logger import log_error, log_info, log_debug, log_warning
     from .network import ServerInfo
     from .qmail_types import Stripe
+    from .wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     import database
@@ -60,6 +61,8 @@ except ImportError:
         host: str
         port: int
         raida_id: int = 0
+
+    from wallet_structure import initialize_wallet_structure
 
 
 DOWNLOAD_CONTEXT = "DownloadHandler"
@@ -677,6 +680,9 @@ def extract_attachment_text(attachment_data: bytes, file_type: str) -> str:
 # ============================================================================
 
 if __name__ == "__main__":
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
+
     print("=" * 60)
     print("download_handler.py - Download Handler Module")
     print("=" * 60)

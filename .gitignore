@@ -1,9 +1,10 @@
+.claude/
 tmp/
+tests/
 docs/
 Data/
 build/
 logs/
 config/
-.claude/
 nul
 *.txt

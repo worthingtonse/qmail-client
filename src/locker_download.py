@@ -58,6 +58,7 @@ try:
         connect_async, disconnect_async, send_raw_request_async,
         NetworkErrorCode, ServerInfo, AsyncConnection,
     )
+    from .wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     from protocol import (
@@ -76,6 +77,7 @@ except ImportError:
         connect_async, disconnect_async, send_raw_request_async,
         NetworkErrorCode, ServerInfo, AsyncConnection,
     )
+    from wallet_structure import initialize_wallet_structure
 
 # Import logger
 try:
@@ -415,17 +417,15 @@ async def _download_single_raida(
                 log_info(logger_handle, LOCKER_CONTEXT,
                          f"RAIDA {raida_id} response body ({len(response_body)} bytes): {body_hex}")
 
-        # Decrypt response body using the locker key and nonce from our request
-        err, decrypted = decrypt_locker_response(
-            response_body, locker_key, nonce, logger_handle
-        )
-        if err != ProtocolErrorCode.SUCCESS:
-            return NetworkErrorCode.ERR_INVALID_RESPONSE, []
+        # For encryption type 0 (no encryption), use response body directly
+        # The DOWNLOAD command uses unencrypted responses, so we skip decryption
+        # to avoid corrupting the plaintext data
+        decrypted = response_body
 
-        # DEBUG: Show decrypted body
+        # DEBUG: Show response body (plaintext for encryption type 0)
         if decrypted:
             log_info(logger_handle, LOCKER_CONTEXT,
-                     f"RAIDA {raida_id} decrypted body ({len(decrypted)} bytes): {decrypted[:64].hex()}...")
+                     f"RAIDA {raida_id} response body (plaintext, {len(decrypted)} bytes): {decrypted.hex()}")
 
         # Parse coin list (same format as PEEK response)
         err, coins = parse_locker_download_response(decrypted, logger_handle)
@@ -640,8 +640,7 @@ async def download_from_locker(
 
             filename = generate_coin_filename(
                 locker_coin.denomination,
-                locker_coin.serial_number,
-                locker_coin.pown_string
+                locker_coin.serial_number
             )
             filepath = os.path.join(fracked_path, filename)
 
@@ -707,6 +706,9 @@ if __name__ == "__main__":
     """
     Test the locker_download module.
     """
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
+
     print("=" * 60)
     print("locker_download.py - Locker Download Module v2.0")
     print("=" * 60)

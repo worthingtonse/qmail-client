@@ -101,7 +101,7 @@ CMD_GROUP_LOCKER = 8      # Command Group for locker operations
 CMD_LOCKER_PUT = 82       # Put coins into locker (0x52)
 CMD_LOCKER_PEEK = 83      # Peek at locker contents (0x53)
 CMD_LOCKER_REMOVE = 84    # Remove coins from locker (0x54)
-CMD_LOCKER_DOWNLOAD = 91  # Download coins from locker - new single command (0x5B)
+CMD_LOCKER_DOWNLOAD = 91  # Download coins from locker (0x5B) - per server protocol.c
 
 # Protocol constants
 COIN_TYPE = 0x0006
@@ -409,7 +409,7 @@ def build_peek_header(
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
+    header[0] = 0x01                   # BF: Must be 0x01
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
@@ -485,7 +485,7 @@ def build_ping_header(
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
+    header[0] = 0x01                   # BF: Must be 0x01
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
@@ -806,7 +806,7 @@ def build_upload_header(
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
+    header[0] = 0x01                   # BF: Must be 0x01
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
@@ -1217,7 +1217,7 @@ def build_tell_header(
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
+    header[0] = 0x01                   # BF: Must be 0x01
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID (beacon server)
     header[3] = 0x00                   # SH: Shard ID (not used)
@@ -1645,7 +1645,7 @@ def build_download_header(
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
+    header[0] = 0x01                   # BF: Must be 0x01
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
@@ -2142,7 +2142,7 @@ def build_make_change_header(
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
+    header[0] = 0x01                   # BF: Must be 0x01
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
@@ -2286,7 +2286,7 @@ def build_locker_download_header(
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
+    header[0] = 0x01                   # BF: Must be 0x01
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
@@ -2305,9 +2305,10 @@ def build_locker_download_header(
     header[15] = 0x00                  # RE: Reserved
 
     # Encryption bytes (16-23)
-    # For encryption type 2, bytes 17-21 contain first 5 bytes of locker key
-    header[16] = ENC_LOCKER_CODE       # EN: Encryption type 2 (locker code)
-    header[17:22] = locker_key[:5]     # LK: First 5 bytes of locker key
+    # NOTE: Testing shows DOWNLOAD works with encryption type 0 (no encryption)
+    # Type 2 (ENC_LOCKER_CODE) causes CRC errors on many RAIDA
+    header[16] = ENC_NONE              # EN: No encryption (type 0)
+    # header[17:21] = zeros (already)  # Not used for type 0
     # Body length (big-endian, 2 bytes)
     if body_length > 65535:
         header[22] = 0xFF
@@ -2315,9 +2316,8 @@ def build_locker_download_header(
     else:
         struct.pack_into('>H', header, 22, body_length)
 
-    # Nonce bytes (24-31) - Server uses all 8 bytes for AES-CTR counter
-    nonce = os.urandom(8)
-    header[24:32] = nonce
+    # Nonce bytes (24-31) - zeros for type 0
+    # header[24:32] = zeros (already)
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built locker_download header: RAIDA={raida_id}, body_len={body_length}")
@@ -2514,6 +2514,10 @@ def parse_locker_download_response(
         coin_data = decrypted_body[:terminator_pos]
 
     # Parse coins (5 bytes each: 1 denom + 4 SN)
+    # Valid denomination range per coin-file-format=9.md: -8 to +11
+    VALID_DENOM_MIN = -8
+    VALID_DENOM_MAX = 11
+
     offset = 0
     while offset + 5 <= len(coin_data):
         denomination = coin_data[offset]
@@ -2521,6 +2525,15 @@ def parse_locker_download_response(
         if denomination > 127:
             denomination = denomination - 256
         serial_number = struct.unpack('>I', coin_data[offset + 1:offset + 5])[0]
+
+        # Validate denomination is in valid range
+        if denomination < VALID_DENOM_MIN or denomination > VALID_DENOM_MAX:
+            log_warning(logger_handle, PROTOCOL_CONTEXT,
+                        f"Invalid denomination {denomination} for SN {serial_number}, "
+                        f"valid range is {VALID_DENOM_MIN} to {VALID_DENOM_MAX} - skipping")
+            offset += 5
+            continue
+
         coins.append((denomination, serial_number))
         offset += 5
 
@@ -2563,30 +2576,23 @@ def build_complete_locker_download_request(
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
 
-    # Build header - body length is 48 + 2 = 50 (encrypted + terminator)
-    # Per protocol, body length includes the terminator even if sent in plaintext
+    # Build header - body length is 48 + 2 = 50 (payload + terminator)
     err, header = build_locker_download_header(
         raida_id, locker_key, len(payload) + 2, logger_handle  # +2 for terminator
     )
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
 
-    # Get nonce from header for encryption
-    nonce = header[24:32]
+    # NOTE: Using encryption type 0 (no encryption) - skip encryption step
+    # Testing showed type 2 encryption causes CRC errors on many RAIDA
+    nonce = bytes(8)  # Zeros for type 0
 
-    # Encrypt payload using locker key
-    err, encrypted_payload = encrypt_locker_payload(
-        payload, locker_key, nonce, raida_id, logger_handle
-    )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
-
-    # Combine header + encrypted payload + unencrypted terminator
-    complete_request = header + encrypted_payload + TERMINATOR
+    # Combine header + plaintext payload + terminator
+    complete_request = header + payload + TERMINATOR
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built complete locker_download request: {len(complete_request)} bytes "
-              f"(header={len(header)}, encrypted={len(encrypted_payload)}, terminator=2)")
+              f"(header={len(header)}, body={len(payload)}, terminator=2)")
 
     return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
 

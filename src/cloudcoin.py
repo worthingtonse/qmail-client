@@ -37,6 +37,9 @@ from typing import Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import IntEnum
 
+# Wallet structure initialization
+from wallet_structure import initialize_wallet_structure
+
 # File locking - try portalocker first, fallback to platform-specific
 try:
     import portalocker
@@ -1147,7 +1150,7 @@ def transfer_coins(
 # Total: 439 bytes per single-coin file
 
 # File format constants
-CC_FILE_FORMAT_VERSION = 0x01
+CC_FILE_FORMAT_VERSION = 0x09  # Current file format version
 CC_COIN_ID = 0x0006  # CloudCoin identifier
 CC_ENCRYPTION_NONE = 0x00
 CC_RAIDA_COUNT = 25
@@ -1155,11 +1158,14 @@ CC_AN_LENGTH = 16
 CC_POWN_STRING_LENGTH = 25
 
 # POWN status nibble values (4 bits per RAIDA)
-POWN_PASS = 0x0      # 'p' - passed authentication
-POWN_FAIL = 0x1      # 'f' - failed authentication
-POWN_UNTRIED = 0x2   # 'u' - not yet tried
-POWN_ERROR = 0x3     # 'e' - network error
-POWN_NO_RESPONSE = 0x4  # 'n' - no response
+# Must match heal_protocol.py encoding for consistency
+POWN_UNTRIED = 0x0     # 'u' - Untried/Unknown, RAIDA not contacted
+POWN_PASS = 0xA        # 'p' - Pass/Authentic, has shared secret
+POWN_BROKE_ENC = 0xB   # 'b' - Broke Encryption Key
+POWN_NO_RESPONSE = 0xC # 'n' - No Reply/Clock Timeout
+POWN_DROPPED = 0xD     # 'd' - Dropped, network error
+POWN_ERROR = 0xE       # 'e' - Error, RAIDA responded with error
+POWN_FAIL = 0xF        # 'f' - Failed/Counterfeit, lost shared secret
 
 
 @dataclass
@@ -1185,17 +1191,21 @@ def _char_to_pown_nibble(char: str) -> int:
     """Convert POWN character to 4-bit nibble value."""
     char = char.lower()
     if char == 'p':
-        return POWN_PASS
+        return POWN_PASS        # 0xA
     elif char == 'f':
-        return POWN_FAIL
+        return POWN_FAIL        # 0xF
     elif char == 'u':
-        return POWN_UNTRIED
+        return POWN_UNTRIED     # 0x0
     elif char == 'e':
-        return POWN_ERROR
+        return POWN_ERROR       # 0xE
     elif char == 'n':
-        return POWN_NO_RESPONSE
+        return POWN_NO_RESPONSE # 0xC
+    elif char == 'b':
+        return POWN_BROKE_ENC   # 0xB
+    elif char == 'd':
+        return POWN_DROPPED     # 0xD
     else:
-        return POWN_UNTRIED  # Default to untried
+        return POWN_UNTRIED     # Default to untried
 
 
 def _encode_pown_bytes(pown_string: str) -> bytes:
@@ -1231,26 +1241,58 @@ def _encode_pown_bytes(pown_string: str) -> bytes:
     return bytes(pown_bytes)
 
 
+def denomination_to_display_value(denomination: int) -> str:
+    """
+    Convert denomination code to human-readable display value.
+
+    Per coin-file-format=9.md:
+    - Positive values: 10^denomination (e.g., 0->1, 1->10, 2->100)
+    - Negative values: fractional (e.g., -1->0.1, -2->0.01)
+
+    Args:
+        denomination: Denomination code (-8 to +11)
+
+    Returns:
+        Formatted value string (e.g., "1", "100", "0.01")
+    """
+    if denomination >= 0:
+        value = 10 ** denomination
+        if value >= 1000:
+            # Add commas for large numbers
+            return f"{value:,}"
+        return str(value)
+    else:
+        # Fractional values
+        decimal_places = -denomination
+        return f"0.{'0' * (decimal_places - 1)}1"
+
+
 def generate_coin_filename(
     denomination: int,
     serial_number: int,
-    pown_string: str
+    tag: str = ""
 ) -> str:
     """
     Generate filename for CloudCoin .bin file.
 
-    Format: {denomination}.{serial_number}.{pown_string}.bin
-    Example: 1.12345678.ppppppppppppppppppppppppp.bin
+    Format per coin-file-format=9.md:
+        {formatted_value} CloudCoin #{serial_number} {tag}.bin
+    Example: 1 CloudCoin #12345678.bin
 
     Args:
-        denomination: Coin denomination code (signed int8)
+        denomination: Coin denomination code (signed int8, -8 to +11)
         serial_number: Coin serial number
-        pown_string: 25-character POWN string
+        tag: Optional tag/memo for the coin
 
     Returns:
-        Filename string
+        Filename string following documented convention
     """
-    return f"{denomination}.{serial_number}.{pown_string}.bin"
+    value_str = denomination_to_display_value(denomination)
+
+    if tag:
+        return f"{value_str} CloudCoin #{serial_number} {tag}.bin"
+    else:
+        return f"{value_str} CloudCoin #{serial_number}.bin"
 
 
 def write_coin_file(
@@ -1267,21 +1309,22 @@ def write_coin_file(
     - Coin Body: 400 bytes (25 ANs x 16 bytes)
 
     File Header (32 bytes):
-    - [0]: File format version (0x01)
+    - [0]: File format version (0x09)
     - [1]: Reserved (0x01)
     - [2-3]: Coin ID (0x00 0x06, big-endian)
-    - [4]: Encryption type (0x00 = none)
-    - [5-7]: Reserved (zeros)
-    - [8-9]: Token count (0x00 0x01, big-endian, 1 coin)
-    - [10-15]: Reserved (zeros)
+    - [4]: Experimental (0x00)
+    - [5]: Encryption type (0x00 = none)
+    - [6-7]: Token count (0x00 0x01, big-endian, 1 coin)
+    - [8-14]: Password hash (zeros)
+    - [15]: State flag (zeros)
     - [16-28]: POWN bytes (13 bytes)
     - [29-31]: Padding (0x99 0x99 0x99)
 
     Coin Header (7 bytes):
     - [0]: Split (0x00)
-    - [1]: Denomination (int8, signed)
-    - [2-5]: Serial number (uint32, big-endian)
-    - [6]: Reserved (0x00)
+    - [1]: Shard (0x00)
+    - [2]: Denomination (int8, signed)
+    - [3-6]: Serial number (uint32, big-endian)
 
     Coin Body (400 bytes):
     - [0-399]: 25 ANs, 16 bytes each
@@ -1299,15 +1342,16 @@ def write_coin_file(
     try:
         # Build file header (32 bytes)
         file_header = bytearray(32)
-        file_header[0] = CC_FILE_FORMAT_VERSION  # Version
+        file_header[0] = CC_FILE_FORMAT_VERSION  # Version (0x09)
         file_header[1] = 0x01  # Reserved
         file_header[2] = (CC_COIN_ID >> 8) & 0xFF  # Coin ID high byte
         file_header[3] = CC_COIN_ID & 0xFF  # Coin ID low byte
-        file_header[4] = CC_ENCRYPTION_NONE  # No encryption
-        # [5-7] reserved, already zeros
-        file_header[8] = 0x00  # Token count high byte
-        file_header[9] = 0x01  # Token count low byte (1 coin)
-        # [10-15] reserved, already zeros
+        file_header[4] = 0x00  # Experimental
+        file_header[5] = CC_ENCRYPTION_NONE  # Encryption type
+        file_header[6] = 0x00  # Token count high byte
+        file_header[7] = 0x01  # Token count low byte (1 coin)
+        # [8-14] password hash, already zeros
+        # [15] state flag, already zero
 
         # POWN bytes (13 bytes at positions 16-28)
         pown_bytes = _encode_pown_bytes(coin.pown_string)
@@ -1321,10 +1365,10 @@ def write_coin_file(
         # Build coin header (7 bytes)
         coin_header = bytearray(7)
         coin_header[0] = 0x00  # Split
-        coin_header[1] = coin.denomination & 0xFF  # Denomination (signed int8)
+        coin_header[1] = 0x00  # Shard
+        coin_header[2] = coin.denomination & 0xFF  # Denomination (signed int8)
         # Serial number (uint32, big-endian)
-        coin_header[2:6] = struct.pack('>I', coin.serial_number)
-        coin_header[6] = 0x00  # Reserved
+        coin_header[3:7] = struct.pack('>I', coin.serial_number)
 
         # Build coin body (400 bytes - 25 ANs)
         coin_body = bytearray(400)
@@ -1363,7 +1407,8 @@ def read_coin_denomination(filepath: str) -> Tuple[CloudCoinErrorCode, int]:
     Read just the denomination from a coin file.
 
     This is a quick way to get the value without reading the full file.
-    Denomination is at byte offset 34 (0-indexed).
+    Denomination is at byte offset 34 (0-indexed):
+    32 (header) + 1 (split) + 1 (shard) = 34
 
     Args:
         filepath: Path to .bin file
@@ -1375,8 +1420,8 @@ def read_coin_denomination(filepath: str) -> Tuple[CloudCoinErrorCode, int]:
 
     try:
         with open(filepath, 'rb') as f:
-            # Seek to denomination byte (32 header + 1 split + 1 denom = byte 34)
-            f.seek(33)
+            # Seek to denomination byte (32 header + 1 split + 1 shard = byte 34)
+            f.seek(34)
             denom_byte = f.read(1)
             if not denom_byte:
                 return CloudCoinErrorCode.ERR_IO_ERROR, 0
@@ -1401,6 +1446,9 @@ if __name__ == "__main__":
     """
     import tempfile
     import shutil
+
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
 
     print("=" * 60)
     print("cloudcoin.py - Test Suite")

@@ -22,6 +22,7 @@ try:
     from .qmail_types import ErrorCode, StorageDuration
     from .logger import log_error, log_info, log_debug, log_warning
     from .protocol import weeks_to_duration_code
+    from .wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     from enum import IntEnum
@@ -65,6 +66,8 @@ except ImportError:
             return 5
         else:
             return 255
+
+    from wallet_structure import initialize_wallet_structure
 
 
 # ============================================================================
@@ -435,6 +438,9 @@ def calculate_total_payment(
 # ============================================================================
 
 if __name__ == "__main__":
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
+
     print("=" * 60)
     print("payment.py - Test Suite")
     print("=" * 60)

@@ -6,7 +6,7 @@ import sys
 import os
 import socket
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from locker_download import RAIDA_COUNT
 from key_manager import get_keys_from_locker_code

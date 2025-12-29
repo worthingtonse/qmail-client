@@ -288,11 +288,16 @@ if __name__ == '__main__':
     # Import logger functions for standalone testing
     try:
         from .logger import init_logger, close_logger
+        from .wallet_structure import initialize_wallet_structure
     except ImportError:
         # For standalone execution, try direct import
         import sys
         sys.path.insert(0, os.path.dirname(__file__))
         from logger import init_logger, close_logger
+        from wallet_structure import initialize_wallet_structure
+
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
 
     # --- Logger Setup ---
     log_dir = os.path.join(os.path.dirname(__file__), '..', 'Data')

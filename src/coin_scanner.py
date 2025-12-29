@@ -24,6 +24,7 @@ from enum import IntEnum
 try:
     from .cloudcoin import CloudCoinErrorCode
     from .logger import log_error, log_warning, log_debug, log_info
+    from .wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback definitions for standalone usage
     class CloudCoinErrorCode(IntEnum):
@@ -45,6 +46,8 @@ except ImportError:
 
     def log_info(handle, context, msg):
         print(f"[INFO] [{context}] {msg}")
+
+    from wallet_structure import initialize_wallet_structure
 
 
 # ============================================================================
@@ -342,6 +345,9 @@ def scan_wallet_folders(bank_path: str, fracked_path: str, limbo_path: Optional[
 # ============================================================================
 
 if __name__ == "__main__":
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
+
     print("=" * 60)
     print("CloudCoin Scanner Test")
     print("=" * 60)

@@ -47,6 +47,7 @@ try:
         NetworkConfig,
         NetworkErrorCode,
     )
+    from .wallet_structure import initialize_wallet_structure
     from .cloudcoin import (
         LockerCoin,
         write_coin_file,
@@ -71,6 +72,7 @@ except ImportError:
         NetworkConfig,
         NetworkErrorCode,
     )
+    from wallet_structure import initialize_wallet_structure
     from cloudcoin import (
         LockerCoin,
         write_coin_file,
@@ -95,26 +97,46 @@ BREAK_CONTEXT = "CoinBreak"
 # Consensus requirement
 MIN_CONSENSUS = 13  # Minimum RAIDAs needed for success
 
-# Serial number range for new coins
-MIN_STARTING_SN = 100_000
-MAX_STARTING_SN = 16_777_215
+# Serial number range for new coins (per G. Change Service.md specification)
+MIN_STARTING_SN = 32_768
+MAX_STARTING_SN = 131_062
 
-# Denomination encoding (value -> code)
+# Denomination encoding (value -> code) - Full table per coin-file-format=9.md
 DENOM_TO_CODE = {
-    0.1: -1,
-    1: 0,
-    10: 1,
-    100: 2,
-    1000: 3,
+    0.00000001: -8,
+    0.0000001:  -7,
+    0.000001:   -6,
+    0.00001:    -5,
+    0.0001:     -4,
+    0.001:      -3,
+    0.01:       -2,
+    0.1:        -1,
+    1:           0,
+    10:          1,
+    100:         2,
+    1000:        3,
+    10000:       4,
+    100000:      5,
+    1000000:     6,
 }
 
-# Denomination decoding (code -> value)
+# Denomination decoding (code -> value) - Full table per coin-file-format=9.md
 CODE_TO_DENOM = {
+    -8: 0.00000001,
+    -7: 0.0000001,
+    -6: 0.000001,
+    -5: 0.00001,
+    -4: 0.0001,
+    -3: 0.001,
+    -2: 0.01,
     -1: 0.1,
-    0: 1,
-    1: 10,
-    2: 100,
-    3: 1000,
+     0: 1,
+     1: 10,
+     2: 100,
+     3: 1000,
+     4: 10000,
+     5: 100000,
+     6: 1000000,
 }
 
 # Response status codes
@@ -164,7 +186,7 @@ def _generate_starting_sn() -> int:
     Generate a random starting serial number for new coins.
 
     Returns:
-        Random integer between 100,000 and 16,777,215
+        Random integer between 32,768 and 131,062 (per G. Change Service.md)
     """
     return secrets.randbelow(MAX_STARTING_SN - MIN_STARTING_SN + 1) + MIN_STARTING_SN
 
@@ -521,8 +543,7 @@ def _save_new_coins_to_fracked(
     for coin in coins:
         filename = generate_coin_filename(
             coin.denomination,
-            coin.serial_number,
-            coin.pown_string
+            coin.serial_number
         )
         filepath = os.path.join(fracked_path, filename)
 
@@ -742,6 +763,9 @@ async def break_coin_by_denomination(
 # ============================================================================
 
 if __name__ == "__main__":
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
+
     print("=" * 60)
     print("coin_break.py - CloudCoin Break Module")
     print("=" * 60)
@@ -766,12 +790,26 @@ if __name__ == "__main__":
     print("   SUCCESS: PAN generation works")
 
     print("\n3. Testing denomination codes...")
+    # Test all 15 denominations (-8 to +6)
+    assert len(DENOM_TO_CODE) == 15, f"Expected 15 denominations, got {len(DENOM_TO_CODE)}"
+    assert len(CODE_TO_DENOM) == 15, f"Expected 15 denominations, got {len(CODE_TO_DENOM)}"
+    # Test boundary values
+    assert DENOM_TO_CODE[0.00000001] == -8, "Smallest denomination"
+    assert DENOM_TO_CODE[1000000] == 6, "Largest denomination"
+    assert CODE_TO_DENOM[-8] == 0.00000001, "Smallest denomination"
+    assert CODE_TO_DENOM[6] == 1000000, "Largest denomination"
+    # Test middle values
     assert DENOM_TO_CODE[1] == 0
     assert DENOM_TO_CODE[10] == 1
     assert DENOM_TO_CODE[100] == 2
     assert CODE_TO_DENOM[0] == 1
     assert CODE_TO_DENOM[1] == 10
     assert CODE_TO_DENOM[-1] == 0.1
+    # Verify round-trip for all codes
+    for code in range(-8, 7):
+        value = CODE_TO_DENOM[code]
+        assert DENOM_TO_CODE[value] == code, f"Round-trip failed for code {code}"
+    print(f"   Verified all 15 denominations (codes -8 to +6)")
     print("   SUCCESS: Denomination encoding works")
 
     print("\n" + "=" * 60)

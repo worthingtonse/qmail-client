@@ -38,22 +38,24 @@ MAILBOX_WALLET = "Mailbox"
 
 # Subfolders required in each wallet (from folder_structure.png)
 WALLET_SUBFOLDERS = [
-    "Gallery",              # Gallery storage
-    "Personal",             # Personal items
     "Attachments",          # Email attachments
     "Bank",                 # Authenticated CloudCoins (good coins)
     "Bucket",               # Temporary bucket storage
     "Contacts",             # Contact information
+    "Counterfeit",             # Contact information   
+    "Decryption_Failed",    # Coins that failed decryption
     "Duplicates",           # Duplicate coins
     "Downloads",            # Downloaded items
     "Emailed",              # Successfully emailed coins
     "EmailFailed",          # Failed email attempts
-    "Decryption_Failed",    # Coins that failed decryption
     "Erased",               # Erased/deleted coins
     "Export",               # Exported coins
     "Fracked",              # Coins in fracked state (need fix)
     "Frack_Failed",         # Coins that failed fracking
     "Fraud",                # Fraudulent coins detected
+    "Gallery",              # Gallery storage
+    "Grade",              # Gallery storage
+    "Personal",             # Personal items
     "ID",                   # Identity-related files
     "Import",               # Coins to be imported
     "Limbo",                # Coins in uncertain state
@@ -66,6 +68,7 @@ WALLET_SUBFOLDERS = [
     "RequestResponses",     # Server request responses
     "Sent",                 # Successfully sent coins
     "Suspect",              # Suspicious coins
+    "Temp"
     "TentativeWithdraw",    # Tentative withdrawals
     "TrustedTransfer",      # Trusted transfer operations
     "Prewithdraw",          # Pre-withdrawal staging

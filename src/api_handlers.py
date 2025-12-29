@@ -56,6 +56,9 @@ from src.database import (
 # Data sync imports
 from src.data_sync import sync_all, SyncErrorCode
 
+# Wallet structure imports
+from src.wallet_structure import initialize_wallet_structure
+
 # Beacon imports
 from src.beacon import do_peek
 from src.network import NetworkErrorCode
@@ -2848,6 +2851,9 @@ def register_all_routes(server):
 # ============================================================================
 
 if __name__ == "__main__":
+    # Ensure wallet folders exist
+    initialize_wallet_structure()
+
     print("api_handlers.py - API Handlers")
     print("=" * 50)
     print("This module provides handler functions for the QMail REST API.")
