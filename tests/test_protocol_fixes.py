@@ -11,16 +11,18 @@ Or standalone: python tests/test_protocol_fixes.py
 
 import sys
 import os
+import struct
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 
 def test_ping_body_size():
-    """PING body should be 50 bytes (was 51 before fix)."""
+    """PING body should be 50 bytes."""
     from protocol import build_ping_body
 
-    body = build_ping_body(
+    # FIXED: Unpack tuple (body, challenge)
+    body, _ = build_ping_body(
         denomination=1,
         serial_number=0x12345678,
         device_id=0x0A,  # Test with non-zero device
@@ -32,11 +34,12 @@ def test_ping_body_size():
 
 
 def test_ping_device_id_offset():
-    """Device ID should be at offset 31 (1 byte)."""
+    """Device ID should be at offset 31 (1 byte) per protocol.c check."""
     from protocol import build_ping_body
 
     test_device_id = 0xAB  # Distinctive value
-    body = build_ping_body(
+    # FIXED: Unpack tuple
+    body, _ = build_ping_body(
         denomination=1,
         serial_number=0x12345678,
         device_id=test_device_id,
@@ -47,27 +50,26 @@ def test_ping_device_id_offset():
     assert body[31] == test_device_id, \
         f"Device ID at offset 31 should be {test_device_id:#x}, got {body[31]:#x}"
 
-    # Verify it's NOT spilling into offset 32 (which is now AN start)
-    # If old 16-bit packing was used, offset 32 would have part of device_id
     print(f"PASS: Device ID at offset 31 = {body[31]:#x}")
 
 
 def test_ping_an_offset():
-    """AN should be at offset 32-47 (not 33-48)."""
+    """AN should be at offset 32-47 (Not 33-48) for server identity check."""
     from protocol import build_ping_body
 
     # Use distinctive AN pattern
     test_an = bytes([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
                      0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00])
 
-    body = build_ping_body(
+    # FIXED: Unpack tuple
+    body, _ = build_ping_body(
         denomination=1,
         serial_number=0x12345678,
         device_id=0x0A,
         an=test_an
     )
 
-    # AN should be at bytes 32-47
+    # AN should be at bytes 32-47 (Offset 32)
     extracted_an = body[32:48]
     assert extracted_an == test_an, \
         f"AN at offset 32-47 should match. Got: {extracted_an.hex()}"
@@ -79,7 +81,8 @@ def test_ping_terminator_offset():
     """Terminator should be at offset 48-49."""
     from protocol import build_ping_body, TERMINATOR
 
-    body = build_ping_body(
+    # FIXED: Unpack tuple
+    body, _ = build_ping_body(
         denomination=1,
         serial_number=0x12345678,
         device_id=0x0A,
@@ -94,10 +97,11 @@ def test_ping_terminator_offset():
 
 
 def test_peek_body_size():
-    """PEEK body should be 54 bytes (was 55 before fix)."""
+    """PEEK body should be 54 bytes."""
     from protocol import build_peek_body
 
-    body = build_peek_body(
+    # FIXED: Unpack tuple
+    body, _ = build_peek_body(
         denomination=1,
         serial_number=0x12345678,
         device_id=0x0A,
@@ -114,7 +118,8 @@ def test_peek_device_id_offset():
     from protocol import build_peek_body
 
     test_device_id = 0xCD
-    body = build_peek_body(
+    # FIXED: Unpack tuple
+    body, _ = build_peek_body(
         denomination=1,
         serial_number=0x12345678,
         device_id=test_device_id,
@@ -129,12 +134,12 @@ def test_peek_device_id_offset():
 
 
 def test_peek_timestamp_offset():
-    """PEEK timestamp should be at offset 48-51."""
+    """PEEK timestamp should be at offset 48-51 (4 bytes big-endian)."""
     from protocol import build_peek_body
-    import struct
 
     test_timestamp = 0xDEADBEEF
-    body = build_peek_body(
+    # FIXED: Unpack tuple
+    body, _ = build_peek_body(
         denomination=1,
         serial_number=0x12345678,
         device_id=0x0A,
@@ -189,6 +194,7 @@ def test_upload_payload_offsets():
     test_locker = bytes([0x33] * 8)
     test_data = b"test stripe data"
 
+    # Already correctly unpacking (returns err, payload, challenge)
     err, payload, challenge = build_upload_payload(
         denomination=1,
         serial_number=0x12345678,
@@ -202,7 +208,7 @@ def test_upload_payload_offsets():
 
     # Check Device ID at offset 31 (1 byte)
     assert payload[31] == test_device_id, \
-        f"Device ID at offset 31 should be {test_device_id:#x}"
+        f"Device ID at offset 31 should be {test_device_id:#x}, got {payload[31]:#x}"
 
     # Check AN at offset 32-47
     assert payload[32:48] == test_an, \
@@ -220,9 +226,10 @@ def test_upload_payload_offsets():
 
 
 def test_download_payload_size():
-    """Download payload should be 83 bytes (was 84 before fix)."""
+    """Download payload should be 83 bytes."""
     from protocol import build_download_payload
 
+    # Already correctly unpacking
     err, payload, challenge = build_download_payload(
         denomination=1,
         serial_number=0x12345678,

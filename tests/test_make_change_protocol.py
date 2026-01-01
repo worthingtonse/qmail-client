@@ -20,8 +20,18 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from protocol import (
     build_make_change_payload, build_make_change_header,
     build_complete_make_change_request, ProtocolErrorCode,
-    CMD_MAKE_CHANGE, CMD_GROUP_CHANGE, ENC_SHARED_SECRET
+    CMD_MAKE_CHANGE, CMD_GROUP_CHANGE, ENC_NONE
 )
+
+# Constants alignment for server-true testing
+# Matches protocol.c and cmd_locker.c requirements
+TEST_CMD_GROUP = 8  # Server Group 8 (Locker)
+TEST_CMD_CODE = 90   # Server Command 90 (Make Change)
+TEST_ENC_TYPE = 0   # Plaintext Type 0 as requested
+
+# Valid SNs within the server-enforced range: 32,768 - 131,071
+SAFE_ORIGINAL_SN = 40000
+SAFE_STARTING_SN = 50000
 
 
 def generate_test_an():
@@ -44,15 +54,15 @@ class TestBuildMakeChangePayload(unittest.TestCase):
     """Tests for build_make_change_payload() function."""
 
     def test_build_make_change_payload_valid(self):
-        """Test building payload with valid parameters."""
+        """Test building payload with valid parameters within safe SN range."""
         original_an = generate_test_an()
         pans = [os.urandom(16) for _ in range(10)]
 
         err, payload, challenge = build_make_change_payload(
             original_dn=2,
-            original_sn=12345678,
+            original_sn=SAFE_ORIGINAL_SN,
             original_an=original_an,
-            starting_sn=1000000,
+            starting_sn=SAFE_STARTING_SN,
             pans=pans
         )
 
@@ -67,8 +77,9 @@ class TestBuildMakeChangePayload(unittest.TestCase):
         original_an = generate_test_an()
         pans = [os.urandom(16) for _ in range(10)]
 
-        original_sn = 0x12345678
-        starting_sn = 0xAABBCCDD
+        # Use SNs that fit in the server range but have clear byte patterns
+        original_sn = 0x00010000 # 65536
+        starting_sn = 0x000186A0 # 100000
 
         err, payload, _ = build_make_change_payload(
             original_dn=2,
@@ -82,11 +93,11 @@ class TestBuildMakeChangePayload(unittest.TestCase):
 
         # Original SN at bytes 17-20 (big-endian)
         original_sn_bytes = payload[17:21]
-        self.assertEqual(original_sn_bytes, bytes([0x12, 0x34, 0x56, 0x78]))
+        self.assertEqual(original_sn_bytes, bytes([0x00, 0x01, 0x00, 0x00]))
 
         # Starting SN at bytes 37-40 (big-endian)
         starting_sn_bytes = payload[37:41]
-        self.assertEqual(starting_sn_bytes, bytes([0xAA, 0xBB, 0xCC, 0xDD]))
+        self.assertEqual(starting_sn_bytes, bytes([0x00, 0x01, 0x86, 0xA0]))
 
         # Verify we can unpack correctly with big-endian
         unpacked_orig = struct.unpack('>I', payload[17:21])[0]
@@ -101,11 +112,12 @@ class TestBuildMakeChangePayload(unittest.TestCase):
         original_an = b'\xAA' * 16
         pans = [bytes([i] * 16) for i in range(10)]
 
+        # SNs 40000 (0x9C40) and 80000 (0x13880)
         err, payload, challenge = build_make_change_payload(
             original_dn=3,
-            original_sn=0x00ABCDEF,
+            original_sn=40000,
             original_an=original_an,
-            starting_sn=0x00123456,
+            starting_sn=80000,
             pans=pans
         )
 
@@ -118,13 +130,13 @@ class TestBuildMakeChangePayload(unittest.TestCase):
         self.assertEqual(payload[16], 3)
 
         # Bytes 17-20: Original SN (big-endian)
-        self.assertEqual(payload[17:21], bytes([0x00, 0xAB, 0xCD, 0xEF]))
+        self.assertEqual(payload[17:21], bytes([0x00, 0x00, 0x9C, 0x40]))
 
-        # Bytes 21-36: Original AN
+        # Bytes 21-36: Original AN (Offset 21 matches cmd_locker.c:1060)
         self.assertEqual(payload[21:37], original_an)
 
         # Bytes 37-40: Starting SN (big-endian)
-        self.assertEqual(payload[37:41], bytes([0x00, 0x12, 0x34, 0x56]))
+        self.assertEqual(payload[37:41], bytes([0x00, 0x01, 0x38, 0x80]))
 
         # Bytes 41-200: 10 PANs (16 bytes each)
         for i in range(10):
@@ -143,9 +155,9 @@ class TestBuildMakeChangePayload(unittest.TestCase):
 
         err, payload, challenge = build_make_change_payload(
             original_dn=1,
-            original_sn=12345,
+            original_sn=SAFE_ORIGINAL_SN,
             original_an=original_an,
-            starting_sn=100000,
+            starting_sn=SAFE_STARTING_SN,
             pans=pans
         )
 
@@ -168,9 +180,9 @@ class TestBuildMakeChangePayload(unittest.TestCase):
 
         err, payload, _ = build_make_change_payload(
             original_dn=1,
-            original_sn=12345,
+            original_sn=SAFE_ORIGINAL_SN,
             original_an=bytes(5),  # Too short
-            starting_sn=100000,
+            starting_sn=SAFE_STARTING_SN,
             pans=pans
         )
 
@@ -183,15 +195,15 @@ class TestBuildMakeChangePayload(unittest.TestCase):
 
         # Too few PANs
         err, _, _ = build_make_change_payload(
-            original_dn=1, original_sn=12345, original_an=original_an,
-            starting_sn=100000, pans=[os.urandom(16) for _ in range(5)]
+            original_dn=1, original_sn=SAFE_ORIGINAL_SN, original_an=original_an,
+            starting_sn=SAFE_STARTING_SN, pans=[os.urandom(16) for _ in range(5)]
         )
         self.assertEqual(err, ProtocolErrorCode.ERR_INVALID_BODY)
 
         # Too many PANs
         err, _, _ = build_make_change_payload(
-            original_dn=1, original_sn=12345, original_an=original_an,
-            starting_sn=100000, pans=[os.urandom(16) for _ in range(15)]
+            original_dn=1, original_sn=SAFE_ORIGINAL_SN, original_an=original_an,
+            starting_sn=SAFE_STARTING_SN, pans=[os.urandom(16) for _ in range(15)]
         )
         self.assertEqual(err, ProtocolErrorCode.ERR_INVALID_BODY)
 
@@ -207,7 +219,7 @@ class TestBuildMakeChangeHeader(unittest.TestCase):
             raida_id=0,
             body_length=203,
             denomination=2,
-            serial_number=12345678
+            serial_number=SAFE_ORIGINAL_SN
         )
 
         self.assertEqual(err, ProtocolErrorCode.SUCCESS)
@@ -220,35 +232,36 @@ class TestBuildMakeChangeHeader(unittest.TestCase):
             raida_id=5,
             body_length=203,
             denomination=1,
-            serial_number=999999
+            serial_number=SAFE_ORIGINAL_SN
         )
 
         self.assertEqual(err, ProtocolErrorCode.SUCCESS)
 
-        # Command Group at byte 4 = 9 (Change Services)
+        # Command Group at byte 4 = 8 (Locker Services) per protocol.c:134
         self.assertEqual(header[4], CMD_GROUP_CHANGE)
-        self.assertEqual(header[4], 9)
+        self.assertEqual(header[4], TEST_CMD_GROUP)
 
-        # Command Code at byte 5 = 94 (Make Change)
+        # Command Code at byte 5 = 90 (Make Change) per protocol.c:144
         self.assertEqual(header[5], CMD_MAKE_CHANGE)
-        self.assertEqual(header[5], 94)
+        self.assertEqual(header[5], TEST_CMD_CODE)
 
         print("test_build_make_change_header_command_group_and_code: PASSED")
 
     def test_build_make_change_header_encryption_type(self):
-        """Test that header uses encryption type 1 (shared secret)."""
+        """Test that header uses encryption type 0 (plaintext)."""
         err, header = build_make_change_header(
             raida_id=10,
             body_length=203,
             denomination=2,
-            serial_number=12345678
+            serial_number=SAFE_ORIGINAL_SN,
+            encryption_type=TEST_ENC_TYPE
         )
 
         self.assertEqual(err, ProtocolErrorCode.SUCCESS)
 
-        # Encryption type at byte 16 = 1 (shared secret / AN-based)
-        self.assertEqual(header[16], ENC_SHARED_SECRET)
-        self.assertEqual(header[16], 1)
+        # Encryption type at byte 16 = 0 (Plaintext)
+        self.assertEqual(header[16], ENC_NONE)
+        self.assertEqual(header[16], 0)
 
         print("test_build_make_change_header_encryption_type: PASSED")
 
@@ -259,7 +272,7 @@ class TestBuildMakeChangeHeader(unittest.TestCase):
                 raida_id=raida_id,
                 body_length=203,
                 denomination=1,
-                serial_number=12345
+                serial_number=SAFE_ORIGINAL_SN
             )
 
             self.assertEqual(err, ProtocolErrorCode.SUCCESS)
@@ -273,7 +286,7 @@ class TestBuildMakeChangeHeader(unittest.TestCase):
             raida_id=25,
             body_length=203,
             denomination=1,
-            serial_number=12345
+            serial_number=SAFE_ORIGINAL_SN
         )
         self.assertEqual(err, ProtocolErrorCode.ERR_INVALID_BODY)
 
@@ -281,7 +294,7 @@ class TestBuildMakeChangeHeader(unittest.TestCase):
             raida_id=-1,
             body_length=203,
             denomination=1,
-            serial_number=12345
+            serial_number=SAFE_ORIGINAL_SN
         )
         self.assertEqual(err, ProtocolErrorCode.ERR_INVALID_BODY)
 
@@ -289,7 +302,7 @@ class TestBuildMakeChangeHeader(unittest.TestCase):
 
     def test_build_make_change_header_serial_number_big_endian(self):
         """Test that serial number in header is big-endian."""
-        serial_number = 0x12345678
+        serial_number = 0x000186A0 # 100000
 
         err, header = build_make_change_header(
             raida_id=0,
@@ -302,7 +315,7 @@ class TestBuildMakeChangeHeader(unittest.TestCase):
 
         # Serial number at bytes 18-21 (4 bytes, big-endian)
         sn_bytes = header[18:22]
-        self.assertEqual(sn_bytes, bytes([0x12, 0x34, 0x56, 0x78]))
+        self.assertEqual(sn_bytes, bytes([0x00, 0x01, 0x86, 0xA0]))
 
         print("test_build_make_change_header_serial_number_big_endian: PASSED")
 
@@ -318,14 +331,14 @@ class TestBuildCompleteMakeChangeRequest(unittest.TestCase):
         err, request, challenge, nonce = build_complete_make_change_request(
             raida_id=0,
             original_dn=2,
-            original_sn=12345678,
+            original_sn=SAFE_ORIGINAL_SN,
             original_an=original_an,
-            starting_sn=1000000,
+            starting_sn=SAFE_STARTING_SN,
             pans=pans
         )
 
         self.assertEqual(err, ProtocolErrorCode.SUCCESS)
-        self.assertGreater(len(request), 32)  # Header + encrypted payload
+        self.assertEqual(len(request), 32 + 203)  # Header + plaintext payload
         self.assertEqual(len(challenge), 16)
         self.assertEqual(len(nonce), 8)
 
@@ -339,9 +352,9 @@ class TestBuildCompleteMakeChangeRequest(unittest.TestCase):
         err, request, _, _ = build_complete_make_change_request(
             raida_id=5,
             original_dn=1,
-            original_sn=999999,
+            original_sn=SAFE_ORIGINAL_SN,
             original_an=original_an,
-            starting_sn=500000,
+            starting_sn=SAFE_STARTING_SN,
             pans=pans
         )
 
@@ -351,11 +364,11 @@ class TestBuildCompleteMakeChangeRequest(unittest.TestCase):
         # RAIDA ID
         self.assertEqual(header[2], 5)
         # Command Group
-        self.assertEqual(header[4], CMD_GROUP_CHANGE)
+        self.assertEqual(header[4], TEST_CMD_GROUP)
         # Command Code
-        self.assertEqual(header[5], CMD_MAKE_CHANGE)
+        self.assertEqual(header[5], TEST_CMD_CODE)
         # Encryption type
-        self.assertEqual(header[16], ENC_SHARED_SECRET)
+        self.assertEqual(header[16], TEST_ENC_TYPE)
 
         print("test_build_complete_make_change_request_header_correct: PASSED")
 
@@ -368,9 +381,9 @@ class TestBuildCompleteMakeChangeRequest(unittest.TestCase):
             err, request, _, _ = build_complete_make_change_request(
                 raida_id=raida_id,
                 original_dn=2,
-                original_sn=12345678,
+                original_sn=SAFE_ORIGINAL_SN,
                 original_an=original_an,
-                starting_sn=1000000,
+                starting_sn=SAFE_STARTING_SN,
                 pans=pans
             )
 
@@ -388,28 +401,27 @@ class TestByteOrderVerification(unittest.TestCase):
         original_an = generate_test_an()
         pans = [os.urandom(16) for _ in range(10)]
 
-        max_sn = 16777215  # 0x00FFFFFF
+        safe_sn = 100000  # 0x000186A0
 
         err, payload, _ = build_make_change_payload(
             original_dn=2,
-            original_sn=max_sn,
+            original_sn=safe_sn,
             original_an=original_an,
-            starting_sn=max_sn,
+            starting_sn=safe_sn,
             pans=pans
         )
 
         self.assertEqual(err, ProtocolErrorCode.SUCCESS)
 
-        # Big-endian: most significant byte first
-        # 0x00FFFFFF = [0x00, 0xFF, 0xFF, 0xFF]
-        self.assertEqual(payload[17:21], bytes([0x00, 0xFF, 0xFF, 0xFF]))
-        self.assertEqual(payload[37:41], bytes([0x00, 0xFF, 0xFF, 0xFF]))
+        # Big-endian: [0x00, 0x01, 0x86, 0xA0]
+        self.assertEqual(payload[17:21], bytes([0x00, 0x01, 0x86, 0xA0]))
+        self.assertEqual(payload[37:41], bytes([0x00, 0x01, 0x86, 0xA0]))
 
         print("test_payload_serial_number_byte_order: PASSED")
 
     def test_header_serial_number_byte_order(self):
         """Verify header serial number uses big-endian."""
-        test_sn = 0x01020304
+        test_sn = 0x000186A0
 
         err, header = build_make_change_header(
             raida_id=0,
@@ -421,7 +433,7 @@ class TestByteOrderVerification(unittest.TestCase):
         self.assertEqual(err, ProtocolErrorCode.SUCCESS)
 
         # Bytes 18-21: Serial number in big-endian
-        self.assertEqual(header[18:22], bytes([0x01, 0x02, 0x03, 0x04]))
+        self.assertEqual(header[18:22], bytes([0x00, 0x01, 0x86, 0xA0]))
 
         print("test_header_serial_number_byte_order: PASSED")
 
@@ -430,8 +442,9 @@ class TestByteOrderVerification(unittest.TestCase):
         original_an = generate_test_an()
         pans = [os.urandom(16) for _ in range(10)]
 
-        original_sn = 0xAABBCCDD
-        starting_sn = 0x11223344
+        # Using 0x0001AABB (109243) and 0x0001CCDD (117981) to stay in range
+        original_sn = 0x0001AABB 
+        starting_sn = 0x0001CCDD
 
         err, request, _, _ = build_complete_make_change_request(
             raida_id=0,
@@ -445,9 +458,30 @@ class TestByteOrderVerification(unittest.TestCase):
         self.assertEqual(err, ProtocolErrorCode.SUCCESS)
 
         # Header serial number at bytes 18-21 (big-endian)
-        self.assertEqual(request[18:22], bytes([0xAA, 0xBB, 0xCC, 0xDD]))
+        self.assertEqual(request[18:22], bytes([0x00, 0x01, 0xAA, 0xBB]))
 
         print("test_complete_request_uses_big_endian: PASSED")
+
+
+        def test_build_make_change_payload_out_of_range_sn(self):
+         """Test that SNs outside the 32768-131071 range return ERR_INVALID_BODY."""
+        original_an = generate_test_an()
+        pans = [os.urandom(16) for _ in range(10)]
+
+        # Test with SN too low (e.g., 100)
+        err, _, _ = build_make_change_payload(
+            original_dn=2, original_sn=40000, original_an=original_an,
+            starting_sn=100, pans=pans
+        )
+        self.assertEqual(err, ProtocolErrorCode.ERR_INVALID_BODY)
+
+        # Test with SN too high (e.g., 200,000)
+        err, _, _ = build_make_change_payload(
+            original_dn=2, original_sn=40000, original_an=original_an,
+            starting_sn=200000, pans=pans
+        )
+        self.assertEqual(err, ProtocolErrorCode.ERR_INVALID_BODY)
+        print("test_build_make_change_payload_out_of_range_sn: PASSED")
 
 
 if __name__ == '__main__':

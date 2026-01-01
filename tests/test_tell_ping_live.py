@@ -30,12 +30,12 @@ import unittest
 import urllib.request
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
+import unittest
 
-# Add src and tests to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-# Import protocol module
+# Now import the modules
 from protocol import (
     build_complete_ping_request,
     build_complete_peek_request,
@@ -44,6 +44,9 @@ from protocol import (
     ProtocolErrorCode
 )
 from qmail_types import TellRecipient, TellServer
+
+# ADD THIS HERE to resolve the yellow line issue
+from email_sender import verify_an_loading
 
 # ============================================================================
 # CONFIGURATION
@@ -56,7 +59,9 @@ QMAIL_SERVERS_URL = "https://raida11.cloudcoin.global/service/qmail_servers"
 BEACON_RAIDA_ID = 11  # Default, will be updated from fetched servers
 
 # Key file paths
-BASE_DIR = os.path.join(os.path.dirname(__file__), '..')
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+BANK_DIR = os.path.join(BASE_DIR, 'Data', 'Wallets', 'Default', 'Bank')
+
 SENDER_KEY_PATH = os.path.join(BASE_DIR, 'Data', 'Wallets', 'Sender', 'Bank', '00060300001AEA.key')
 RECEIVER_KEY_PATH = os.path.join(BASE_DIR, 'Data', 'Wallets', 'Receiver', 'Bank', '00060300001AEB.key')
 # New coin with denomination 0 (1 CC) - freshly converted from binary
@@ -294,63 +299,66 @@ class TestTellPingLive(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Load key file and fetch servers once for all tests."""
+        """
+        FIXED: Dynamically discovers the identity coin (9572) 
+        and handles both .bin and .key formats.
+        """
         print("\n" + "=" * 72)
         print("  TELL-PING LIVE INTEGRATION TEST")
         print("=" * 72)
 
-        # Fetch QMail servers
-        print(f"\n  Fetching QMail servers from: {QMAIL_SERVERS_URL}")
+        # 1. Fetch Servers
         success, servers, error = fetch_qmail_servers(QMAIL_SERVERS_URL)
-        if not success:
-            print(f"  [FATAL] Failed to fetch servers: {error}")
+        if not success or not servers:
             raise RuntimeError(f"Failed to fetch servers: {error}")
 
-        if not servers:
-            print("  [FATAL] No servers found")
-            raise RuntimeError("No servers found")
-
-        print(f"  [OK] Found {len(servers)} servers")
-
-        # Store servers and pick a REAL QMail server as beacon
-        # R00 and R21 are known QMail servers (return Command Group 6)
-        # R11 is NOT a QMail server (returns Command Group 0)
         cls.qmail_servers = servers
-        cls.beacon_server = None
-
-        # Prefer R11 first (most consistent in testing) then R00
-        preferred_beacons = [11, 0, 9, 14]  # RAIDA IDs that support QMail
-
-        for srv in servers:
-            print(f"    R{srv['raida_id']:02d}: {srv['host']}:{srv['port']}")
-
-        # Find beacon in priority order
-        for pref_id in preferred_beacons:
-            for srv in servers:
-                if srv['raida_id'] == pref_id:
-                    cls.beacon_server = srv
-                    break
-            if cls.beacon_server:
-                break
-
-        if cls.beacon_server is None:
-            cls.beacon_server = servers[0]
-            print(f"  [WARN] Preferred beacons not found, using R{cls.beacon_server['raida_id']}")
-
+        cls.beacon_server = next((s for s in servers if s['raida_id'] == 11), servers[0])
         cls.beacon_raida_id = cls.beacon_server['raida_id']
         cls.beacon_host = cls.beacon_server['host']
         cls.beacon_port = cls.beacon_server['port']
 
         print(f"\n  Beacon: RAIDA {cls.beacon_raida_id} ({cls.beacon_host}:{cls.beacon_port})")
 
-        # Load key file (using Receiver key which user verified works)
+        # 2. DYNAMIC IDENTITY DISCOVERY
+        # Target SN 9572 (Hex 00002564)
+        target_sn = 9572
+        sn_hex = f"{target_sn:08X}"
+        found_path = None
+
+        if os.path.exists(BANK_DIR):
+            for f_name in os.listdir(BANK_DIR):
+                if sn_hex in f_name.upper() and f_name.upper().endswith(('.BIN', '.KEY')):
+                    if not f_name.startswith('.'):
+                        found_path = os.path.join(BANK_DIR, f_name)
+                        break
+
+        if not found_path:
+            print(f"  [FATAL] Identity coin for SN {target_sn} not found in {BANK_DIR}")
+            raise FileNotFoundError(f"Identity coin (9572) not found in {BANK_DIR}")
+
+        # 3. Load Key Data based on extension
         try:
-            cls.sender_key = load_key_file(TEST_KEY_PATH)
-            print(f"\n  Key loaded: {TEST_KEY_PATH}")
-            print(f"    coin={cls.sender_key.coin_id}, denom={cls.sender_key.denomination}, sn={cls.sender_key.serial_number}")
-            print(f"    AN[{cls.beacon_raida_id}]: {cls.sender_key.ans[cls.beacon_raida_id].hex()}")
+            from email_sender import verify_an_loading
+            success, ans_hex_list, err_msg = verify_an_loading(found_path)
+            
+            if not success:
+                raise ValueError(err_msg)
+
+            # Convert hex strings back to bytes for the test logic
+            ans_bytes = [bytes.fromhex(h) for h in ans_hex_list]
+
+            # Map into a mock WalletKey object compatible with the rest of this test
+            cls.sender_key = WalletKey(
+                coin_id=6,
+                denomination=0, # Matches '1 CloudCoin'
+                serial_number=target_sn,
+                ans=ans_bytes,
+                file_path=found_path
+            )
+            print(f"  [OK] Identity loaded: {os.path.basename(found_path)}")
         except Exception as e:
-            print(f"\n  [FATAL] Failed to load key file: {e}")
+            print(f"\n  [FATAL] Failed to process coin file: {e}")
             raise
 
     def test_01_tell_ping_notification_received(self):
@@ -392,11 +400,12 @@ class TestTellPingLive(unittest.TestCase):
             try:
                 print(f"\n  [PING Thread] Building request...")
                 err, request, challenge, nonce = build_complete_ping_request(
-                    raida_id=beacon_raida_id,
-                    denomination=sender_key.denomination,
-                    serial_number=sender_key.serial_number,
-                    device_id=1,
-                    an=an
+                raida_id=beacon_raida_id,
+                denomination=sender_key.denomination,
+                serial_number=sender_key.serial_number,
+                device_id=1,
+                an=an,
+                encryption_type=0  # ADD THIS
                 )
 
                 if err != ProtocolErrorCode.SUCCESS:
@@ -445,7 +454,8 @@ class TestTellPingLive(unittest.TestCase):
             locker_payment_key=bytes(16)
         )
 
-        err, tell_request, tell_challenge = build_complete_tell_request(
+        # FIXED: Unpack 4 values
+        err, tell_request, tell_challenge, tell_nonce = build_complete_tell_request(
             raida_id=beacon_raida_id,
             denomination=sender_key.denomination,
             serial_number=sender_key.serial_number,
@@ -457,7 +467,8 @@ class TestTellPingLive(unittest.TestCase):
             tell_type=0,  # QMAIL
             recipients=[recipient],
             servers=servers,
-            beacon_payment_locker=bytes(8)
+            beacon_payment_locker=bytes(8),
+            encryption_type=0
         )
 
         if err != ProtocolErrorCode.SUCCESS:
@@ -667,7 +678,8 @@ class TestTellPingLive(unittest.TestCase):
         )
 
         print(f"\n  Building TELL request (no parallel PING)...")
-        err, tell_request, tell_challenge = build_complete_tell_request(
+       # FIXED: Unpack 4 values
+        err, tell_request, tell_challenge, tell_nonce = build_complete_tell_request(
             raida_id=beacon_raida_id,
             denomination=sender_key.denomination,
             serial_number=sender_key.serial_number,
@@ -676,7 +688,7 @@ class TestTellPingLive(unittest.TestCase):
             file_group_guid=file_group_guid,
             locker_code=locker_code,
             timestamp=timestamp,
-            tell_type=0,
+            tell_type=0,  # QMAIL
             recipients=[recipient],
             servers=servers,
             beacon_payment_locker=bytes(8)
@@ -793,16 +805,18 @@ class TestTellPingLive(unittest.TestCase):
         )
 
         print(f"\n  Building TELL with invalid AN (all zeros)...")
-        err, request, challenge = build_complete_tell_request(
+      # FIXED: Unpack 4 values
+        err, tell_request, tell_challenge, tell_nonce = build_complete_tell_request(
             raida_id=beacon_raida_id,
             denomination=sender_key.denomination,
             serial_number=sender_key.serial_number,
             device_id=1,
-            an=bad_an,  # Wrong AN
+            an=bad_an,
+            encryption_type=0,
             file_group_guid=file_group_guid,
             locker_code=locker_code,
             timestamp=timestamp,
-            tell_type=0,
+            tell_type=0,  # QMAIL
             recipients=[recipient],
             servers=servers,
             beacon_payment_locker=bytes(8)
@@ -813,7 +827,7 @@ class TestTellPingLive(unittest.TestCase):
 
         print(f"  Sending TELL with bad AN...")
         success, response, elapsed, error = send_tcp_request(
-            beacon_host, beacon_port, request, timeout_ms=10000
+            beacon_host, beacon_port, tell_request, timeout_ms=10000
         )
 
         print(f"  Response: {len(response)} bytes, {elapsed}ms")

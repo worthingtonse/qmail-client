@@ -80,14 +80,15 @@ def format_header_annotated(header):
 
 
 def test_raida(raida_id, host, port, locker_key, seed):
+    seeds = [secrets.token_bytes(16) for _ in range(25)]
     """Build request and send to RAIDA. Returns request and response."""
     try:
         err, request, challenge, nonce = build_complete_locker_download_request(
-            raida_id=raida_id,
-            locker_key=locker_key,
-            seed=seed,
-            logger_handle=None
-        )
+                raida_id=raida_id,
+                locker_code_str=locker_key, 
+                seed=seeds[raida_id],
+                logger_handle=None
+            )
         if err != ProtocolErrorCode.SUCCESS:
             return None, None, "BUILD_ERROR"
 
