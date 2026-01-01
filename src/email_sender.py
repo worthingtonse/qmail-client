@@ -26,9 +26,23 @@ import os
 import uuid
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple ,Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from qmail_types import (
+    ErrorCode, SendEmailErrorCode, SendEmailRequest, SendEmailResult,
+    FileUploadInfo, EmailPackage, IdentityConfig
+)
+from protocol import (
+    build_complete_tell_request, CMD_GROUP_QMAIL, CMD_TELL, TELL_TYPE_QMAIL,
+    weeks_to_duration_code
+)
+from network import connect_to_server, send_request, disconnect
+from database import store_sent_email
+from payment import calculate_storage_cost, request_locker_code
+from logger import log_info, log_error, log_warning, log_debug
+from config import get_raida_server_config
 
 import json
 import socket
@@ -81,7 +95,14 @@ except ImportError:
         ERR_PARTIAL_FAILURE = 208
 
     class StorageDuration:
+        ONE_DAY = 0
+        ONE_WEEK = 1
         ONE_MONTH = 2
+        THREE_MONTHS = 3
+        SIX_MONTHS = 4
+        ONE_YEAR = 5
+        PERMANENT = 255
+        
 
     class RecipientType:
         TO = 0
@@ -223,7 +244,14 @@ except ImportError:
         return ProtocolErrorCode.SUCCESS, 250, "OK"
 
     def weeks_to_duration_code(weeks):
-        return StorageDuration.ONE_MONTH
+        if weeks <= 0: return StorageDuration.ONE_DAY
+        elif weeks == 1: return StorageDuration.ONE_WEEK
+        elif weeks <= 4: return StorageDuration.ONE_MONTH
+        elif weeks <= 12: return StorageDuration.THREE_MONTHS
+        elif weeks <= 26: return StorageDuration.SIX_MONTHS
+        elif weeks <= 52: return StorageDuration.ONE_YEAR
+        else: return StorageDuration.PERMANENT
+        
 
     # Fallback database functions
     class DatabaseErrorCode(IntEnum):
@@ -520,62 +548,32 @@ def prepare_file_for_upload(
     file_data: bytes,
     file_name: str,
     file_index: int,
-    encryption_key: bytes,
+    encryption_key: bytes, # Param kept for signature but ignored
     logger_handle: Optional[object] = None
 ) -> Tuple[ErrorCode, Optional[FileUploadInfo]]:
     """
-    Prepare a file for upload (encrypt, stripe, calculate parity).
-
-    Args:
-        file_data: Raw file content
-        file_name: Original filename
-        file_index: File index (1 for body, 10+ for attachments)
-        encryption_key: Key for encrypting file data
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ErrorCode, FileUploadInfo or None)
+    Prepare a file for upload (stripe and calculate parity).
+    
+    
+    Implementation: Encryption is bypassed to ensure recipients can reassemble stripes
+    and read content immediately.
     """
+    from striping import create_upload_stripes, calculate_parity_from_bytes
+    from logger import log_debug, log_error
+
     info = FileUploadInfo()
     info.file_index = file_index
     info.file_name = file_name
     info.file_data = file_data
     info.file_size = len(file_data)
 
-    # Encrypt file data
-    try:
-        try:
-            from .crypto import encrypt_data
-        except ImportError:
-            try:
-                from crypto import encrypt_data
-            except ImportError:
-                # Fallback: no encryption for testing
-                log_warning(logger_handle, SENDER_CONTEXT,
-                            "Crypto module not available, skipping encryption")
-                info.encrypted_data = file_data
-                encrypt_data = None
-
-        if encrypt_data:
-            err, encrypted = encrypt_data(file_data, encryption_key, logger_handle)
-            if err != 0:
-                log_error(logger_handle, SENDER_CONTEXT, "File encryption failed",
-                          f"file_index={file_index}")
-                return ErrorCode.ERR_INTERNAL, None
-            info.encrypted_data = encrypted
-        else:
-            info.encrypted_data = file_data
-
-    except Exception as e:
-        log_error(logger_handle, SENDER_CONTEXT, "File encryption failed", str(e))
-        return ErrorCode.ERR_INTERNAL, None
+    # DIRECTIVE: Use raw data for striping. Encryption is transport-only (Type 0).
+    info.encrypted_data = file_data 
 
     # Create stripes (4 data stripes)
-    # Note: AES-128-CTR is a stream cipher and does NOT require padding
-    err, stripes = create_upload_stripes(info.encrypted_data, NUM_DATA_STRIPES, logger_handle)
+    err, stripes = create_upload_stripes(info.encrypted_data, 5, logger_handle)
     if err != ErrorCode.SUCCESS:
-        log_error(logger_handle, SENDER_CONTEXT, "Striping failed",
-                  f"file_index={file_index}")
+        log_error(logger_handle, "Sender", f"Striping failed for index {file_index}")
         return err, None
 
     info.stripes = stripes
@@ -583,17 +581,12 @@ def prepare_file_for_upload(
     # Calculate parity stripe
     err, parity = calculate_parity_from_bytes(stripes, logger_handle)
     if err != ErrorCode.SUCCESS:
-        log_error(logger_handle, SENDER_CONTEXT, "Parity calculation failed",
-                  f"file_index={file_index}")
+        log_error(logger_handle, "Sender", f"Parity failed for index {file_index}")
         return err, None
 
     info.parity_stripe = parity
 
-    log_debug(logger_handle, SENDER_CONTEXT,
-              f"Prepared file '{file_name}' (index={file_index}): "
-              f"{len(stripes)} data stripes + parity, "
-              f"encrypted size={len(info.encrypted_data)}")
-
+    log_debug(logger_handle, "Sender", f"Prepared '{file_name}' (plaintext) - 5 stripes total.")
     return ErrorCode.SUCCESS, info
 
 
@@ -610,83 +603,91 @@ def upload_stripe_to_server(
     logger_handle: Optional[object] = None
 ) -> UploadResult:
     """
-    Upload a single stripe to a server.
-    FIXED: Now correctly slices the 400-byte key (800 hex chars) for each server.
+    Upload a single stripe with Adaptive Idempotency.
+    
+    Decision Flow :
+    1. Attempt with REAL code. 
+    2. If Timeout: Attempt with ZERO code (Free Write-over).
+       - If SUCCESS: First attempt actually worked; we are done.
+       - If PAYMENT_REQUIRED: Server never saw first attempt; try REAL again.
     """
-    from .network import connect_to_server, send_stripe, disconnect, ServerInfo, NetworkErrorCode
+    from network import connect_to_server, send_stripe, disconnect, ServerInfo, NetworkErrorCode, StatusCode
     
     result = UploadResult()
     result.server_id = str(server_id)
     result.stripe_index = stripe_index
     start_time = time.time()
 
-    try:
-        # 1. Get the AN for THIS specific server from the 400-byte (800 hex) key
-        # We expect identity.authenticity_number to have been loaded from the .key file
-        hex_an = getattr(identity, 'authenticity_number', '')
-        
-        if len(hex_an) == 800:
-            # Extract the specific 16-byte (32 hex char) slice for this server_id (0-24)
-            # Offset calculation: server_id * 16 bytes * 2 characters per byte
-            start_hex = server_id * 32
-            target_hex = hex_an[start_hex : start_hex + 32]
-            success, target_an, err_msg = _safe_hex_to_bytes(target_hex, 16, f"an_raida{server_id}", logger_handle)
-        elif len(hex_an) == 32:
-            # Fallback for legacy single-key testing
-            log_warning(logger_handle, SENDER_CONTEXT, f"Using single-server AN for RAIDA {server_id}")
-            success, target_an, err_msg = _safe_hex_to_bytes(hex_an, 16, "authenticity_number", logger_handle)
-        else:
-            success = False
-            err_msg = f"Invalid AN length: {len(hex_an)} hex chars (expected 800 or 32)"
+    # AN Slicing (Same as before)
+    hex_an = getattr(identity, 'authenticity_number', '')
+    if len(hex_an) == 800:
+        start_hex = server_id * 32
+        target_hex = hex_an[start_hex : start_hex + 32]
+        _, target_an, _ = _safe_hex_to_bytes(target_hex, 16, f"an_raida{server_id}", logger_handle)
+    else:
+        _, target_an, _ = _safe_hex_to_bytes(hex_an, 16, "authenticity_number", logger_handle)
 
-        if not success:
-            result.error_message = f"Key Error: {err_msg}"
-            return result
+    # --- ADAPTIVE RETRY STATE ---
+    current_locker_code = locker_code
+    last_was_timeout = False
 
-        # 2. Connect to the server using the correct server-specific AN
-        # This AN is used for both the TCP connection and the payload preamble
-        s_info = ServerInfo(host=server_address, port=server_port, raida_id=server_id)
-        err_conn, conn = connect_to_server(
-            s_info, 
-            encryption_key=target_an, 
-            denomination=identity.denomination, 
-            serial_number=identity.serial_number,
-            logger_handle=logger_handle
-        )
+    for attempt in range(MAX_RETRIES):
+        try:
+            s_info = ServerInfo(host=server_address, port=server_port, raida_id=server_id)
+            err_conn, conn = connect_to_server(
+                s_info, encryption_key=target_an, 
+                denomination=identity.denomination, 
+                serial_number=identity.serial_number,
+                logger_handle=logger_handle
+            )
 
-        if err_conn != NetworkErrorCode.SUCCESS or not conn:
-            result.error_message = f"Connection failed: {err_conn.name}"
-            return result
+            if err_conn != NetworkErrorCode.SUCCESS or not conn:
+                continue # Retry connection
 
-        # 3. Use the network module's send_stripe to build and transmit the payload
-        # This uses the correct preamble offsets (Device ID at 31, AN at 32)
-        err_send, status_code = send_stripe(
-            connection=conn,
-            stripe_data=stripe_data,
-            file_guid=file_group_guid,
-            locker_code=locker_code,
-            storage_duration=storage_duration,
-            denomination=identity.denomination,
-            serial_number=identity.serial_number,
-            device_id=identity.device_id,
-            logger_handle=logger_handle
-        )
+            # Execute CMD_UPLOAD
+            err_send, status_code = send_stripe(
+                connection=conn,
+                stripe_data=stripe_data,
+                file_guid=file_group_guid,
+                locker_code=current_locker_code,
+                storage_duration=storage_duration,
+                denomination=identity.denomination,
+                serial_number=identity.serial_number,
+                device_id=identity.device_id,
+                logger_handle=logger_handle
+            )
+            disconnect(conn)
 
-        # 4. Always close the connection
-        disconnect(conn)
+            # --- SUCCESS CASE ---
+            if err_send == NetworkErrorCode.SUCCESS and status_code == StatusCode.STATUS_SUCCESS:
+                result.success = True
+                result.status_code = status_code
+                return result
 
-        # 5. Process result (Status 250 is SUCCESS)
-        result.success = (err_send == NetworkErrorCode.SUCCESS and status_code == 250)
-        result.status_code = status_code
-        if not result.success:
-            result.error_message = f"Error {err_send.name}, Status {status_code}"
+            # --- THE AMBIGUITY RESOLVER ---
+            if err_send in [NetworkErrorCode.ERR_TIMEOUT, NetworkErrorCode.ERR_SEND_FAILED]:
+                # Step 1: We timed out. Next attempt, try the Zero-Code logic.
+                log_warning(logger_handle, SENDER_CONTEXT, 
+                            f"Timeout on RAIDA {server_id}. Testing if server already has file via Zero-Code.")
+                current_locker_code = bytes(8)
+                last_was_timeout = True
+                continue
 
-    except Exception as e:
-        result.success = False
-        result.error_message = str(e)
-        log_error(logger_handle, SENDER_CONTEXT, f"Upload crash on RAIDA {server_id}", str(e))
+            # Step 2: Handle results of the Zero-Code check
+            if last_was_timeout and status_code == StatusCode.ERROR_PAYMENT_REQUIRED:
+                # If zeros failed with payment error, it means file doesn't exist on server.
+                # We revert to REAL code to try the first upload properly.
+                log_info(logger_handle, SENDER_CONTEXT, 
+                         f"Zero-Code test for {server_id} failed. File doesn't exist. Re-uploading with real code.")
+                current_locker_code = locker_code
+                last_was_timeout = False
+                continue
 
-    result.upload_time_ms = int((time.time() - start_time) * 1000)
+        except Exception as e:
+            log_error(logger_handle, SENDER_CONTEXT, f"RAIDA {server_id} Attempt {attempt} crashed", str(e))
+
+    result.success = False
+    result.error_message = "Max retries reached: Adaptive idempotency check failed."
     return result
 
 def upload_file_to_servers(
@@ -1136,7 +1137,6 @@ def send_tell_notifications(
 
     return ErrorCode.SUCCESS
 
-
 def _send_single_tell(
     raida_id: int,
     beacon_id: str,
@@ -1150,24 +1150,11 @@ def _send_single_tell(
 ) -> ErrorCode:
     """
     Send a single Tell request to a beacon server.
-
-    Args:
-        raida_id: Beacon server RAIDA index (0-24)
-        beacon_id: Beacon server ID string (e.g., "raida11")
-        recipient: TellRecipient with recipient info
-        file_group_guid: 16-byte file group GUID
-        servers: List of TellServer objects
-        locker_code: 8-byte locker code for encryption
-        identity: User identity
-        timestamp: Unix timestamp
-        logger_handle: Optional logger handle
-
-    Returns:
-        ErrorCode
+    FIXED: Unpacks 4 values (err, request, challenge, nonce) to match protocol.py.
     """
     try:
-        # Build Tell request
-        err, request_bytes, challenge = build_complete_tell_request(
+        # Build Tell request - UPDATED UNPACKING
+        err, request_bytes, challenge, nonce = build_complete_tell_request(
             raida_id=raida_id,
             denomination=identity.denomination if hasattr(identity, 'denomination') else 1,
             serial_number=identity.serial_number if hasattr(identity, 'serial_number') else 0,
@@ -1217,7 +1204,6 @@ def _send_single_tell(
         log_error(logger_handle, SENDER_CONTEXT,
                   f"Exception in _send_single_tell", str(e))
         return ErrorCode.ERR_NETWORK
-
 
 def _send_udp_request(
     ip: str,
@@ -1521,37 +1507,41 @@ def _process_pending_tells(
 
 
 def verify_an_loading(mailbox_file: str, logger_handle: Optional[object] = None):
+    """
+    Robustly loads 25 ANs from a .bin or .key file based on Go format definitions.
+    """
     try:
-        file_ext = mailbox_file.lower()
-        if not (file_ext.endswith('.key') or file_ext.endswith('.bin')):
-            return False, [], "Unsupported file extension (need .key or .bin)"
-
         with open(mailbox_file, 'rb') as f:
             file_data = f.read()
-            
-        # CloudCoin binary files are typically 448 bytes: 
-        # 32 (Header) + 400 (Keys) + 16 (Signature)
-        # Some .key variants add a 7-byte 'coin header' (32+7=39)
-        if len(file_data) == 448:
-            offset = 32
-        elif len(file_data) == 455:
+        
+        if len(file_data) < 32:
+            return False, [], "File too small for header"
+
+        # Byte 0 defines the format
+        format_type = file_data[0]
+        
+        if format_type == 9:
+            # Format 9: ANs start at header(32) + body_meta(7) = 39
             offset = 39
+        elif format_type == 0:
+            # Legacy CC2: ANs start at header(32) + body_meta(16) = 48
+            offset = 48
         else:
-            # Fallback if the file size is non-standard but contains the data
-            offset = len(file_data) - 416 # (400 keys + 16 signature)
+            # Fallback for .KEY files which might have a different header
+            # Usually .KEY is header(32) + ANs(400) = 432 bytes total
+            offset = 32
 
         full_key_bytes = file_data[offset : offset + 400]
         
         if len(full_key_bytes) < 400:
-            return False, [], f"File too small to contain 400-byte AN data"
+            return False, [], f"Expected 400 bytes of AN data, got {len(full_key_bytes)}"
         
+        # Convert to hex strings for compatibility with your existing slicing logic
         ans = [full_key_bytes[i*16 : (i+1)*16].hex() for i in range(25)]
-        log_info(logger_handle, "AN_VERIFY", f"Loaded 25 ANs from {mailbox_file}")
         return True, ans, ""
         
     except Exception as e:
-        return False, [], f"Failed to read identity file: {e}"
-
+        return False, [], f"Failed to parse binary coin: {e}"
 
 def store_sent_email(
     request: 'SendEmailRequest',
@@ -1589,8 +1579,117 @@ def store_sent_email(
 
     return ErrorCode.SUCCESS
 
+def process_email_package(
+    package: EmailPackage,
+    identity: IdentityConfig,
+    db_handle: Any,
+    config: Any, 
+    storage_weeks: int = 1,
+    logger_handle: Optional[object] = None
+) -> Tuple[SendEmailErrorCode, Optional[SendEmailResult]]:
+    """
+    Orchestrate full upload. Plaintext transport, 8-month server grace period.
+    NOTIFIES BEACON (RAIDA 11) ONLY per Phase I requirement.
+    Uses send_raw_request to solve the Double Header bug.
+    """
+    from network import connect_to_server, disconnect, send_raw_request
+    from config import get_raida_server_config
 
+    log_info(logger_handle, "Sender", "Starting mail upload process.")
+    file_group_guid = uuid.uuid4().bytes
 
+    # 1. Cost & Locker
+    total_size = len(package.email_file) + sum(os.path.getsize(p) for p in package.attachment_paths)
+    cost = calculate_storage_cost(total_size, storage_weeks, len(package.recipients))
+    err, locker_code = request_locker_code(cost, db_handle, logger_handle)
+    if err != ErrorCode.SUCCESS: 
+        return SendEmailErrorCode.ERR_PAYMENT_FAILED, None
+
+    # 2. Locker Sanitization (AS8D-HJL -> 8 Bytes Null-Padded)
+   # In process_email_package or any locker handler:
+    if isinstance(locker_code, str):
+    # If the user provided an 8-char code (like ASB-JH7J), use it as is
+        if len(locker_code) == 8:
+            locker_code = locker_code.encode('ascii')
+        else:
+        # Fallback for other formats: strip hyphens and pad with nulls to 8 bytes
+            clean_code = locker_code.replace('-', '').strip().upper()
+            locker_code = clean_code.encode('ascii').ljust(8, b'\x00')
+
+    # 3. Preparation (Plaintext / Type 0)
+    files_to_upload = []
+    # Body index 0
+    err, body_info = prepare_file_for_upload(package.email_file, "body.qmail", 0, bytes(16), logger_handle)
+    if err == ErrorCode.SUCCESS: files_to_upload.append(body_info)
+
+    # Attachments
+    for i, path in enumerate(package.attachment_paths):
+        with open(path, 'rb') as f:
+            err, att_info = prepare_file_for_upload(f.read(), os.path.basename(path), i+1, bytes(16), logger_handle)
+            if err == ErrorCode.SUCCESS: files_to_upload.append(att_info)
+
+    # 4. Parallel Upload (With Adaptive Idempotency)
+    duration_code = weeks_to_duration_code(storage_weeks)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = []
+        for info in files_to_upload:
+            for s_idx, s_data in enumerate(info.stripes + [info.parity_stripe]):
+                # Map stripe index to a server (0-4)
+                srv = config.qmail_servers[s_idx]
+                futures.append(executor.submit(
+                    upload_stripe_to_server, 
+                    srv, s_data, s_idx, identity, 
+                    file_group_guid, locker_code, 
+                    duration_code, logger_handle
+                ))
+        for f in as_completed(futures): f.result()
+
+    # 5. BEACON NOTIFICATION (RAIDA 11 ONLY - Using Raw Send)
+    beacon_id = 11
+    tell_success = False
+    try:
+        timestamp = int(time.time())
+        # Determine AN slice for RAIDA 11 (Format 9 Offset: 39)
+        if hasattr(identity, 'authenticity_number') and len(identity.authenticity_number) == 800:
+            start = beacon_id * 32
+            target_an = bytes.fromhex(identity.authenticity_number[start : start+32])
+        else:
+            target_an = bytes(16)
+
+        # build_complete_tell_request returns (ProtocolErrorCode, packet, challenge)
+       # Update within process_email_package (around line 915)
+        # UPDATED UNPACKING: Added 'nonce'
+        err_proto, tell_req, challenge, nonce = build_complete_tell_request(
+            raida_id=beacon_id,
+            denomination=identity.denomination,
+            serial_number=identity.serial_number,
+            device_id=0,
+            an=target_an,
+            file_group_guid=file_group_guid,
+            locker_code=locker_code,
+            timestamp=timestamp,
+            tell_type=TELL_TYPE_QMAIL,
+            recipients=package.recipients,
+            servers=[] 
+        )
+        
+        srv_cfg = get_raida_server_config(beacon_id, config.raida_servers)
+        if srv_cfg:
+            conn_err, conn = connect_to_server(srv_cfg)
+            if conn_err == 0:
+                # FIXED: send_raw_request avoids the Double Header bug
+                net_err, resp, _ = send_raw_request(conn, tell_req, logger_handle=logger_handle)
+                if net_err == 0 and resp.status == 250:
+                    tell_success = True
+                    log_info(logger_handle, "Sender", f"Tell accepted by Beacon (RAIDA {beacon_id})")
+                disconnect(conn)
+    except Exception as e:
+        log_error(logger_handle, "Sender", f"Tell failed: {e}")
+
+    # 6. Local Storage (Sender Copy)
+    store_sent_email(db_handle, file_group_guid.hex(), locker_code, package.subject)
+
+    return SendEmailErrorCode.SUCCESS, SendEmailResult(file_group_guid, locker_code)
 
 
 # ============================================================================

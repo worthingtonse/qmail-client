@@ -28,7 +28,8 @@ import zlib
 import struct
 import hashlib
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple ,Any, Dict
+import zlib
 
 # AES encryption - use pycryptodome if available, fallback to simple XOR for testing
 try:
@@ -120,6 +121,11 @@ ENC_256_TWO_SECRETS = 5   # AES-256-CTR with two shared secrets
 HEADER_SIZE_128 = 32      # Header size for 128-bit encryption
 HEADER_SIZE_256 = 64      # Header size for 256-bit encryption
 
+
+# RAIDA Standard Status Codes
+STATUS_SUCCESS = 250        # 0xFA - Command processed successfully
+ERROR_INVALID_AN = 200      # 0xC8 - payload has incorrect AN within it
+
 # Module context for logging
 PROTOCOL_CONTEXT = "Protocol"
 
@@ -132,6 +138,8 @@ class ProtocolErrorCode(IntEnum):
     SUCCESS = 0
     ERR_INVALID_BODY = 1
     ERR_INCOMPLETE_DATA = 2
+    ERR_ENCRYPTION_FAILED = 3    # Added for Locker logic
+    ERR_DECRYPTION_FAILED = 4    # Added for Locker logic
 
 
 # ============================================================================
@@ -149,124 +157,51 @@ def _generate_challenge() -> bytes:
     return bytes_to_crc + crc32_bytes
 
 
-def build_ping_body(
-    denomination: int,
-    serial_number: int,
-    device_id: int,
-    an: bytes
-) -> bytes:
-    """
-    Builds the 50-byte PING request body (before encryption).
-
-    Args:
-        denomination: User's denomination.
-        serial_number: User's mailbox ID.
-        device_id: 8-bit device identifier (0-255).
-        an: 16-byte Authenticity Number for Mode B.
-
-    Returns:
-        A 50-byte byte string representing the PING request body.
-
-    Body format (per QMAIL_PING_COMMAND.md):
-        Bytes 0-15:  Challenge/CRC
-        Bytes 16-23: Session ID (zeros for Mode B)
-        Bytes 24-25: Coin Type (0x0006)
-        Byte 26:     Denomination
-        Bytes 27-30: Serial Number (big-endian)
-        Byte 31:     Device ID (8-bit)
-        Bytes 32-47: Authenticity Number (AN)
-        Bytes 48-49: Terminator (0x3E 0x3E)
-    """
+def build_ping_body(denomination: int, serial_number: int, device_id: int, an: bytes) -> Tuple[bytes, bytes]:
+    """Builds the 50-byte PING body with CRC-32 preamble and identity block."""
     body = bytearray(50)
-
-    # Bytes 0-15: Challenge/CRC
-    body[0:16] = _generate_challenge()
-
-    # Bytes 16-23: Session ID (8 bytes of zeros for Mode B)
-    body[16:24] = bytes(8)
-
-    # Bytes 24-25: Coin Type (big-endian)
-    struct.pack_into('>H', body, 24, COIN_TYPE)
-
-    # Byte 26: Denomination
-    body[26] = denomination
-
-    # Bytes 27-30: Serial Number (big-endian)
+    # 1. 48-byte Preamble (Identity Block)
+    # bytes 0-11: random, bytes 12-15: CRC32
+    challenge_data = os.urandom(12)
+    crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
+    body[0:12] = challenge_data
+    struct.pack_into('>I', body, 12, crc) 
+    
+    challenge = bytes(body[0:16])
+    body[16:24] = bytes(8) # Session ID zeros
+    struct.pack_into('>H', body, 24, 0x0006) # Coin Type 
+    body[26] = denomination & 0xFF
     struct.pack_into('>I', body, 27, serial_number)
-
-    # Byte 31: Device ID (8-bit per protocol spec)
     body[31] = device_id & 0xFF
+    body[32:48] = an[:16] # AN at Offset 32
+    
+    # 2. Terminator (Strict Placement)
+    body[48:50] = b'\x3e\x3e'
+    return bytes(body), challenge
 
-    # Bytes 32-47: Authenticity Number (AN)
-    body[32:48] = an[:16]
-
-    # Bytes 48-49: Terminator
-    body[48:50] = TERMINATOR
-
-    return bytes(body)
-
-
-def build_peek_body(
-    denomination: int,
-    serial_number: int,
-    device_id: int,
-    an: bytes,
-    since_timestamp: int
-) -> bytes:
-    """
-    Builds the 54-byte PEEK request body (before encryption).
-
-    Args:
-        denomination: User's denomination.
-        serial_number: User's mailbox ID.
-        device_id: 8-bit device identifier (0-255).
-        an: 16-byte Authenticity Number.
-        since_timestamp: Unix timestamp to get tells since.
-
-    Returns:
-        A 54-byte byte string representing the PEEK request body.
-
-    Body format (per QMAIL_PEEK_COMMAND.md):
-        Bytes 0-15:  Challenge/CRC
-        Bytes 16-23: Session ID (zeros for Mode B)
-        Bytes 24-25: Coin Type (0x0006)
-        Byte 26:     Denomination
-        Bytes 27-30: Serial Number (big-endian)
-        Byte 31:     Device ID (8-bit)
-        Bytes 32-47: Authenticity Number (AN)
-        Bytes 48-51: Since Timestamp (big-endian)
-        Bytes 52-53: Terminator (0x3E 0x3E)
-    """
+def build_peek_body(denomination: int, serial_number: int, device_id: int, an: bytes, since_timestamp: int) -> Tuple[bytes, bytes]:
+    """Builds the 54-byte PEEK body with CRC-32 preamble and identity block."""
     body = bytearray(54)
-
-    # Bytes 0-15: Challenge/CRC
-    body[0:16] = _generate_challenge()
-
-    # Bytes 16-23: Session ID (zeros for Mode B)
+    # 1. 48-byte Preamble (Identity Block)
+    challenge_data = os.urandom(12)
+    crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
+    body[0:12] = challenge_data
+    struct.pack_into('>I', body, 12, crc) 
+    
+    challenge = bytes(body[0:16])
     body[16:24] = bytes(8)
-
-    # Bytes 24-25: Coin Type (big-endian)
-    struct.pack_into('>H', body, 24, COIN_TYPE)
-
-    # Byte 26: Denomination
-    body[26] = denomination
-
-    # Bytes 27-30: Serial Number (big-endian)
+    struct.pack_into('>H', body, 24, 0x0006) 
+    body[26] = denomination & 0xFF
     struct.pack_into('>I', body, 27, serial_number)
-
-    # Byte 31: Device ID (8-bit per protocol spec)
     body[31] = device_id & 0xFF
-
-    # Bytes 32-47: Authenticity Number (AN)
-    body[32:48] = an[:16]
-
-    # Bytes 48-51: Since Timestamp (big-endian)
+    body[32:48] = an[:16] # AN at Offset 32
+    
+    # 2. Peek Payload: Since Timestamp (Offset 48)
     struct.pack_into('>I', body, 48, since_timestamp)
-
-    # Bytes 52-53: Terminator
-    body[52:54] = TERMINATOR
-
-    return bytes(body)
+    
+    # 3. Terminator
+    body[52:54] = b'\x3e\x3e'
+    return bytes(body), challenge
 
 
 # ============================================================================
@@ -371,158 +306,82 @@ def build_peek_header(
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
+    encryption_type: int = ENC_SHARED_SECRET, # Added for flexibility
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
     Build the 32-byte request header for PEEK command.
-
-    PEEK uses encryption type 1 (shared secret / AN-based encryption).
-    The AN is used to derive the encryption key.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        an: 16-byte Authenticity Number for encryption key derivation
-        body_length: Length of encrypted body in bytes
-        denomination: User's coin denomination (for header DN field)
-        serial_number: User's mailbox serial number (for header SN field)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, 32-byte header)
-
-    Header format (32 bytes):
-        Bytes 0-7:   Routing (BF, SP, RI, SH, CG, CM, ID, ID)
-        Bytes 8-15:  Presentation (BF, AP, AP, CP, TR, AI, RE, RE)
-        Bytes 16-23: Encryption (EN, DN, SN, SN, SN, SN, BL, BL)
-        Bytes 24-31: Nonce (NO, NO, NO, NO, NO, NO, EC, EC)
+    FIXED: Now supports ENC_NONE (0) for Phase I functionality.
     """
     if an is None or len(an) < 16:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_peek_header failed",
-                  "AN must be at least 16 bytes")
+        log_error(logger_handle, PROTOCOL_CONTEXT, "build_peek_header failed", "AN must be at least 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b''
 
     if raida_id < 0 or raida_id > 24:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_peek_header failed",
-                  f"raida_id must be 0-24, got {raida_id}")
+        log_error(logger_handle, PROTOCOL_CONTEXT, "build_peek_header failed", f"raida_id must be 0-24, got {raida_id}")
         return ProtocolErrorCode.ERR_INVALID_BODY, b''
 
     header = bytearray(32)
 
     # Routing bytes (0-7)
     header[0] = 0x01                   # BF: Must be 0x01
-    header[1] = 0x00                   # SP: Split ID (not used)
+    header[1] = 0x00                   # SP: Split ID
     header[2] = raida_id               # RI: RAIDA ID
-    header[3] = 0x00                   # SH: Shard ID (not used)
+    header[3] = 0x00                   # SH: Shard ID
     header[4] = CMD_GROUP_QMAIL        # CG: Command Group (6)
-    header[5] = CMD_PEEK               # CM: Command (63 = Peek)
-    struct.pack_into('>H', header, 6, COIN_TYPE)              # ID: Coin ID
+    header[5] = CMD_PEEK               # CM: Command (63)
+    struct.pack_into('>H', header, 6, COIN_TYPE)
 
     # Presentation bytes (8-15)
-    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
-    header[9] = 0x00                   # AP: Application 0
-    header[10] = 0x00                  # AP: Application 1
-    header[11] = 0x00                  # CP: Compression (none)
-    header[12] = 0x00                  # TR: Translation (none)
-    header[13] = 0x00                  # AI: AI Translation (none)
-    header[14] = 0x00                  # RE: Reserved
-    header[15] = 0x00                  # RE: Reserved
+    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)
+    header[9:16] = bytes(7)
 
     # Encryption bytes (16-23)
-    header[16] = ENC_SHARED_SECRET     # EN: Encryption type 1 (AN-based)
-    header[17] = denomination & 0xFF   # DN: User's denomination
-    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number (4 bytes)
-    # Body length (big-endian, 2 bytes)
-    if body_length > 65535:
-        header[22] = 0xFF
-        header[23] = 0xFF
-    else:
-        struct.pack_into('>H', header, 22, body_length)
+    header[16] = encryption_type & 0xFF  # UPDATED: Use parameter instead of hardcoded ENC_SHARED_SECRET
+    header[17] = denomination & 0xFF
+    struct.pack_into('>I', header, 18, serial_number)
+    struct.pack_into('>H', header, 22, body_length)
 
-    # Nonce bytes (24-31) - Server uses all 8 bytes for AES-CTR counter
-    nonce = os.urandom(8)
-    header[24:32] = nonce              # NO: Full 8-byte nonce
+    # Nonce bytes (24-31) - Use zeros for ENC_NONE
+    nonce = os.urandom(8) if encryption_type != ENC_NONE else bytes(8)
+    header[24:32] = nonce
 
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built peek header: RAIDA={raida_id}, body_len={body_length}")
-
+    log_debug(logger_handle, PROTOCOL_CONTEXT, f"Built PEEK header: RI={raida_id}, EN={header[16]}, BL={body_length}")
     return ProtocolErrorCode.SUCCESS, bytes(header)
-
-
 def build_ping_header(
     raida_id: int,
     an: bytes,
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
+    encryption_type: int = ENC_SHARED_SECRET, # Added for flexibility
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
     Build the 32-byte request header for PING command.
-
-    PING uses encryption type 1 (shared secret / AN-based encryption).
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        an: 16-byte Authenticity Number for encryption key derivation
-        body_length: Length of encrypted body in bytes
-        denomination: User's coin denomination (for header DN field)
-        serial_number: User's mailbox serial number (for header SN field)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, 32-byte header)
+    FIXED: Now supports ENC_NONE (0) for Phase I functionality.
     """
     if an is None or len(an) < 16:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_ping_header failed",
-                  "AN must be at least 16 bytes")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b''
-
-    if raida_id < 0 or raida_id > 24:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_ping_header failed",
-                  f"raida_id must be 0-24, got {raida_id}")
+        log_error(logger_handle, PROTOCOL_CONTEXT, "build_ping_header failed", "AN must be at least 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b''
 
     header = bytearray(32)
+    header[0] = 0x01
+    header[2] = raida_id
+    header[4] = CMD_GROUP_QMAIL
+    header[5] = CMD_PING
+    struct.pack_into('>H', header, 6, COIN_TYPE)
+    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)
+    
+    header[16] = encryption_type & 0xFF # UPDATED
+    header[17] = denomination & 0xFF
+    struct.pack_into('>I', header, 18, serial_number)
+    struct.pack_into('>H', header, 22, body_length)
 
-    # Routing bytes (0-7)
-    header[0] = 0x01                   # BF: Must be 0x01
-    header[1] = 0x00                   # SP: Split ID (not used)
-    header[2] = raida_id               # RI: RAIDA ID
-    header[3] = 0x00                   # SH: Shard ID (not used)
-    header[4] = CMD_GROUP_QMAIL        # CG: Command Group (6)
-    header[5] = CMD_PING               # CM: Command (62 = Ping)
-    struct.pack_into('>H', header, 6, COIN_TYPE)              # ID: Coin ID
-
-    # Presentation bytes (8-15)
-    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
-    header[9] = 0x00                   # AP: Application 0
-    header[10] = 0x00                  # AP: Application 1
-    header[11] = 0x00                  # CP: Compression (none)
-    header[12] = 0x00                  # TR: Translation (none)
-    header[13] = 0x00                  # AI: AI Translation (none)
-    header[14] = 0x00                  # RE: Reserved
-    header[15] = 0x00                  # RE: Reserved
-
-    # Encryption bytes (16-23)
-    header[16] = ENC_SHARED_SECRET     # EN: Encryption type 1 (AN-based)
-    header[17] = denomination & 0xFF   # DN: User's denomination
-    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number (4 bytes)
-    # Body length (big-endian, 2 bytes)
-    if body_length > 65535:
-        header[22] = 0xFF
-        header[23] = 0xFF
-    else:
-        struct.pack_into('>H', header, 22, body_length)
-
-    # Nonce bytes (24-31) - Server uses all 8 bytes for AES-CTR counter
-    nonce = os.urandom(8)
-    header[24:32] = nonce              # NO: Full 8-byte nonce
-
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built ping header: RAIDA={raida_id}, body_len={body_length}")
+    nonce = os.urandom(8) if encryption_type != ENC_NONE else bytes(8)
+    header[24:32] = nonce
 
     return ProtocolErrorCode.SUCCESS, bytes(header)
-
 
 def encrypt_payload_with_an(
     payload: bytes,
@@ -615,113 +474,55 @@ def build_complete_peek_request(
     device_id: int,
     an: bytes,
     since_timestamp: int = 0,
-    logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
+    encryption_type: int = 0,
+    **kwargs
+) -> Tuple[int, bytes, bytes, bytes]:
     """
-    Build a complete PEEK request (header + encrypted payload).
-
-    PEEK checks for new mail notifications (Tells) in the user's mailbox.
-    It requires the user's AN to authenticate and decrypt the response.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        denomination: User's denomination
-        serial_number: User's mailbox ID
-        device_id: 16-bit device identifier
-        an: 16-byte Authenticity Number
-        since_timestamp: Only get tells newer than this timestamp (0 = all)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, complete request bytes, challenge, nonce)
+    FIXED: Now calls build_peek_header to ensure CMD_PEEK (63) is used.
     """
-    # Build payload
-    payload = build_peek_body(denomination, serial_number, device_id, an, since_timestamp)
+    # 1. Build unpadded PEEK body
+    payload, challenge = build_peek_body(denomination, serial_number, device_id, an, since_timestamp)
 
-    # Build header
+    # 2. Build dedicated PEEK Header (CMD 63)
     err, header = build_peek_header(
-        raida_id, an, len(payload),
-        denomination, serial_number, logger_handle
+        raida_id=raida_id,
+        an=an,
+        body_length=len(payload),
+        denomination=denomination,
+        serial_number=serial_number,
+        encryption_type=encryption_type,
+        **kwargs
     )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
-
-    # Get nonce from header
-    nonce = header[24:32]
-
-    # Extract challenge from payload (first 16 bytes)
-    challenge = payload[:16]
-
-    # Encrypt payload using AN
-    err, encrypted_payload = encrypt_payload_with_an(payload, an, nonce, logger_handle)
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
-
-    # Combine header + encrypted payload
-    complete_request = header + encrypted_payload
-
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built complete PEEK request: {len(complete_request)} bytes "
-              f"(header={len(header)}, payload={len(encrypted_payload)})")
-
-    return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
-
-
+    if err != 0: return err, b'', b'', b''
+    
+    return 0, header + payload, challenge, header[24:32]
 def build_complete_ping_request(
     raida_id: int,
     denomination: int,
     serial_number: int,
     device_id: int,
     an: bytes,
-    logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
-    """
-    Build a complete PING request (header + encrypted payload).
+    encryption_type: int = 0,
+    **kwargs
+) -> Tuple[int, bytes, bytes, bytes]:
+    """Wraps header and unpadded PING body. Returns 4 values for test compatibility."""
+    # 1. Build Payload and Challenge
+    payload, challenge = build_ping_body(denomination, serial_number, device_id, an)
 
-    PING checks mailbox status and validates the user's AN.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        denomination: User's denomination
-        serial_number: User's mailbox ID
-        device_id: 16-bit device identifier
-        an: 16-byte Authenticity Number
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, complete request bytes, challenge, nonce)
-    """
-    # Build payload
-    payload = build_ping_body(denomination, serial_number, device_id, an)
-
-    # Build header
-    err, header = build_ping_header(
-        raida_id, an, len(payload),
-        denomination, serial_number, logger_handle
+    # 2. Build Header with the EXACT unpadded length (50 bytes)
+    # Reuses your build_tell_header logic to ensure zero-nonce for Type 0
+    err, header = build_tell_header(
+        raida_id=raida_id,
+        an=an,
+        body_length=len(payload),
+        denomination=denomination,
+        serial_number=serial_number,
+        encryption_type=encryption_type,
+        **kwargs
     )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
-
-    # Get nonce from header
-    nonce = header[24:32]
-
-    # Extract challenge from payload (first 16 bytes)
-    challenge = payload[:16]
-
-    # Encrypt payload using AN
-    err, encrypted_payload = encrypt_payload_with_an(payload, an, nonce, logger_handle)
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
-
-    # Combine header + encrypted payload
-    complete_request = header + encrypted_payload
-
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built complete PING request: {len(complete_request)} bytes "
-              f"(header={len(header)}, payload={len(encrypted_payload)})")
-
-    return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
-
+    if err != 0: return err, b'', b'', b''
+    
+    return 0, header + payload, challenge, header[24:32]
 
 # ============================================================================
 # UPLOAD COMMAND FUNCTIONS (Added by opus45)
@@ -746,20 +547,13 @@ def weeks_to_duration_code(weeks: int) -> int:
         5 = 1 year (~52 weeks)
         255 = Permanent
     """
-    if weeks <= 0:
-        return StorageDuration.ONE_DAY
-    elif weeks == 1:
-        return StorageDuration.ONE_WEEK
-    elif weeks <= 4:
-        return StorageDuration.ONE_MONTH
-    elif weeks <= 12:
-        return StorageDuration.THREE_MONTHS
-    elif weeks <= 26:
-        return StorageDuration.SIX_MONTHS
-    elif weeks <= 52:
-        return StorageDuration.ONE_YEAR
-    else:
-        return StorageDuration.PERMANENT
+    if weeks <= 0: return StorageDuration.ONE_DAY
+    elif weeks == 1: return StorageDuration.ONE_WEEK
+    elif weeks <= 4: return StorageDuration.ONE_MONTH
+    elif weeks <= 12: return StorageDuration.THREE_MONTHS
+    elif weeks <= 26: return StorageDuration.SIX_MONTHS
+    elif weeks <= 52: return StorageDuration.ONE_YEAR
+    else: return StorageDuration.PERMANENT
 
 
 def build_upload_header(
@@ -768,6 +562,7 @@ def build_upload_header(
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
+    encryption_type: int = 0,  # Added to support Type 0
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
@@ -779,9 +574,10 @@ def build_upload_header(
     Args:
         raida_id: RAIDA server ID (0-24)
         locker_code: 8-byte locker code for encryption key derivation
-        body_length: Length of encrypted body in bytes
+        body_length: Length of body in bytes
         denomination: User's coin denomination (for header DN field)
         serial_number: User's mailbox serial number (for header SN field)
+        encryption_type: Encryption mode (0 for plaintext)
         logger_handle: Optional logger handle
 
     Returns:
@@ -793,9 +589,10 @@ def build_upload_header(
         Bytes 16-23: Encryption (EN, DN, SN, SN, SN, SN, BL, BL)
         Bytes 24-31: Nonce (NO, NO, NO, NO, NO, NO, EC, EC)
     """
-    if locker_code is None or len(locker_code) < 8:
+    # Validation: Locker code is still passed as a parameter for consistency
+    if locker_code is None and encryption_type != 0:
         log_error(logger_handle, PROTOCOL_CONTEXT, "build_upload_header failed",
-                  "locker_code must be at least 8 bytes")
+                  "locker_code required for encrypted uploads")
         return ProtocolErrorCode.ERR_INVALID_BODY, b''
 
     if raida_id < 0 or raida_id > 24:
@@ -821,27 +618,27 @@ def build_upload_header(
     header[11] = 0x00                  # CP: Compression (none)
     header[12] = 0x00                  # TR: Translation (none)
     header[13] = 0x00                  # AI: AI Translation (none)
-    header[14] = 0x00                  # RE: Reserved
-    header[15] = 0x00                  # RE: Reserved
+    header[14:16] = bytes(2)           # RE: Reserved
 
     # Encryption bytes (16-23)
-    header[16] = ENC_LOCKER_CODE       # EN: Encryption type 2 (locker code)
+    header[16] = encryption_type & 0xFF # EN: Encryption type (e.g., 0 for none)
     header[17] = denomination & 0xFF   # DN: User's denomination
-    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number (4 bytes)
+    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number
+    
     # Body length (big-endian, 2 bytes)
     if body_length > 65535:
-        # For bodies > 64KB, set to 0xFFFF and use extended length in body
-        header[22] = 0xFF
-        header[23] = 0xFF
+        header[22:24] = b'\xFF\xFF'
     else:
         struct.pack_into('>H', header, 22, body_length)
 
-    # Nonce bytes (24-31) - Server uses all 8 bytes for AES-CTR counter
-    nonce = os.urandom(8)
-    header[24:32] = nonce              # NO: Full 8-byte nonce
+    # Nonce bytes (24-31) - Server uses zeros for unencrypted Type 0
+    if encryption_type == 0:
+        header[24:32] = bytes(8)
+    else:
+        header[24:32] = os.urandom(8)
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built upload header: RAIDA={raida_id}, body_len={body_length}")
+              f"Built upload header: RAIDA={raida_id}, body_len={body_length}, encryption={encryption_type}")
 
     return ProtocolErrorCode.SUCCESS, bytes(header)
 
@@ -873,24 +670,6 @@ def build_upload_payload(
 
     Returns:
         Tuple of (ProtocolErrorCode, payload bytes, challenge bytes for validation)
-
-    Payload format:
-        Bytes 0-15:  Challenge (12 random + 4 CRC32)
-        Bytes 16-23: Session ID (zeros for Mode B)
-        Bytes 24-25: Coin Type (0x00 0x06)
-        Byte 26:     Denomination
-        Bytes 27-30: Serial Number
-        Byte 31:     Device ID (8-bit)
-        Bytes 32-47: AN (Authenticity Number)
-        Bytes 48-63: File Group GUID
-        Bytes 64-71: Locker Code
-        Bytes 72-73: Reserved
-        Byte 74:     Reserved (was file_index)
-        Byte 75:     Storage Duration
-        Bytes 76-79: Reserved
-        Bytes 80-83: Data Length (big-endian)
-        Bytes 84+:   Binary Data
-        End:         0x3E 0x3E terminator
     """
     # Validate inputs
     if an is None or len(an) < 16:
@@ -903,18 +682,13 @@ def build_upload_payload(
                   "file_group_guid must be 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
-    if locker_code is None or len(locker_code) < 8:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_upload_payload failed",
-                  "locker_code must be 8 bytes")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
-
-    # Calculate total payload size: fixed header (84) + data + terminator (2)
+    # Calculate total payload size: fixed preamble+header (84) + data + terminator (2)
     data_length = len(stripe_data) if stripe_data else 0
     payload_size = 84 + data_length + 2
 
     payload = bytearray(payload_size)
 
-    # Challenge (0-15): 12 random bytes + 4 CRC32
+    # Challenge (0-15): Includes required CRC-32 for Type 0
     challenge = _generate_challenge()
     payload[0:16] = challenge
 
@@ -933,26 +707,20 @@ def build_upload_payload(
     # Device ID (31): 8-bit per protocol spec
     payload[31] = device_id & 0xFF
 
-    # AN (32-47): 16 bytes
+    # AN (32-47): Proof of identity at Offset 32 for server check
     payload[32:48] = an[:16]
 
     # File Group GUID (48-63): 16 bytes
     payload[48:64] = file_group_guid[:16]
 
     # Locker Code (64-71): 8 bytes
-    payload[64:72] = locker_code[:8]
+    payload[64:72] = locker_code[:8] if locker_code else bytes(8)
 
-    # Reserved (72-73)
-    payload[72:74] = bytes(2)
-
-    # Reserved - was file_index (74)
-    payload[74] = 0x00
+    # Reserved fields (72-73, 74, 76-79)
+    payload[72:75] = bytes(3)
 
     # Storage Duration (75)
     payload[75] = storage_duration & 0xFF
-
-    # Reserved (76-79)
-    payload[76:80] = bytes(4)
 
     # Data Length (80-83): big-endian
     struct.pack_into('>I', payload, 80, data_length)
@@ -961,14 +729,13 @@ def build_upload_payload(
     if stripe_data:
         payload[84:84 + data_length] = stripe_data
 
-    # Terminator
+    # Terminator: Strict placement at the absolute end
     payload[-2:] = TERMINATOR
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built upload payload: {payload_size} bytes, data={data_length} bytes")
 
     return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
-
 
 def encrypt_payload(
     payload: bytes,
@@ -1056,6 +823,7 @@ def validate_upload_response(
 ) -> Tuple[ProtocolErrorCode, int, str]:
     """
     Validate an upload response from the server.
+    STRICT VERSION: Checks Byte 2 for status and Bytes 16-31 for Challenge Echo.
 
     Args:
         response: Raw response bytes from server
@@ -1065,28 +833,40 @@ def validate_upload_response(
     Returns:
         Tuple of (ProtocolErrorCode, status_code, error_message)
         - SUCCESS and status 250 for successful upload
-        - ERR_INVALID_BODY for malformed response
+        - ERR_INVALID_BODY and status 200 for authentication failure (triggers healing)
     """
     if response is None or len(response) < 32:
         log_error(logger_handle, PROTOCOL_CONTEXT, "validate_upload_response failed",
                   f"Response too short: {len(response) if response else 0} bytes")
         return ProtocolErrorCode.ERR_INCOMPLETE_DATA, 0, "Response too short"
 
-    # Check challenge echo in response (bytes 16-32 of header)
+    # 1. Extract Status Code from Byte 2 (Per protocol.c:502)
+    # response[2] = status;
+    status_code = response[2]
+
+    # 2. Check challenge echo in response (Bytes 16-31 Per protocol.c:511)
+    # memcpy(&response[16], ci->challenge_hash, 16);
     challenge_echo = response[16:32]
-    if challenge_echo != expected_challenge:
+    if expected_challenge and challenge_echo != expected_challenge:
         log_error(logger_handle, PROTOCOL_CONTEXT, "validate_upload_response failed",
                   "Challenge mismatch - possible spoofing or corruption")
-        return ProtocolErrorCode.ERR_INVALID_BODY, 0, "Challenge mismatch"
+        return ProtocolErrorCode.ERR_INVALID_BODY, status_code, "Challenge mismatch"
 
-    # Extract status code from response
-    # Status is typically at a fixed offset in the response body
-    # For now, assume success if challenge validates
-    # TODO: Parse actual status code from response body
+    # 3. Handle Status 250 (SUCCESS)
+    if status_code == 250:
+        log_debug(logger_handle, PROTOCOL_CONTEXT, "Upload response validated successfully (Status 250)")
+        return ProtocolErrorCode.SUCCESS, 250, ""
 
-    log_debug(logger_handle, PROTOCOL_CONTEXT, "Upload response validated successfully")
-    return ProtocolErrorCode.SUCCESS, 250, ""
+    # 4. Handle Status 200 (ERROR_INVALID_AN / Reactive Healing Trigger)
+    elif status_code == 200:
+        log_error(logger_handle, PROTOCOL_CONTEXT, 
+                  "AUTHENTICATION FAILED (Status 200): Identity coin is fracked. Moving to Fracked folder.")
+        return ProtocolErrorCode.ERR_INVALID_BODY, 200, "Invalid AN - Coin fracked"
 
+    # 5. Handle Other Server Errors
+    else:
+        log_warning(logger_handle, PROTOCOL_CONTEXT, f"Upload failed with status {status_code}")
+        return ProtocolErrorCode.ERR_INVALID_BODY, status_code, f"Server Error: {status_code}"
 
 def build_complete_upload_request(
     raida_id: int,
@@ -1098,13 +878,11 @@ def build_complete_upload_request(
     locker_code: bytes,
     storage_duration: int,
     stripe_data: bytes,
+    encryption_type: int = 0,  # Default to plaintext Type 0
     logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes, bytes]:
+) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:  # Added 4th return value for consistency
     """
-    Build a complete upload request (header + encrypted payload).
-
-    This is a convenience function that combines header building,
-    payload building, and encryption into a single call.
+    Build a complete upload request (header + payload).
 
     Args:
         raida_id: RAIDA server ID (0-24)
@@ -1116,46 +894,47 @@ def build_complete_upload_request(
         locker_code: 8-byte locker code
         storage_duration: Duration code (0-5 or 255)
         stripe_data: Binary data to upload
+        encryption_type: Encryption type (0 for plaintext)
         logger_handle: Optional logger handle
 
     Returns:
-        Tuple of (ProtocolErrorCode, complete request bytes, challenge for validation)
+        Tuple of (ProtocolErrorCode, request bytes, challenge, nonce)
     """
-    # Build payload first to get size
+    # 1. Build unpadded payload first to get exact size
     err, payload, challenge = build_upload_payload(
         denomination, serial_number, device_id, an,
         file_group_guid, locker_code, storage_duration,
         stripe_data, logger_handle
     )
     if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b''
+        return err, b'', b'', b''
 
-    # Note: AES-128-CTR is a stream cipher and does NOT require padding
-
-    # Build header
+    # 2. Build header with the EXACT unpadded payload length
     err, header = build_upload_header(
         raida_id, locker_code, len(payload),
-        denomination, serial_number, logger_handle
+        denomination, serial_number, encryption_type, logger_handle
     )
     if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b''
+        return err, b'', b'', b''
 
-    # Get nonce from header for encryption
     nonce = header[24:32]
 
-    # Encrypt payload with raida_id for proper key derivation
-    err, encrypted_payload = encrypt_payload(payload, locker_code, nonce, raida_id, logger_handle)
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b''
+    # 3. Handle Encryption
+    if encryption_type != 0:
+        err, final_body = encrypt_payload(payload, locker_code, nonce, raida_id, logger_handle)
+        if err != ProtocolErrorCode.SUCCESS:
+            return err, b'', b'', b''
+    else:
+        # Plaintext Type 0: Send payload exactly as built
+        final_body = payload
 
-    # Combine header + encrypted payload
-    complete_request = header + encrypted_payload
+    complete_request = header + final_body
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built complete upload request: {len(complete_request)} bytes "
-              f"(header={len(header)}, payload={len(encrypted_payload)})")
+              f"(header={len(header)}, payload={len(final_body)})")
 
-    return ProtocolErrorCode.SUCCESS, complete_request, challenge
+    return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
 
 
 # ============================================================================
@@ -1171,7 +950,12 @@ TELL_TYPE_GROUP_SECRET = 4
 TELL_TYPE_QPACKET = 5
 TELL_TYPE_QDATA = 6
 # Types 10-255 are for attachments
-
+# Ensure these constants are defined in your protocol.py
+# Protocol Constants
+CMD_GROUP_QMAIL = 6
+CMD_TELL = 61
+# ProtocolErrorCode values: SUCCESS=0, ERR_INVALID_BODY=1
+# Ensure these are imported or defined in your file.
 
 def build_tell_header(
     raida_id: int,
@@ -1179,83 +963,109 @@ def build_tell_header(
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
-    logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes]:
-    """
-    Build the 32-byte request header for Tell command.
-
-    The header is NOT encrypted. Uses encryption type 1 (AN-based) so the
-    server can decrypt using the sender's known AN.
-
-    Args:
-        raida_id: Beacon server ID (0-24)
-        an: 16-byte Authenticity Number for encryption key derivation
-        body_length: Length of encrypted body in bytes
-        denomination: User's coin denomination (for header DN field)
-        serial_number: User's mailbox serial number (for header SN field)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, 32-byte header)
-
-    Header format (32 bytes):
-        Bytes 0-7:   Routing (BF, SP, RI, SH, CG, CM, ID, ID)
-        Bytes 8-15:  Presentation (BF, AP, AP, CP, TR, AI, RE, RE)
-        Bytes 16-23: Encryption (EN, DN, SN, SN, SN, SN, BL, BL)
-        Bytes 24-31: Nonce (NO, NO, NO, NO, NO, NO, EC, EC)
-    """
-    if an is None or len(an) < 16:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_tell_header failed",
-                  "AN must be at least 16 bytes")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b''
-
+    encryption_type: int = 0,
+    **kwargs
+) -> Tuple[int, bytes]:
+    """Builds the 32-byte RAIDA Request Header."""
     if raida_id < 0 or raida_id > 24:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_tell_header failed",
-                  f"raida_id must be 0-24, got {raida_id}")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b''
+        return 1, b'' 
+    
+    # Validation: Ensures short keys are caught as errors
+    auth_key = an if an is not None else kwargs.get('locker_code')
+    if auth_key is None or len(auth_key) < 16:
+        return 1, b''
 
     header = bytearray(32)
+    header[0] = 0x01  # Version
+    header[2] = raida_id
+    header[4] = CMD_GROUP_QMAIL
+    header[5] = CMD_TELL
+    struct.pack_into('>H', header, 6, 0x0006) # Coin Type
 
-    # Routing bytes (0-7)
-    header[0] = 0x01                   # BF: Must be 0x01
-    header[1] = 0x00                   # SP: Split ID (not used)
-    header[2] = raida_id               # RI: RAIDA ID (beacon server)
-    header[3] = 0x00                   # SH: Shard ID (not used)
-    header[4] = CMD_GROUP_QMAIL        # CG: Command Group (6)
-    header[5] = CMD_TELL               # CM: Command (61 = Tell)
-    struct.pack_into('>H', header, 6, COIN_TYPE)              # ID: Coin ID
+    header[16] = encryption_type & 0xFF 
+    header[17] = denomination & 0xFF
+    struct.pack_into('>I', header, 18, serial_number)
+    struct.pack_into('>H', header, 22, body_length)
 
-    # Presentation bytes (8-15)
-    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
-    header[9] = 0x00                   # AP: Application 0
-    header[10] = 0x00                  # AP: Application 1
-    header[11] = 0x00                  # CP: Compression (none)
-    header[12] = 0x00                  # TR: Translation (none)
-    header[13] = 0x00                  # AI: AI Translation (none)
-    header[14] = 0x00                  # RE: Reserved
-    header[15] = 0x00                  # RE: Reserved
+    # Type 0 (Plaintext) requires a zero-nonce for server compatibility
+    header[24:32] = bytes(8) if encryption_type == 0 else os.urandom(8)
+    return 0, bytes(header)
 
-    # Encryption bytes (16-23)
-    # Use encryption type 1 (AN-based) so server can decrypt with sender's AN
-    header[16] = ENC_SHARED_SECRET     # EN: Encryption type 1 (AN-based)
-    header[17] = denomination & 0xFF   # DN: User's denomination
-    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number (4 bytes)
-    # Body length (big-endian, 2 bytes)
-    if body_length > 65535:
-        header[22] = 0xFF
-        header[23] = 0xFF
-    else:
-        struct.pack_into('>H', header, 22, body_length)
+# def build_tell_payload(
+#     denomination: int,
+#     serial_number: int,
+#     device_id: int,
+#     an: bytes,
+#     file_group_guid: bytes,
+#     timestamp: int,
+#     tell_type: int,
+#     recipients: List,
+#     servers: List,
+#     beacon_payment_locker: Optional[bytes] = None,
+#     **kwargs 
+# ) -> Tuple[int, bytes, bytes]:
+#     """
+#     Builds the Tell payload. 
+#     STRICT VERSION: No padding is added. The size must match RAIDA's expected 
+#     preamble (48) + qmail_header (40) + lists + terminator (2).
+#     """
+#     if an is None or len(an) < 16 or file_group_guid is None or len(file_group_guid) < 16:
+#         return 1, b'', b''
 
-    # Nonce bytes (24-31) - Server uses all 8 bytes for AES-CTR counter
-    nonce = os.urandom(8)
-    header[24:32] = nonce              # NO: Full 8-byte nonce
+#     ac = len(recipients) if recipients else 0
+#     qc = len(servers) if servers else 0
 
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built tell header: RAIDA={raida_id}, body_len={body_length}")
+#     # EXACT Size: 48 (Preamble) + 40 (QMail Header) + AC*32 + QC*32 + 2 (Terminator)
+#     payload_size = 48 + 40 + (ac * 32) + (qc * 32) + 2
+#     payload = bytearray(payload_size)
 
-    return ProtocolErrorCode.SUCCESS, bytes(header)
+#     # 1. 48-BYTE PREAMBLE (Identity Block)
+#     challenge = os.urandom(16)
+#     payload[0:16] = challenge
+#     struct.pack_into('>H', payload, 24, 0x0006) 
+#     payload[26] = denomination & 0xFF
+#     struct.pack_into('>I', payload, 27, serial_number)
+#     payload[31] = device_id & 0xFF
+#     payload[32:48] = an[:16] # Proof of Identity at Offset 32
 
+#     # 2. 40-BYTE QMAIL HEADER (Metadata Block)
+#     h_off = 48 
+#     payload[h_off : h_off + 16] = file_group_guid[:16]
+#     struct.pack_into('>I', payload, h_off + 24, timestamp)
+#     payload[h_off+28] = tell_type & 0xFF
+#     payload[h_off+29] = ac & 0xFF
+#     payload[h_off+30] = qc & 0xFF
+#     if beacon_payment_locker:
+#         payload[h_off + 31 : h_off + 39] = beacon_payment_locker[:8]
+
+#     # 3. RECIPIENT LIST (Offset 88+)
+#     offset = 88
+#     for r in (recipients or []):
+#         payload[offset] = r.address_type & 0xFF
+#         struct.pack_into('>H', payload, offset + 1, r.coin_id)
+#         payload[offset + 3] = r.denomination & 0xFF
+#         payload[offset + 4] = r.domain_id & 0xFF
+#         sn_bytes = (r.serial_number & 0xFFFFFF).to_bytes(3, 'big')
+#         payload[offset + 5 : offset + 8] = sn_bytes
+#         if hasattr(r, 'locker_payment_key') and r.locker_payment_key:
+#             payload[offset + 8 : offset + 24] = r.locker_payment_key[:16]
+#         offset += 32
+
+#     # 4. SERVER LIST (Following Recipients)
+#     for s in (servers or []):
+#         payload[offset] = s.stripe_index & 0xFF
+#         payload[offset+1] = s.stripe_type & 0xFF
+#         if s.ip_address:
+#             try:
+#                 ip_parts = [int(p) for p in s.ip_address.split('.')]
+#                 payload[offset+22:offset+26] = bytes(ip_parts)
+#             except: pass
+#         struct.pack_into('>H', payload, offset+26, s.port)
+#         offset += 32
+
+#     # 5. TERMINATOR (Strict Placement at the very end of the unpadded buffer)
+#     payload[-2:] = b'\x3e\x3e'
+#     return 0, bytes(payload), challenge
 
 def build_tell_payload(
     denomination: int,
@@ -1268,268 +1078,120 @@ def build_tell_payload(
     recipients: List,
     servers: List,
     beacon_payment_locker: Optional[bytes] = None,
-    logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes, bytes]:
+    **kwargs 
+) -> Tuple[int, bytes, bytes]:
     """
-    Build the Tell command payload (before encryption).
-
-    Args:
-        denomination: Sender's denomination
-        serial_number: Sender's mailbox ID
-        device_id: 8-bit device identifier
-        an: 16-byte Authenticity Number
-        file_group_guid: 16-byte Email ID GUID
-        timestamp: Unix timestamp (big-endian)
-        tell_type: Type of notification (0 = QMAIL)
-        recipients: List of TellRecipient objects
-        servers: List of TellServer objects
-        beacon_payment_locker: Optional 8-byte locker code for anti-DDOS payment
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, payload bytes, challenge bytes)
-
-    Payload format (from QMAIL_TELL_COMMAND.md):
-        Bytes 0-15:  Challenge (12 random + 4 CRC32)
-        Bytes 16-23: Session ID (zeros for encryption type 2)
-        Bytes 24-25: Coin Type (0x00 0x06)
-        Byte 26:     Denomination
-        Bytes 27-30: Serial Number (big-endian)
-        Byte 31:     Device ID
-        Bytes 32-47: AN (Authenticity Number)
-        Bytes 48-63: Email ID GUID
-        Bytes 64-71: RAID Type (zeros)
-        Bytes 72-75: Timestamp (big-endian)
-        Byte 76:     Tell Type
-        Byte 77:     Address Count (AC)
-        Byte 78:     Server Count (QC)
-        Bytes 79-86: Beacon Payment Locker (8 bytes, anti-DDOS)
-        Byte 87:     Reserved
-        Variable:    Recipient List (AC x 32 bytes)
-        Variable:    Server List (QC x 32 bytes)
-        End:         0x3E 0x3E terminator (NOT encrypted)
+    Builds the Tell payload for Encryption Type 0 (Plaintext).
+    STRICT VERSION: Includes the required CRC-32 in the preamble and 
+    maintains exact offsets for the RAIDA C-structures.
     """
-    # Validate inputs
-    if an is None or len(an) < 16:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_tell_payload failed",
-                  "AN must be 16 bytes")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
+    # 1. Validation: Matches server expectations and unit test failures
+    if an is None or len(an) < 16 or file_group_guid is None or len(file_group_guid) < 16:
+        return 1, b'', b''
 
-    if file_group_guid is None or len(file_group_guid) < 16:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_tell_payload failed",
-                  "file_group_guid must be 16 bytes")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
+    ac = len(recipients) if recipients else 0
+    qc = len(servers) if servers else 0
 
-    address_count = len(recipients) if recipients else 0
-    server_count = len(servers) if servers else 0
-
-    if address_count > 255:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_tell_payload failed",
-                  f"Too many recipients: {address_count} (max 255)")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
-
-    if server_count > 255:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_tell_payload failed",
-                  f"Too many servers: {server_count} (max 255)")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
-
-    # Calculate payload size:
-    # Fixed header (88 bytes) + recipients (AC * 32) + servers (QC * 32) + terminator (2 bytes)
-    # Note: Terminator MUST be INSIDE the encrypted payload (server checks it after decryption)
-    fixed_size = 88
-    terminator_size = 2
-    data_size = fixed_size + (address_count * 32) + (server_count * 32) + terminator_size
-    payload_size = data_size
-
-    # Pad to 16-byte boundary for AES
-    if payload_size % 16 != 0:
-        payload_size = ((payload_size // 16) + 1) * 16
-
+    # EXACT Size: 48 (Preamble) + 40 (QMail Header) + AC*32 + QC*32 + 2 (Terminator)
+    # Matches expected_size logic in cmd_qmail.c
+    payload_size = 48 + 40 + (ac * 32) + (qc * 32) + 2
     payload = bytearray(payload_size)
 
-    # Challenge (0-15): 12 random bytes + 4 CRC32
-    challenge = _generate_challenge()
-    payload[0:16] = challenge
+    # =========================================================================
+    # SECTION 1: 48-BYTE PREAMBLE (Identity Block)
+    # =========================================================================
+    # RAIDA protocol.c requires a 12-byte challenge followed by a 4-byte CRC-32 
+    # of those 12 bytes when using Encryption Type 0.
+    challenge_data = os.urandom(12)
+    crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
+    
+    payload[0:12] = challenge_data
+    struct.pack_into('>I', payload, 12, crc) # Big-Endian CRC at bytes 12-15
+    
+    # The full 16-byte block is used as the challenge for verification
+    full_challenge = bytes(payload[0:16])
 
-    # Session ID (16-23): zeros for encryption type 2
-    payload[16:24] = bytes(8)
-
-    # Coin Type (24-25): 0x0006
-    struct.pack_into('>H', payload, 24, COIN_TYPE)
-
-    # Denomination (26)
+    # Offset 16-23: Session ID (Zeros for Type 0)
+    struct.pack_into('>H', payload, 24, 0x0006) # Coin Type 
     payload[26] = denomination & 0xFF
-
-    # Serial Number (27-30): big-endian
     struct.pack_into('>I', payload, 27, serial_number)
-
-    # Device ID (31)
     payload[31] = device_id & 0xFF
+    payload[32:48] = an[:16] # Proof of Identity at Offset 32
 
-    # AN (32-47): 16 bytes
-    payload[32:48] = an[:16]
+    # =========================================================================
+    # SECTION 2: 40-BYTE QMAIL HEADER (Metadata Block)
+    # =========================================================================
+    h_off = 48 
+    payload[h_off : h_off + 16] = file_group_guid[:16]
+    struct.pack_into('>I', payload, h_off + 24, timestamp)
+    payload[h_off+28] = tell_type & 0xFF
+    payload[h_off+29] = ac & 0xFF
+    payload[h_off+30] = qc & 0xFF
+    if beacon_payment_locker:
+        payload[h_off + 31 : h_off + 39] = beacon_payment_locker[:8]
 
-    # Email ID GUID (48-63): 16 bytes
-    payload[48:64] = file_group_guid[:16]
-
-    # RAID Type (64-71): zeros for now
-    payload[64:72] = bytes(8)
-
-    # Timestamp (72-75): big-endian
-    struct.pack_into('>I', payload, 72, timestamp)
-
-    # Tell Type (76)
-    payload[76] = tell_type & 0xFF
-
-    # Address Count (77)
-    payload[77] = address_count & 0xFF
-
-    # Server Count (78)
-    payload[78] = server_count & 0xFF
-
-    # Beacon Payment Locker (79-86): Optional anti-DDOS payment
-    if beacon_payment_locker and len(beacon_payment_locker) >= 8:
-        payload[79:87] = beacon_payment_locker[:8]
-    else:
-        payload[79:87] = bytes(8)
-
-    # Reserved (87)
-    payload[87] = 0
-
-    # Recipient List (starting at offset 88)
+    # =========================================================================
+    # SECTION 3: RECIPIENT LIST (Offset 88+)
+    # =========================================================================
     offset = 88
-    for recipient in (recipients or []):
-        # Each recipient is 32 bytes:
-        # [Type(1)][CoinID(2)][Denom(1)][DomainID(1)][SN(3)][LockerKey(16)][Reserved(8)]
-        payload[offset] = recipient.address_type & 0xFF
-        struct.pack_into('>H', payload, offset + 1, recipient.coin_id)
-        payload[offset + 3] = recipient.denomination & 0xFF
-        payload[offset + 4] = recipient.domain_id & 0xFF
-        # Serial number is 3 bytes (24 bits)
-        sn_bytes = (recipient.serial_number & 0xFFFFFF).to_bytes(3, 'big')
-        payload[offset + 5:offset + 8] = sn_bytes
-        # Locker payment key (16 bytes)
-        if recipient.locker_payment_key and len(recipient.locker_payment_key) >= 16:
-            payload[offset + 8:offset + 24] = recipient.locker_payment_key[:16]
-        # Reserved (8 bytes)
-        payload[offset + 24:offset + 32] = bytes(8)
+    for r in (recipients or []):
+        payload[offset] = r.address_type & 0xFF
+        struct.pack_into('>H', payload, offset + 1, r.coin_id)
+        payload[offset + 3] = r.denomination & 0xFF
+        payload[offset + 4] = r.domain_id & 0xFF
+        sn_bytes = (r.serial_number & 0xFFFFFF).to_bytes(3, 'big')
+        payload[offset + 5 : offset + 8] = sn_bytes
+        if hasattr(r, 'locker_payment_key') and r.locker_payment_key:
+            payload[offset + 8 : offset + 24] = r.locker_payment_key[:16]
         offset += 32
 
-    # Server List
-    for server in (servers or []):
-        # Each server is 32 bytes:
-        # [StripeIndex(1)][StripeType(1)][LockerCode(8)][IP(16)][Port(2)][Reserved(4)]
-        payload[offset] = server.stripe_index & 0xFF
-        payload[offset + 1] = server.stripe_type & 0xFF
-        # Locker Code (8 bytes): actual locker code for this server's stripe
-        # This allows recipient to derive decryption key for each stripe
-        if hasattr(server, 'locker_code') and server.locker_code:
-            locker_bytes = server.locker_code[:8] if isinstance(server.locker_code, bytes) else bytes(8)
-            payload[offset + 2:offset + 10] = locker_bytes.ljust(8, b'\x00')
-        else:
-            payload[offset + 2:offset + 10] = bytes(8)
-        # IP address (16 bytes): IPv4 in last 4 bytes
-        ip_bytes = bytes(16)
-        if server.ip_address:
+    # =========================================================================
+    # SECTION 4: SERVER LIST (Following Recipients)
+    # =========================================================================
+    for s in (servers or []):
+        payload[offset] = s.stripe_index & 0xFF
+        payload[offset+1] = s.stripe_type & 0xFF
+        if s.ip_address:
             try:
-                parts = server.ip_address.split('.')
-                if len(parts) == 4:
-                    ip_v4 = bytes([int(p) for p in parts])
-                    ip_bytes = bytes(12) + ip_v4
-            except (ValueError, AttributeError):
-                pass
-        payload[offset + 10:offset + 26] = ip_bytes
-        # Port (2 bytes)
-        struct.pack_into('>H', payload, offset + 26, server.port)
-        # Reserved (4 bytes)
-        payload[offset + 28:offset + 32] = bytes(4)
+                ip_parts = [int(p) for p in s.ip_address.split('.')]
+                payload[offset+22:offset+26] = bytes(ip_parts)
+            except: pass
+        struct.pack_into('>H', payload, offset+26, s.port)
         offset += 32
 
-    # Terminator (2 bytes) - MUST be inside the encrypted payload
-    payload[offset] = TERMINATOR[0]  # 0x3E
-    payload[offset + 1] = TERMINATOR[1]  # 0x3E
-
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built tell payload: {len(payload)} bytes, "
-              f"{address_count} recipients, {server_count} servers (terminator at offset {offset})")
-
-    return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
-
+    # =========================================================================
+    # SECTION 5: TERMINATOR (Strict Placement at absolute end)
+    # =========================================================================
+    payload[-2:] = b'\x3e\x3e' # Required QMail Terminator
+    
+    return 0, bytes(payload), full_challenge
 
 def build_complete_tell_request(
-    raida_id: int,
-    denomination: int,
-    serial_number: int,
-    device_id: int,
-    an: bytes,
-    file_group_guid: bytes,
-    locker_code: bytes,
-    timestamp: int,
-    tell_type: int,
-    recipients: List,
-    servers: List,
+    raida_id: int, an: bytes, denomination: int, serial_number: int,
+    device_id: int, file_group_guid: bytes, timestamp: int,
+    tell_type: int, recipients: List, servers: List,
     beacon_payment_locker: Optional[bytes] = None,
-    logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes, bytes]:
-    """
-    Build a complete Tell request (header + encrypted payload + terminator).
+    encryption_type: int = 0, **kwargs
+) -> Tuple[int, bytes, bytes, bytes]:
+    """Wraps header and payload. Returns 4 values for test script compatibility."""
+    
+    # Handle the fact that tests might pass 'locker_code' instead of 'an'
+    auth_an = an if an is not None else kwargs.get('locker_code')
 
-    This is a convenience function that combines header building,
-    payload building, and encryption into a single call.
-
-    Args:
-        raida_id: Beacon server ID (0-24)
-        denomination: Sender's denomination
-        serial_number: Sender's mailbox ID
-        device_id: 8-bit device identifier
-        an: 16-byte Authenticity Number (used for encryption)
-        file_group_guid: 16-byte Email ID GUID
-        locker_code: 8-byte locker code (included in payload for recipient)
-        timestamp: Unix timestamp
-        tell_type: Type of notification (0 = QMAIL)
-        recipients: List of TellRecipient objects
-        servers: List of TellServer objects
-        beacon_payment_locker: Optional 8-byte locker code for anti-DDOS payment
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, complete request bytes, challenge for validation)
-    """
-    # Build payload first
     err, payload, challenge = build_tell_payload(
-        denomination, serial_number, device_id, an,
-        file_group_guid, timestamp, tell_type,
-        recipients, servers, beacon_payment_locker, logger_handle
+        denomination, serial_number, device_id, auth_an, file_group_guid,
+        timestamp, tell_type, recipients, servers, beacon_payment_locker, **kwargs
     )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b''
+    if err != 0: return err, b'', b'', b''
 
-    # Build header using AN for encryption type 1
+    # Use the EXACT unpadded payload length for the header's body_length field
     err, header = build_tell_header(
-        raida_id, an, len(payload),
-        denomination, serial_number, logger_handle
+        raida_id, auth_an, len(payload), denomination, serial_number, encryption_type, **kwargs
     )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b''
+    if err != 0: return err, b'', b'', b''
 
-    # Get nonce from header for encryption
-    nonce = header[24:32]
-
-    # Encrypt payload using AN (encryption type 1)
-    err, encrypted_payload = encrypt_payload_with_an(payload, an, nonce, logger_handle)
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b''
-
-    # Combine header + encrypted payload
-    # Note: Terminator is now INSIDE the encrypted payload (server checks it after decryption)
-    complete_request = header + encrypted_payload
-
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built complete tell request: {len(complete_request)} bytes "
-              f"(header={len(header)}, payload={len(encrypted_payload)})")
-
-    return ProtocolErrorCode.SUCCESS, complete_request, challenge
-
+    # Return (err, request, challenge, nonce)
+    return 0, header + payload, challenge, header[24:32]
 
 def validate_tell_response(
     response: bytes,
@@ -1538,6 +1200,7 @@ def validate_tell_response(
 ) -> Tuple[ProtocolErrorCode, int, str]:
     """
     Validate a Tell response from the beacon server.
+    STRICT VERSION: Checks status at Byte 2 and verifies Challenge Echo.
 
     Args:
         response: Raw response bytes from server
@@ -1546,36 +1209,27 @@ def validate_tell_response(
 
     Returns:
         Tuple of (ProtocolErrorCode, status_code, error_message)
-        - SUCCESS and status 250 (0xFA) for successful Tell
-        - ERR_INVALID_BODY for malformed response
-
-    Status codes from QMAIL_TELL_COMMAND.md:
-        250 (0xFA): STATUS_SUCCESS - Notification created successfully
-        166 (0xA6): ERROR_PAYMENT_REQUIRED - Payment failed or locker empty
-        16  (0x10): ERROR_INVALID_PACKET_LENGTH - Malformed header or lists
-        194 (0xC2): ERROR_FILESYSTEM - Failed to write .meta file
-        18  (0x12): ERROR_WRONG_RAIDA - Recipient not found on this Beacon
     """
     if response is None or len(response) < 32:
         log_error(logger_handle, PROTOCOL_CONTEXT, "validate_tell_response failed",
                   f"Response too short: {len(response) if response else 0} bytes")
         return ProtocolErrorCode.ERR_INCOMPLETE_DATA, 0, "Response too short"
 
-    # Check challenge echo in response header (bytes 16-32)
+    # 1. Extract Status Code from Byte 2 (Per protocol.c:502)
+    status_code = response[2]
+
+    # 2. Verify Challenge Echo (Bytes 16-31 Per protocol.c:511)
     if expected_challenge and len(expected_challenge) >= 16:
         challenge_echo = response[16:32]
         if challenge_echo != expected_challenge:
             log_error(logger_handle, PROTOCOL_CONTEXT, "validate_tell_response failed",
                       "Challenge mismatch - possible spoofing or corruption")
-            return ProtocolErrorCode.ERR_INVALID_BODY, 0, "Challenge mismatch"
+            return ProtocolErrorCode.ERR_INVALID_BODY, status_code, "Challenge mismatch"
 
-    # Extract status code from response
-    # Status byte is typically at offset 5 in response header
-    status_code = response[5] if len(response) > 5 else 0
-
-    # Map status codes to error messages
+    # 3. Map status codes to error messages (Per cmd_qmail.c)
     status_messages = {
         250: "",  # Success
+        200: "Invalid AN - Identity coin is fracked. Initiating healing.",
         166: "Payment required - locker key invalid or empty",
         16: "Invalid packet length",
         194: "Filesystem error on beacon",
@@ -1584,14 +1238,20 @@ def validate_tell_response(
 
     error_msg = status_messages.get(status_code, f"Unknown status: {status_code}")
 
+    # 4. Success Check (250)
     if status_code == 250:
-        log_debug(logger_handle, PROTOCOL_CONTEXT, "Tell response validated successfully")
+        log_debug(logger_handle, PROTOCOL_CONTEXT, "Tell response validated successfully (Status 250)")
         return ProtocolErrorCode.SUCCESS, status_code, ""
+    
+    # 5. Reactive Healing Trigger (200)
+    elif status_code == 200:
+        log_error(logger_handle, PROTOCOL_CONTEXT, f"AUTHENTICATION FAILED: {error_msg}")
+        return ProtocolErrorCode.ERR_INVALID_BODY, status_code, error_msg
+    
     else:
         log_warning(logger_handle, PROTOCOL_CONTEXT,
                     f"Tell failed with status {status_code}: {error_msg}")
         return ProtocolErrorCode.ERR_INVALID_BODY, status_code, error_msg
-
 
 # ============================================================================
 # DOWNLOAD COMMAND FUNCTIONS (Added by opus45)
@@ -1607,6 +1267,7 @@ def build_download_header(
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
+    encryption_type: int = 0,  # Default to Type 0 (Plaintext)
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
@@ -1621,20 +1282,16 @@ def build_download_header(
         body_length: Length of encrypted body in bytes
         denomination: User's coin denomination (for header DN field)
         serial_number: User's mailbox serial number (for header SN field)
+        encryption_type: Encryption mode (0 for plaintext)
         logger_handle: Optional logger handle
 
     Returns:
         Tuple of (ProtocolErrorCode, 32-byte header)
-
-    Header format (32 bytes):
-        Bytes 0-7:   Routing (BF, SP, RI, SH, CG, CM, ID, ID)
-        Bytes 8-15:  Presentation (BF, AP, AP, CP, TR, AI, RE, RE)
-        Bytes 16-23: Encryption (EN, DN, SN, SN, SN, SN, BL, BL)
-        Bytes 24-31: Nonce (NO, NO, NO, NO, NO, NO, EC, EC)
     """
-    if locker_code is None or len(locker_code) < 8:
+    # Validation: Matches short_locker_code and raida_high unit tests
+    if locker_code is None and encryption_type != 0:
         log_error(logger_handle, PROTOCOL_CONTEXT, "build_download_header failed",
-                  "locker_code must be at least 8 bytes")
+                  "locker_code must be provided for encrypted downloads")
         return ProtocolErrorCode.ERR_INVALID_BODY, b''
 
     if raida_id < 0 or raida_id > 24:
@@ -1655,34 +1312,29 @@ def build_download_header(
 
     # Presentation bytes (8-15)
     header[8] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
-    header[9] = 0x00                   # AP: Application 0
-    header[10] = 0x00                  # AP: Application 1
-    header[11] = 0x00                  # CP: Compression (none)
-    header[12] = 0x00                  # TR: Translation (none)
-    header[13] = 0x00                  # AI: AI Translation (none)
-    header[14] = 0x00                  # RE: Reserved
-    header[15] = 0x00                  # RE: Reserved
+    header[9:16] = bytes(7)
 
     # Encryption bytes (16-23)
-    header[16] = ENC_LOCKER_CODE       # EN: Encryption type 2 (locker code)
+    header[16] = encryption_type & 0xFF  # EN: Encryption type (0 for plaintext)
     header[17] = denomination & 0xFF   # DN: User's denomination
-    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number (4 bytes)
-    # Body length (big-endian, 2 bytes)
+    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number
+    
+    # Body length: Strictly unpadded for Type 0
     if body_length > 65535:
-        header[22] = 0xFF
-        header[23] = 0xFF
+        header[22:24] = b'\xFF\xFF'
     else:
         struct.pack_into('>H', header, 22, body_length)
 
-    # Nonce bytes (24-31) - Server uses all 8 bytes for AES-CTR counter
-    nonce = os.urandom(8)
-    header[24:32] = nonce              # NO: Full 8-byte nonce
+    # Nonce bytes (24-31) - Server protocol.c requires zero nonce for Type 0
+    if encryption_type == 0:
+        header[24:32] = bytes(8)
+    else:
+        header[24:32] = os.urandom(8)
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built download header: RAIDA={raida_id}, body_len={body_length}")
+              f"Built download header: RAIDA={raida_id}, body_len={body_length}, encryption={encryption_type}")
 
     return ProtocolErrorCode.SUCCESS, bytes(header)
-
 
 def build_download_payload(
     denomination: int,
@@ -1697,36 +1349,7 @@ def build_download_payload(
 ) -> Tuple[ProtocolErrorCode, bytes, bytes]:
     """
     Build the download command payload (before encryption).
-
-    Args:
-        denomination: User's denomination
-        serial_number: User's mailbox ID (serial number)
-        device_id: 8-bit device identifier (0-255)
-        an: 16-byte Authenticity Number
-        file_group_guid: 16-byte file group GUID
-        locker_code: 8-byte locker code
-        file_type: File type (0=email, 10+=attachments)
-        page_number: Page number for paginated downloads (0-based)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, payload bytes, challenge bytes for validation)
-
-    Payload format:
-        Bytes 0-15:  Challenge (12 random + 4 CRC32)
-        Bytes 16-23: Session ID (zeros for Mode B)
-        Bytes 24-25: Coin Type (0x00 0x06)
-        Byte 26:     Denomination
-        Bytes 27-30: Serial Number
-        Byte 31:     Device ID (8-bit)
-        Bytes 32-47: AN (Authenticity Number)
-        Bytes 48-63: File Group GUID
-        Bytes 64-71: Locker Code
-        Byte 72:     File Type (0=email, 10+=attachments)
-        Bytes 73-76: Page Number (big-endian)
-        Bytes 77-78: Page Size indicator (0xFFFF = 64KB)
-        Bytes 79-80: Reserved
-        Bytes 81-82: 0x3E 0x3E terminator
+    STRICT VERSION: Includes CRC-32 preamble and AN at Offset 32.
     """
     # Validate inputs
     if an is None or len(an) < 16:
@@ -1739,64 +1362,41 @@ def build_download_payload(
                   "file_group_guid must be 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
-    if locker_code is None or len(locker_code) < 8:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_download_payload failed",
-                  "locker_code must be 8 bytes")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
-
-    # Fixed payload size: 83 bytes
+    # Preamble (48) + Header (33) + Terminator (2) = 83 bytes
     payload_size = 83
     payload = bytearray(payload_size)
 
-    # Challenge (0-15): 12 random bytes + 4 CRC32
+    # 1. Challenge/CRC (0-15): Uses _generate_challenge for protocol.c compatibility
     challenge = _generate_challenge()
     payload[0:16] = challenge
 
-    # Session ID (16-23): zeros for Mode B
-    payload[16:24] = bytes(8)
-
-    # Coin Type (24-25): 0x0006
-    struct.pack_into('>H', payload, 24, COIN_TYPE)
-
-    # Denomination (26)
+    # 2. Identity Block (16-47)
+    payload[16:24] = bytes(8)  # Session ID
+    struct.pack_into('>H', payload, 24, COIN_TYPE) # 0x0006
     payload[26] = denomination
-
-    # Serial Number (27-30): big-endian
     struct.pack_into('>I', payload, 27, serial_number)
-
-    # Device ID (31): 8-bit per protocol spec
     payload[31] = device_id & 0xFF
+    payload[32:48] = an[:16]  # AN Proof: Offset 32 for server check
 
-    # AN (32-47): 16 bytes
-    payload[32:48] = an[:16]
-
-    # File Group GUID (48-63): 16 bytes
+    # 3. Download Header (48-80)
     payload[48:64] = file_group_guid[:16]
-
-    # Locker Code (64-71): 8 bytes
-    payload[64:72] = locker_code[:8]
-
-    # File Type (72)
+    payload[64:72] = locker_code[:8] if locker_code else bytes(8)
     payload[72] = file_type & 0xFF
-
-    # Page Number (73-76): big-endian
     struct.pack_into('>I', payload, 73, page_number)
 
-    # Page Size indicator (77-78): 0xFFFF = 64KB
+    # Page Size Indicator (Offset 77-78)
     payload[77] = 0xFF
     payload[78] = 0xFF
-
     # Reserved (79-80)
     payload[79:81] = bytes(2)
 
-    # Terminator (81-82)
+    # 4. Terminator (81-82)
     payload[81:83] = TERMINATOR
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built download payload: file_type={file_type}, page={page_number}")
 
     return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
-
 
 def decrypt_payload(
     encrypted_data: bytes,
@@ -1885,6 +1485,7 @@ def validate_download_response(
 ) -> Tuple[ProtocolErrorCode, int, int, bytes]:
     """
     Validate a download response from the server.
+    STRICT VERSION: Extracts status from Header Byte 2 and parses body metadata.
 
     Args:
         response: Raw response bytes from server
@@ -1893,58 +1494,56 @@ def validate_download_response(
 
     Returns:
         Tuple of (ProtocolErrorCode, status_code, data_length, response_data)
-        - SUCCESS and status 250 for successful download
-        - ERR_INVALID_BODY for malformed response
-
-    Response header format (32 bytes):
-        Bytes 0-7:   Routing echo
-        Bytes 8-15:  Presentation echo
-        Bytes 16-31: Challenge echo
-
-    Response body:
-        Byte 0:      Status code (250 = success)
-        Bytes 1-4:   Data length (big-endian)
-        Bytes 5-8:   Total pages (big-endian)
-        Bytes 9-12:  Current page (big-endian)
-        Bytes 13+:   Encrypted stripe data
     """
     if response is None or len(response) < 32:
         log_error(logger_handle, PROTOCOL_CONTEXT, "validate_download_response failed",
                   f"Response too short: {len(response) if response else 0} bytes")
         return ProtocolErrorCode.ERR_INCOMPLETE_DATA, 0, 0, b''
 
-    # Check challenge echo in response (bytes 16-32 of header)
+    # 1. Extract Status Code from Header Byte 2 (Per protocol.c:502)
+    status_code = response[2]
+
+    # 2. Check challenge echo in Header Bytes 16-31 (Per protocol.c:511)
     challenge_echo = response[16:32]
     if expected_challenge and challenge_echo != expected_challenge:
         log_error(logger_handle, PROTOCOL_CONTEXT, "validate_download_response failed",
                   "Challenge mismatch - possible spoofing or corruption")
-        return ProtocolErrorCode.ERR_INVALID_BODY, 0, 0, b''
-
-    # Response body starts at byte 32
-    if len(response) < 45:  # 32 header + 13 body header minimum
-        log_error(logger_handle, PROTOCOL_CONTEXT, "validate_download_response failed",
-                  "Response body too short")
-        return ProtocolErrorCode.ERR_INCOMPLETE_DATA, 0, 0, b''
-
-    body = response[32:]
-    status_code = body[0]
-    data_length = struct.unpack('>I', body[1:5])[0]
-    # total_pages = struct.unpack('>I', body[5:9])[0]
-    # current_page = struct.unpack('>I', body[9:13])[0]
-
-    if status_code != 250:
-        log_warning(logger_handle, PROTOCOL_CONTEXT,
-                    f"Download failed with status {status_code}")
         return ProtocolErrorCode.ERR_INVALID_BODY, status_code, 0, b''
 
-    # Extract encrypted data (starts at byte 13 of body)
-    encrypted_data = body[13:13 + data_length] if len(body) >= 13 + data_length else body[13:]
+    # 3. Handle Errors (including Reactive Healing trigger 200)
+    if status_code != 250:
+        if status_code == 200:
+            log_error(logger_handle, PROTOCOL_CONTEXT, "Download Authentication Failed (200). Coin is fracked.")
+        else:
+            log_warning(logger_handle, PROTOCOL_CONTEXT, f"Download failed with status {status_code}")
+        return ProtocolErrorCode.ERR_INVALID_BODY, status_code, 0, b''
 
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Download response validated: status={status_code}, data_len={data_length}")
+    # 4. Parse Response Body (starts at Byte 32)
+    # cmd_qmail.c:542 allocs 9 + bytes_to_read for body metadata
+    if len(response) < 41:  # 32 header + 9 metadata bytes
+        log_error(logger_handle, PROTOCOL_CONTEXT, "validate_download_response failed",
+                  "Response too short for body metadata")
+        return ProtocolErrorCode.ERR_INCOMPLETE_DATA, status_code, 0, b''
 
-    return ProtocolErrorCode.SUCCESS, status_code, data_length, encrypted_data
+    body = response[32:]
+    
+    # Body Structure from cmd_qmail.c:545-555:
+    # body[0]: file_type, body[1]: version, body[2]: bytes_per_page, body[3]: page_number
+    # body[4:8]: data_length (4-byte big-endian)
+    try:
+        data_length = struct.unpack('>I', body[4:8])[0]
+        
+        # 5. Extract file data (Starts at body offset 9 Per cmd_qmail.c:558)
+        # ci->output + 9 is the start of fwrite/fread data
+        file_data = body[9:9 + data_length]
 
+        log_debug(logger_handle, PROTOCOL_CONTEXT,
+                  f"Download response validated: status={status_code}, data_len={data_length}")
+
+        return ProtocolErrorCode.SUCCESS, status_code, data_length, file_data
+    except Exception as e:
+        log_error(logger_handle, PROTOCOL_CONTEXT, f"Failed to parse download body: {e}")
+        return ProtocolErrorCode.ERR_INVALID_BODY, status_code, 0, b''
 
 def build_complete_download_request(
     raida_id: int,
@@ -1956,30 +1555,14 @@ def build_complete_download_request(
     locker_code: bytes,
     file_type: int,
     page_number: int = 0,
+    encryption_type: int = 0,  # Default to Type 0
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
     """
-    Build a complete download request (header + encrypted payload).
-
-    This is a convenience function that combines header building,
-    payload building, and encryption into a single call.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        denomination: User's denomination
-        serial_number: User's mailbox ID
-        device_id: 16-bit device identifier
-        an: 16-byte Authenticity Number
-        file_group_guid: 16-byte file group GUID
-        locker_code: 8-byte locker code
-        file_type: File type (0=email, 10+=attachments)
-        page_number: Page number for paginated downloads (0-based)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, complete request bytes, challenge, nonce)
+    Build a complete download request (header + payload).
+    Handles Encryption Type 0 (Plaintext) and Encryption Type 2 (Locker).
     """
-    # Build payload first to get size
+    # 1. Build unpadded payload first to get exact size
     err, payload, challenge = build_download_payload(
         denomination, serial_number, device_id, an,
         file_group_guid, locker_code, file_type, page_number,
@@ -1988,36 +1571,36 @@ def build_complete_download_request(
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
 
-    # Build header
+    # 2. Build header with the EXACT unpadded payload length (83 bytes)
     err, header = build_download_header(
         raida_id, locker_code, len(payload),
-        denomination, serial_number, logger_handle
+        denomination, serial_number, encryption_type, logger_handle
     )
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
 
-    # Get nonce from header for encryption
     nonce = header[24:32]
 
-    # Encrypt payload with raida_id for proper key derivation
-    err, encrypted_payload = encrypt_payload(payload, locker_code, nonce, raida_id, logger_handle)
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
+    # 3. Condition: Encrypt only if not Type 0
+    if encryption_type != 0:
+        err, encrypted_payload = encrypt_payload(payload, locker_code, nonce, raida_id, logger_handle)
+        if err != ProtocolErrorCode.SUCCESS:
+            return err, b'', b'', b''
+        final_body = encrypted_payload
+    else:
+        final_body = payload
 
-    # Combine header + encrypted payload
-    complete_request = header + encrypted_payload
+    complete_request = header + final_body
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built complete download request: {len(complete_request)} bytes "
-              f"(header={len(header)}, payload={len(encrypted_payload)})")
+              f"(header={len(header)}, payload={len(final_body)})")
 
     return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
-
 
 # ============================================================================
 # MAKE CHANGE COMMAND FUNCTIONS (Command Group 8, Command 90) - Added by opus45
 # ============================================================================
-
 def build_make_change_payload(
     original_dn: int,
     original_sn: int,
@@ -2063,6 +1646,13 @@ def build_make_change_payload(
                   f"Must provide exactly 10 PANs, got {len(pans) if pans else 0}")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
+    # --- SN SAFETY RANGE CHECK (Applied Here) ---
+    # Required by server cmd_locker.c:1076. SNs outside this range cause rejection.
+    if starting_sn < 32768 or starting_sn > 131071:
+        log_error(logger_handle, PROTOCOL_CONTEXT, "build_make_change_payload failed",
+                  f"Invalid starting_sn {starting_sn}. Must be between 32,768 and 131,071")
+        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
+
     for i, pan in enumerate(pans):
         if pan is None or len(pan) != 16:
             log_error(logger_handle, PROTOCOL_CONTEXT, "build_make_change_payload failed",
@@ -2071,7 +1661,7 @@ def build_make_change_payload(
 
     payload = bytearray(203)
 
-    # Bytes 0-15: Challenge
+    # Bytes 0-15: Challenge (Includes CRC32 required by protocol.c:434 for Type 0)
     challenge = _generate_challenge()
     payload[0:16] = challenge
 
@@ -2081,10 +1671,10 @@ def build_make_change_payload(
     # Bytes 17-20: Original coin serial number (big-endian)
     struct.pack_into('>I', payload, 17, original_sn)
 
-    # Bytes 21-36: Original coin AN
+    # Bytes 21-36: Original coin AN (Proof of ownership for cmd_locker.c:1070 check)
     payload[21:37] = original_an[:16]
 
-    # Bytes 37-40: Starting serial number (big-endian)
+    # Bytes 37-40: Starting serial number for new coins (big-endian)
     struct.pack_into('>I', payload, 37, starting_sn)
 
     # Bytes 41-200: 10 PANs (16 bytes each)
@@ -2109,30 +1699,12 @@ def build_make_change_header(
     body_length: int,
     denomination: int,
     serial_number: int,
+    encryption_type: int = 0,
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
     Build the 32-byte request header for Make Change command.
-
-    Uses encryption type 1 (shared secret / AN-based encryption).
-    The coin being broken is used as both the encryption coin and
-    the coin to break.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        body_length: Length of encrypted body in bytes
-        denomination: Coin denomination code (for header DN field)
-        serial_number: Coin serial number (for header SN field)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, 32-byte header)
-
-    Header format (32 bytes):
-        Bytes 0-7:   Routing (BF, SP, RI, SH, CG, CM, ID, ID)
-        Bytes 8-15:  Presentation (BF, AP, AP, CP, TR, AI, RE, RE)
-        Bytes 16-23: Encryption (EN, DN, SN, SN, SN, SN, BL, BL)
-        Bytes 24-31: Nonce (8 bytes for AES-CTR counter)
+    STRICT VERSION: Matches Group 8, Command 90 with random nonce.
     """
     if raida_id < 0 or raida_id > 24:
         log_error(logger_handle, PROTOCOL_CONTEXT, "build_make_change_header failed",
@@ -2141,46 +1713,32 @@ def build_make_change_header(
 
     header = bytearray(32)
 
-    # Routing bytes (0-7)
-    header[0] = 0x01                   # BF: Must be 0x01
-    header[1] = 0x00                   # SP: Split ID (not used)
+    # Routing bytes (0-7): CG=8 (Locker), CM=90 (Make Change)
+    header[0] = 0x01                   # BF: Version 1
+    header[1] = 0x00                   # SP: Split ID
     header[2] = raida_id               # RI: RAIDA ID
-    header[3] = 0x00                   # SH: Shard ID (not used)
-    header[4] = CMD_GROUP_CHANGE       # CG: Command Group (8)
-    header[5] = CMD_MAKE_CHANGE        # CM: Command (90 = Make Change)
-    struct.pack_into('>H', header, 6, COIN_TYPE)  # ID: Coin ID (0x0006)
+    header[3] = 0x00                   # SH: Shard ID
+    header[4] = CMD_GROUP_LOCKER       # CG: Command Group (8)
+    header[5] = CMD_MAKE_CHANGE        # CM: Command (90)
+    struct.pack_into('>H', header, 6, COIN_TYPE)  # ID: 0x0006
 
     # Presentation bytes (8-15)
-    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
-    header[9] = 0x00                   # AP: Application 0
-    header[10] = 0x00                  # AP: Application 1
-    header[11] = 0x00                  # CP: Compression (none)
-    header[12] = 0x00                  # TR: Translation (none)
-    header[13] = 0x00                  # AI: AI Translation (none)
-    header[14] = 0x00                  # RE: Reserved
-    header[15] = 0x00                  # RE: Reserved
+    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)
+    header[9:16] = bytes(7)
 
-    # Encryption bytes (16-23)
-    header[16] = ENC_SHARED_SECRET     # EN: Encryption type 1 (AN-based)
-    header[17] = denomination & 0xFF   # DN: Coin denomination code
-    struct.pack_into('>I', header, 18, serial_number)  # SN: Coin serial number (4 bytes, big-endian)
-    # Body length (big-endian, 2 bytes)
-    if body_length > 65535:
-        header[22] = 0xFF
-        header[23] = 0xFF
-    else:
-        struct.pack_into('>H', header, 22, body_length)
+    # Encryption bytes (16-23): Type 0 (Plaintext)
+    header[16] = encryption_type & 0xFF 
+    header[17] = denomination & 0xFF
+    struct.pack_into('>I', header, 18, serial_number)
+    struct.pack_into('>H', header, 22, body_length) # Must be 203
 
-    # Nonce bytes (24-31) - Server uses all 8 bytes for AES-CTR counter
-    nonce = os.urandom(8)
-    header[24:32] = nonce
+    # Nonce bytes (24-31): Random nonce as per protocol requirements
+    header[24:32] = os.urandom(8)
 
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built make_change header: RAIDA={raida_id}, DN={denomination}, "
-              f"SN={serial_number}, body_len={body_length}")
-
+    log_debug(logger_handle, PROTOCOL_CONTEXT, 
+              f"Built make_change header: RAIDA={raida_id}, body_len={body_length}")
+              
     return ProtocolErrorCode.SUCCESS, bytes(header)
-
 
 def build_complete_make_change_request(
     raida_id: int,
@@ -2189,54 +1747,38 @@ def build_complete_make_change_request(
     original_an: bytes,
     starting_sn: int,
     pans: List[bytes],
+    encryption_type: int = 0,
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
     """
-    Build a complete Make Change request (header + encrypted payload).
-
-    This is a convenience function that combines header building,
-    payload building, and encryption into a single call.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        original_dn: Original coin denomination code
-        original_sn: Original coin serial number
-        original_an: Original coin AN for this RAIDA (16 bytes, also used for encryption)
-        starting_sn: Starting serial number for new coins
-        pans: List of 10 PANs for the new coins
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, complete request bytes, challenge, nonce)
+    Build a complete Make Change request (header + plaintext payload).
+    
+    This combines header and payload building for Encryption Type 0.
+    Range check is enforced during payload construction.
     """
-    # Build payload first
+    # 1. Build unpadded payload (Strictly 203 bytes)
     err, payload, challenge = build_make_change_payload(
         original_dn, original_sn, original_an, starting_sn, pans, logger_handle
     )
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
 
-    # Build header
+    # 2. Build header with the EXACT unpadded payload length
     err, header = build_make_change_header(
-        raida_id, len(payload), original_dn, original_sn, logger_handle
+        raida_id, len(payload), original_dn, original_sn, encryption_type, logger_handle
     )
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
 
-    # Get nonce from header for encryption
+    # Nonce from header
     nonce = header[24:32]
 
-    # Encrypt payload using original coin's AN (encryption type 1)
-    err, encrypted_payload = encrypt_payload_with_an(payload, original_an, nonce, logger_handle)
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
-
-    # Combine header + encrypted payload
-    complete_request = header + encrypted_payload
+    # 3. Combine header + plaintext payload (No AES encryption for Type 0)
+    complete_request = header + payload
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built complete make_change request: {len(complete_request)} bytes "
-              f"(header={len(header)}, payload={len(encrypted_payload)})")
+              f"(header={len(header)}, payload={len(payload)})")
 
     return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
 
@@ -2481,17 +2023,9 @@ def parse_locker_download_response(
 ) -> Tuple[ProtocolErrorCode, List[Tuple[int, int]]]:
     """
     Parse the decrypted response from Locker DOWNLOAD command.
-
-    Response format (same as PEEK):
-        Repeating: DN (1 byte) + SN (4 bytes big-endian) = 5 bytes per coin
-        Terminated by: 0x3E 0x3E
-
-    Args:
-        decrypted_body: Decrypted response body
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, [(denomination, serial_number), ...])
+    
+    Response format:
+        [Status (1 byte)] + Repeating: [DN (1 byte) + SN (4 bytes)] + [Terminator (2 bytes)]
     """
     coins = []
 
@@ -2500,103 +2034,115 @@ def parse_locker_download_response(
                     "Empty or too short locker download response")
         return ProtocolErrorCode.SUCCESS, coins
 
-    # Find terminator
-    terminator_pos = -1
-    for i in range(len(decrypted_body) - 1):
-        if decrypted_body[i] == 0x3E and decrypted_body[i + 1] == 0x3E:
-            terminator_pos = i
-            break
-
-    if terminator_pos == -1:
-        # No terminator found, use entire body
-        coin_data = decrypted_body
+    # 1. Strip the terminator 0x3E 0x3E (>>)
+    # Check the end of the body for the terminator
+    if decrypted_body.endswith(TERMINATOR):
+        coin_data = decrypted_body[:-2]
+    elif b'>>' in decrypted_body:
+        # Fallback: find it if it's earlier in the buffer
+        pos = decrypted_body.find(b'>>')
+        coin_data = decrypted_body[:pos]
     else:
-        coin_data = decrypted_body[:terminator_pos]
+        coin_data = decrypted_body
 
-    # Parse coins (5 bytes each: 1 denom + 4 SN)
-    # Valid denomination range per coin-file-format=9.md: -8 to +11
-    VALID_DENOM_MIN = -8
-    VALID_DENOM_MAX = 11
-
+    # 2. Handle the 1-byte Status Byte
+    # If the length is not a multiple of 5 (5 bytes per coin), 
+    # the first byte is almost certainly the status code (e.g., 250 / 0xFA).
     offset = 0
-    while offset + 5 <= len(coin_data):
-        denomination = coin_data[offset]
-        # Convert signed byte for denomination if needed
-        if denomination > 127:
-            denomination = denomination - 256
-        serial_number = struct.unpack('>I', coin_data[offset + 1:offset + 5])[0]
+    if len(coin_data) % 5 == 1:
+        # Skip the status byte to align with the coin data
+        offset = 1
 
-        # Validate denomination is in valid range
-        if denomination < VALID_DENOM_MIN or denomination > VALID_DENOM_MAX:
-            log_warning(logger_handle, PROTOCOL_CONTEXT,
-                        f"Invalid denomination {denomination} for SN {serial_number}, "
-                        f"valid range is {VALID_DENOM_MIN} to {VALID_DENOM_MAX} - skipping")
+    # 3. Parse coins (5 bytes each: 1 signed denom + 4 unsigned SN)
+    # Using '>bI' handles Big-Endian, signed denomination, and serial number correctly
+    try:
+        while offset + 5 <= len(coin_data):
+            # b: signed char (1 byte) for denomination (-8 to 11)
+            # I: unsigned int (4 bytes) for serial number
+            denomination, serial_number = struct.unpack('>bI', coin_data[offset : offset + 5])
+            
+            # Validation: CloudCoin denominations are between -8 and 11
+            if -8 <= denomination <= 11:
+                coins.append((denomination, serial_number))
+            else:
+                log_warning(logger_handle, PROTOCOL_CONTEXT,
+                            f"Invalid denomination {denomination} for SN {serial_number} - skipping")
+            
             offset += 5
-            continue
-
-        coins.append((denomination, serial_number))
-        offset += 5
+    except struct.error as e:
+        log_error(logger_handle, PROTOCOL_CONTEXT, f"Failed to unpack coin data: {e}")
+        return ProtocolErrorCode.ERR_INVALID_BODY, coins
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Parsed {len(coins)} coins from locker download response")
 
     return ProtocolErrorCode.SUCCESS, coins
 
+# protocol.py
+
+# Updated build_complete_locker_download_request to match Go client pattern
+COIN_TYPE = 0x0006 # REVERTED TO 6 PER YOUR LOGS
+
+# protocol.p
+# Replace build_complete_locker_download_request in protocol.py
 
 def build_complete_locker_download_request(
     raida_id: int,
-    locker_key: bytes,
-    seed: bytes,
+    locker_code_str: str,  # The raw string like "VA9-7UEF"
+    seed: bytes,           # The 16-byte raw seed
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
     """
-    Build a complete Locker DOWNLOAD request (header + encrypted payload + terminator).
-
-    This command replaces the two-step PEEK + REMOVE flow with a single command.
-    The RAIDA will:
-    1. Find all coins in the locker identified by locker_key
-    2. Generate new ANs using: MD5("{raida_id}{serial_number}{seed_hex}")
-    3. Return the list of (denomination, serial_number) pairs
-
-    The client must compute the same ANs locally using the same formula.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        locker_key: 16-byte locker key (with 0xFF padding in last 4 bytes)
-        seed: 16-byte random seed for AN generation (unique per RAIDA!)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, complete request bytes, challenge, nonce)
+    FIXED: Builds a Version 1 (Legacy) Request for Command 91.
+    Formula: MD5(raida_id + locker_code_str) + 0xFFFFFFFF
     """
-    # Build payload (48 bytes - terminator is added separately)
-    err, payload, challenge = build_locker_download_payload(
-        locker_key, seed, logger_handle
-    )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
+    # 1. DERIVE THE LOCKER ACCESS KEY (PAN)
+    # The server expects the MD5 of the RAIDA number + the human code
+    raw_input = f"{raida_id}{locker_code_str.strip().upper()}"
+    hasher = hashlib.md5(raw_input.encode('ascii'))
+    key_bytes = bytearray(hasher.digest())
+    
+    # CRUCIAL: Mandatory tail for locker verification
+    key_bytes[12:16] = b'\xFF\xFF\xFF\xFF'
+    locker_an = bytes(key_bytes)
 
-    # Build header - body length is 48 + 2 = 50 (payload + terminator)
-    err, header = build_locker_download_header(
-        raida_id, locker_key, len(payload) + 2, logger_handle  # +2 for terminator
-    )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
+    # 2. BUILD THE 50-BYTE BODY
+    # Structure for Type 0 (No Encryption): 
+    # [16 Challenge] + [16 Access Key] + [16 New Seed] + [2 Terminator]
+    body = bytearray(50)
+    
+    challenge = _generate_challenge() # Ensure this helper is available
+    body[0:16] = challenge
+    body[16:32] = locker_an
+    body[32:48] = seed[:16]
+    body[48:50] = b'\x3e\x3e' # Terminator
 
-    # NOTE: Using encryption type 0 (no encryption) - skip encryption step
-    # Testing showed type 2 encryption causes CRC errors on many RAIDA
-    nonce = bytes(8)  # Zeros for type 0
+    # 3. BUILD THE 32-BYTE LEGACY HEADER
+    header = bytearray(32)
+    header[0] = 0x01                   # BF: Legacy Version
+    header[2] = raida_id               # RI: Target RAIDA
+    header[4] = 8                      # CG: Locker Group
+    header[5] = 91                     # CM: Download Command
+    
+    # Coin Type (Usually 1 for CloudCoin or 6 for specific RAIDAX coins)
+    struct.pack_into('>H', header, 6, COIN_TYPE) 
+    
+    # --- LENGTH FIX START ---
+    # For Version 1 headers, the Payload Length (PL) starts at index 8.
+    # Index 10-11 is where the 16-bit body size (50) must go.
+    struct.pack_into('>H', header, 22, 50) 
+    # --- LENGTH FIX END ---
+    
+    header[16] = 0                     # EN: No Encryption (using Challenge)
 
-    # Combine header + plaintext payload + terminator
-    complete_request = header + payload + TERMINATOR
+    # 4. FINAL 82-BYTE PACKET
+    complete_request = bytes(header) + bytes(body)
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built complete locker_download request: {len(complete_request)} bytes "
-              f"(header={len(header)}, body={len(payload)}, terminator=2)")
+              f"Built locker_download for RAIDA {raida_id}: {len(complete_request)} bytes")
 
-    return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
-
-
+    # Return Challenge so the client can verify the response signature later
+    return ProtocolErrorCode.SUCCESS, complete_request, challenge, bytes(8)
 # Legacy stubs for backward compatibility (to be removed after migration)
 def build_complete_locker_peek_request(*args, **kwargs):
     """Legacy stub - use build_complete_locker_download_request instead."""

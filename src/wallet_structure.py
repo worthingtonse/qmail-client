@@ -52,7 +52,7 @@ WALLET_SUBFOLDERS = [
     "Export",               # Exported coins
     "Fracked",              # Coins in fracked state (need fix)
     "Frack_Failed",         # Coins that failed fracking
-    "Fraud",                # Fraudulent coins detected
+    "Counterfiet",                # Fraudulent coins detected
     "Gallery",              # Gallery storage
     "Grade",              # Gallery storage
     "Personal",             # Personal items

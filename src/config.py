@@ -14,10 +14,13 @@ Functions:
     set_config_value(config, key, val)   -> None
     validate_config(config)              -> ValidationResult
 """
-
+from __future__ import annotations
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional ,List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from qmail_types import QMailConfig, ServerConfig, ValidationResult, IdentityConfig
 
 # Python 3.11+ has tomllib built-in, earlier versions need tomli
 try:
@@ -441,7 +444,7 @@ def validate_config(config: QMailConfig) -> ValidationResult:
     if config.identity.coin_type != 6:
         result.add_warning(f"identity.coin_type is {config.identity.coin_type}, expected 6 (CloudCoin)")
 
-    if config.identity.denomination < 1 or config.identity.denomination > 250:
+    if config.identity.denomination < 0 or config.identity.denomination > 250:
         result.add_error(f"identity.denomination must be 1-250, got {config.identity.denomination}")
 
     if config.identity.serial_number == 0:
@@ -554,6 +557,18 @@ def get_default_config_path() -> str:
 
     # Return default name (caller will handle file-not-found)
     return DEFAULT_CONFIG_FILENAME
+
+
+def get_raida_server_config(raida_index: int, servers: List[ServerConfig]) -> Optional[ServerConfig]:
+    """
+    Finds a RAIDA server configuration by its index (0-24).
+    Required for beacon-only notifications in Phase I.
+    """
+    for srv in servers:
+        # Some configs might store index as a string or int; we check both
+        if srv.index == raida_index or str(srv.index) == str(raida_index):
+            return srv
+    return None
 
 
 def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool:
@@ -680,3 +695,6 @@ if __name__ == "__main__":
 
     set_config_value(config, "identity.serial_number", 999)
     print(f"After set_config_value('identity.serial_number', 999): {get_config_value(config, 'identity.serial_number')}")
+
+
+    

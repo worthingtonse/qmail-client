@@ -16,9 +16,13 @@ Updated: 2025-12-16 - Added database integration for contacts, list, search
 import time
 import json
 import re
+import socket
 from math import ceil
 from typing import Any, Dict, Optional, Tuple
 from src.task_manager import create_task, start_task, TaskErrorCode
+# from aiohttp import web
+import os
+import threading
 import time
 
 # Database imports for real implementations
@@ -71,6 +75,7 @@ import os
 
 # Task manager imports
 from src.task_manager import get_task_status, cancel_task, TaskErrorCode
+from src.task_manager import create_task, start_task, complete_task, fail_task , stake_locker_identity
 
 # Note: These handlers receive:
 #   - request_handler: Has send_json_response(), send_text_response(), send_error()
@@ -216,27 +221,20 @@ def handle_mail_send(request_handler, context):
         return
 
    #  Robust Server List Generation ---
-  # Corrected block for src/api_handlers.py
-
     servers = []
     config_servers = getattr(app_ctx.config, 'qmail_servers', []) or []
     
     for i in range(5):
         if i < len(config_servers):
             s = config_servers[i]
-            
-            # 1. ALWAYS check for an explicit 'index' from config first
             real_idx = getattr(s, 'index', None)
             
-            # 2. Only if no index is provided, try to guess (hostname only)
             if real_idx is None:
                 import re
-                # If it's a hostname like "raida14.cloudcoin.global", find the 14
                 if re.search(r'[a-zA-Z]', s.address):
                     match = re.search(r'raida(\d+)', s.address.lower())
                     real_idx = int(match.group(1)) if match else i
                 else:
-                    # If it's an IP and no index was given, fallback to the loop index i
                     real_idx = i
             
             servers.append({
@@ -245,55 +243,39 @@ def handle_mail_send(request_handler, context):
                 'index': real_idx
             })
         else:
-            # Fallback for missing server configurations
             servers.append({'address': f'raida{i}.cloudcoin.global', 'port': 443, 'index': i})
+
     # Task Registration
     err_task, task_id = create_task(app_ctx.task_manager, "send", {"subject": request_obj.subject})
     start_task(app_ctx.task_manager, task_id, "Initializing send process")
 
     # Identity Borrowing
     identity = app_ctx.config.identity
-    # If the full 400-byte (800 hex chars) key is missing, load it from the coin file
     if identity and (not getattr(identity, 'authenticity_number', None) or len(identity.authenticity_number) < 800):
-
-
-
         base_name = f"0006{identity.denomination:02X}{identity.serial_number:08X}"
         path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
         path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY"
-    
         key_file = path_bin if os.path.exists(path_bin) else path_key
-        # Path based on your SN 6891 (0x1AEB) and Denom 3
-
-        # base_name = f"0006{identity.denomination:02x}{identity.serial_number:08x}"
-        # path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
-        # path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY"
         
-        # key_file = path_bin if os.path.exists(path_bin) else path_key
-        # key_file = f"Data/Wallets/Default/Bank/0006{identity.denomination:02x}{identity.serial_number:08x}.key".upper()
         if os.path.exists(key_file):
-        # Determine offset based on the extension of the found file
-         offset = 32 if key_file.upper().endswith('.BIN') else 39
-         with open(key_file, 'rb') as f:
-            f.seek(offset)
-            identity.authenticity_number = f.read(400).hex()
-        elif app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
-            # Last resort fallback (will likely only work for the beacon server itself)
-            identity.authenticity_number = app_ctx.beacon_handle.encryption_key.hex()
+            with open(key_file, 'rb') as f:
+                header = f.read(32)
+                format_type = header[0]
+                offset = 39 if format_type == 9 else 48 if format_type == 0 else 32
+                f.seek(offset)
+                identity.authenticity_number = f.read(400).hex()
 
     def process_send():
         try:
             def messenger(state):
                 update_task_progress(app_ctx.task_manager, task_id, state.progress, state.message)
 
-            # Correct 7 positional arguments as per email_sender.py
             err, result = send_email_async(
                 request_obj, identity, app_ctx.db_handle, servers,
                 app_ctx.thread_pool.executor, messenger, app_ctx.logger
             )
             
             if result.success:
-                # Clean result dictionary for JSON serialization
                 final_res = {
                     "success": True,
                     "file_group_guid": result.file_group_guid.hex() if isinstance(result.file_group_guid, bytes) else "",
@@ -305,6 +287,19 @@ def handle_mail_send(request_handler, context):
                 }
                 complete_task(app_ctx.task_manager, task_id, final_res, "Email sent successfully")
             else:
+                # --- REACTIVE HEALING INTEGRATION ---
+                # result.upload_results contains 'status' from network.send_stripe
+                is_fracked = False
+                for upload_res in getattr(result, 'upload_results', []):
+                    if getattr(upload_res, 'status', 0) == 200:
+                        is_fracked = True
+                        break
+                
+                if is_fracked:
+                    from src.app import move_identity_to_fracked
+                    log_error(app_ctx.logger, "API", f"Reactive Healing triggered for SN {identity.serial_number} due to status 200.")
+                    move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
+                
                 fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
         except Exception as e:
             log_error(app_ctx.logger, "API", f"Background send crash: {e}")
@@ -324,18 +319,7 @@ def handle_mail_send(request_handler, context):
 def handle_mail_download(request_handler, context):
     """
     GET /api/mail/download/{id} - Download an email by ID
-
-    Path parameter:
-        id: The file GUID to download (hex string, with or without dashes)
-
-    Query parameters (optional):
-        file_type: 0 for email body (default), 10+ for attachments
-
-    Returns:
-        - 200 with raw file bytes on success
-        - 400 for invalid file_guid format
-        - 404 if file_guid not found in database
-        - 500 on download failure
+    STRICT VERSION: Now handles Status 200 to trigger Reactive Healing.
     """
     # Get app context
     app_ctx = request_handler.server_instance.app_context
@@ -348,50 +332,22 @@ def handle_mail_download(request_handler, context):
         request_handler.send_json_response(400, {"error": "Missing file_guid"})
         return
 
-    # Validate GUID format (32 hex chars with optional dashes)
+    # Validate GUID format
     clean_guid = file_guid.replace('-', '').strip()
     if len(clean_guid) != 32:
-        request_handler.send_json_response(400, {
-            "error": "Invalid file_guid format",
-            "details": "Expected 32 hex characters"
-        })
-        return
-
-    try:
-        bytes.fromhex(clean_guid)
-    except ValueError:
-        request_handler.send_json_response(400, {
-            "error": "Invalid file_guid format",
-            "details": "Must be valid hexadecimal"
-        })
+        request_handler.send_json_response(400, {"error": "Invalid file_guid format", "details": "Expected 32 hex characters"})
         return
 
     # Extract file_type parameter
     file_type_list = context.query_params.get('file_type', ['0'])
-    file_type_str = file_type_list[0] if file_type_list else '0'
-    try:
-        file_type = int(file_type_str)
-    except ValueError:
-        file_type = 0
+    file_type = int(file_type_list[0]) if file_type_list else 0
 
-    # Verify tell exists in database
     log_info(logger, "API", f"Download request for file_guid: {file_guid}")
 
     err, tell_info = get_received_tell_by_guid(db_handle, file_guid)
     if err == DatabaseErrorCode.ERR_NOT_FOUND:
         log_error(logger, "API", f"Tell not found: {file_guid}")
-        request_handler.send_json_response(404, {
-            "error": "File not found",
-            "file_guid": file_guid,
-            "details": "No tell notification received for this file_guid"
-        })
-        return
-    if err != DatabaseErrorCode.SUCCESS:
-        log_error(logger, "API", f"Database error for {file_guid}: {err}")
-        request_handler.send_json_response(500, {
-            "error": "Database error",
-            "details": str(err)
-        })
+        request_handler.send_json_response(404, {"error": "File not found", "details": "No tell notification received"})
         return
 
     # Get user credentials from config
@@ -400,28 +356,15 @@ def handle_mail_download(request_handler, context):
         denomination = identity.denomination
         serial_number = identity.serial_number
         device_id = getattr(identity, 'device_id', 0)
-
-        # Get AN (Authenticity Number)
         an = _get_an_for_download(app_ctx)
-
-    except AttributeError as e:
-        log_error(logger, "API", f"Configuration error: {e}")
-        request_handler.send_json_response(500, {
-            "error": "Configuration error",
-            "details": str(e)
-        })
-        return
-    except ValueError as e:
-        log_error(logger, "API", f"AN not found: {e}")
-        request_handler.send_json_response(500, {
-            "error": "Authentication key not configured",
-            "details": str(e)
-        })
+    except Exception as e:
+        request_handler.send_json_response(500, {"error": "Configuration error", "details": str(e)})
         return
 
     # Download the file
     try:
-        file_bytes = download_file_sync(
+        # download_file_sync should be updated to return (bytes, status)
+        file_bytes, status = download_file_sync(
             db_handle=db_handle,
             file_guid=file_guid,
             file_type=file_type,
@@ -431,73 +374,134 @@ def handle_mail_download(request_handler, context):
             an=an
         )
 
-        log_info(logger, "API",
-                 f"Download complete: {len(file_bytes)} bytes for {file_guid}")
+        # --- REACTIVE HEALING INTEGRATION ---
+        # Triggered if RAIDA reported ERROR_INVALID_AN (200) Per protocol.c:502
+        if status == 200:
+            from src.app import move_identity_to_fracked
+            log_error(logger, "API", f"Download failed (Status 200): Identity coin fracked. Initiating healing.")
+            move_identity_to_fracked(app_ctx.config.identity, app_ctx.beacon_handle, logger)
+            request_handler.send_json_response(401, {
+                "error": "Authentication failed - Coin fracked",
+                "details": "The identity coin was rejected by RAIDA and moved to Fracked for repair."
+            })
+            return
+
+        log_info(logger, "API", f"Download complete: {len(file_bytes)} bytes for {file_guid}")
 
         # Return raw bytes
         request_handler.send_response(200)
         request_handler.send_header('Content-Type', 'application/octet-stream')
         request_handler.send_header('Content-Length', str(len(file_bytes)))
-        request_handler.send_header('Content-Disposition',
-                                    f'attachment; filename="{file_guid}.bin"')
+        request_handler.send_header('Content-Disposition', f'attachment; filename="{file_guid}.bin"')
         request_handler.send_header('X-File-GUID', file_guid)
         request_handler.send_header('X-File-Type', str(file_type))
         request_handler.end_headers()
         request_handler.wfile.write(file_bytes)
 
-    except FileNotFoundError as e:
-        log_error(logger, "API", f"Tell not found during download: {file_guid} - {e}")
-        request_handler.send_json_response(404, {
-            "error": "Tell not found",
-            "details": str(e)
-        })
     except Exception as e:
         log_error(logger, "API", f"Download failed for {file_guid}: {e}")
-        request_handler.send_json_response(500, {
-            "error": "Download failed",
-            "details": str(e)
-        })
+        request_handler.send_json_response(500, {"error": "Download failed", "details": str(e)})
+
+
+## DONT DELETE
+
+# def _get_an_for_download(app_ctx):
+#     """
+#     Get the Authenticity Number (AN) for download operations.
+
+#     Tries multiple sources in order:
+#     1. Beacon handle encryption_key (if beacon is initialized)
+#     2. Config identity.an (if configured)
+#     3. Key file (Data/keys.txt)
+
+#     Returns:
+#         bytes: 16-byte AN
+
+#     Raises:
+#         ValueError: If AN cannot be found
+#     """
+#     # Try beacon handle first (most reliable if beacon is running)
+#     if app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
+#         an = app_ctx.beacon_handle.encryption_key
+#         if an is not None:
+#             return an
+
+#     # Try config
+#     identity = app_ctx.config.identity
+#     an = getattr(identity, 'an', None)
+#     if an is not None:
+#         return an if isinstance(an, bytes) else bytes.fromhex(an)
+
+#     # Try key file
+#     key_file_path = "Data/keys.txt"
+#     if os.path.exists(key_file_path):
+#         with open(key_file_path, 'r') as f:
+#             keys = [line.strip() for line in f.readlines() if line.strip()]
+
+#         # Use the beacon server's key index
+#         beacon_index = getattr(app_ctx.config.beacon, 'server_index', 0)
+#         if beacon_index < len(keys):
+#             return bytes.fromhex(keys[beacon_index])
+
+#     raise ValueError("Authenticity Number (AN) not found in beacon, config, or key file")
 
 
 def _get_an_for_download(app_ctx):
     """
-    Get the Authenticity Number (AN) for download operations.
-
-    Tries multiple sources in order:
-    1. Beacon handle encryption_key (if beacon is initialized)
-    2. Config identity.an (if configured)
-    3. Key file (Data/keys.txt)
-
-    Returns:
-        bytes: 16-byte AN
-
-    Raises:
-        ValueError: If AN cannot be found
+    Get the full 400-byte Authenticity Number (AN) block for download operations.
+    REQUIRED: Must return 400 bytes so the downloader can slice for multiple RAIDAs.
     """
-    # Try beacon handle first (most reliable if beacon is running)
-    if app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
-        an = app_ctx.beacon_handle.encryption_key
-        if an is not None:
-            return an
+    from src.logger import log_error, log_debug
+    import os
 
-    # Try config
     identity = app_ctx.config.identity
-    an = getattr(identity, 'an', None)
-    if an is not None:
-        return an if isinstance(an, bytes) else bytes.fromhex(an)
+    
+    # 1. Try if it's already loaded in the identity object (from app.py initialization)
+    if hasattr(identity, 'authenticity_number') and identity.authenticity_number:
+        # Convert from hex string if necessary (app.py stores it as hex)
+        an_data = identity.authenticity_number
+        if isinstance(an_data, str):
+            an_bytes = bytes.fromhex(an_data)
+        else:
+            an_bytes = an_data
+            
+        if len(an_bytes) >= 400:
+            return an_bytes[:400]
 
-    # Try key file
-    key_file_path = "Data/keys.txt"
-    if os.path.exists(key_file_path):
-        with open(key_file_path, 'r') as f:
-            keys = [line.strip() for line in f.readlines() if line.strip()]
+    # 2. Try to "Borrow" it from the physical wallet files (BIN/KEY)
+    # This matches the logic in app.py:407-422
+    base_name = f"0006{identity.denomination:02X}{identity.serial_number:08X}"
+    path_bin = os.path.join("Data", "Wallets", "Default", "Bank", f"{base_name}.BIN")
+    path_key = os.path.join("Data", "Wallets", "Default", "Bank", f"{base_name}.KEY")
+    
+    key_file = path_bin if os.path.exists(path_bin) else path_key
+    
+    if os.path.exists(key_file):
+        try:
+            with open(key_file, 'rb') as f:
+                header = f.read(32)
+                format_type = header[0]
+                
+                # Determine offset based on RAIDA standard formats
+                # Format 9 = 39, Legacy = 48, else 32
+                offset = 39 if format_type == 9 else 48 if format_type == 0 else 32
+                
+                f.seek(offset)
+                an_block = f.read(400)
+                
+                if len(an_block) == 400:
+                    log_debug(app_ctx.logger, "API", f"Successfully borrowed 400-byte AN from {key_file}")
+                    return an_block
+        except Exception as e:
+            log_error(app_ctx.logger, "API", f"Failed to read AN from file: {e}")
 
-        # Use the beacon server's key index
-        beacon_index = getattr(app_ctx.config.beacon, 'server_index', 0)
-        if beacon_index < len(keys):
-            return bytes.fromhex(keys[beacon_index])
+    # 3. Fallback: Beacon handle (Only if we are only downloading from ONE specific server)
+    if app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
+        # WARNING: This is only 16 bytes!
+        log_warning(app_ctx.logger, "API", "Using single-RAIDA AN for multi-stripe download. This may fail.")
+        return app_ctx.beacon_handle.encryption_key
 
-    raise ValueError("Authenticity Number (AN) not found in beacon, config, or key file")
+    raise ValueError(f"Full 400-byte AN block not found for identity coin SN {identity.serial_number}")
 
 
 def handle_mail_list(request_handler, context):
@@ -562,39 +566,83 @@ def handle_mail_list(request_handler, context):
         "offset": offset
     }
     request_handler.send_json_response(200, response)
+# src/api_handlers.py
+import json
+import threading
+import socket #
+from src.task_manager import create_task, start_task, complete_task, fail_task #
 
-
-def handle_create_mailbox(request_handler, context):
+def handle_create_mailbox(request_handler, request_context):
     """
-    POST /api/mail/create-mailbox - Create a new mailbox
-
-    Expected JSON body:
-    {
-        "denomination": 1,
-        "serial_number": 12345678
-    }
-
-    STUB: Returns success with provided values.
-    FUTURE: Will validate against CloudCoin and configure identity.
+    STALL-PROOF VERSION: Reads body even if Content-Length is missing.
     """
-    data = context.json if context.json else {}
+    # 1. BREAK THE READ-HANG
+    # We set a timeout and try to read the body manually
+    request_handler.connection.settimeout(2.0)
+    data = {}
+    try:
+        content_length = int(request_handler.headers.get('Content-Length', 0))
+        
+        if content_length > 0:
+            # Standard path: read the specified length
+            post_data = request_handler.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+        else:
+            # FALLBACK: If Content-Length is missing, we try to read the available buffer
+            # This is helpful if Postman isn't sending the length header
+            request_handler.connection.setblocking(False) # Don't wait for more bytes
+            try:
+                # Try to read up to 4KB of whatever is currently in the pipe
+                post_data = request_handler.connection.recv(4096)
+                # We need to skip the HTTP headers if they were bundled in this recv
+                if b'\r\n\r\n' in post_data:
+                    post_data = post_data.split(b'\r\n\r\n')[1]
+                if post_data:
+                    data = json.loads(post_data.decode('utf-8'))
+            except:
+                pass # No data found in buffer
+    except Exception as e:
+        print(f"[DEBUG] API Read Error: {e}")
+    finally:
+        request_handler.connection.settimeout(None)
+        request_handler.connection.setblocking(True)
 
-    denomination = data.get("denomination", 1)
-    serial_number = data.get("serial_number", 0)
+    locker_code = data.get("locker_code")
+    if not locker_code:
+        # If we still have no locker_code, it means the body truly didn't arrive
+        return request_handler.send_error(400, "Request Body Missing (No Content-Length found)")
 
-    # Format as QMail address
-    mailbox_address = f"0006.{denomination}.{serial_number}"
+    # 2. CONTEXT LOOKUP
+    ctx = None
+    if hasattr(request_context, 'server') and hasattr(request_context.server, 'app_context'):
+        ctx = request_context.server.app_context
+    elif hasattr(request_handler, 'server_instance') and hasattr(request_handler.server_instance, 'app_context'):
+        ctx = request_handler.server_instance.app_context
 
-    response = {
-        "status": "created",
-        "mailbox_address": mailbox_address,
-        "denomination": denomination,
-        "serial_number": serial_number,
-        "message": "Mailbox creation stub - identity configuration pending"
-    }
-    request_handler.send_json_response(201, response)
+    if not ctx: return request_handler.send_error(500, "AppContext Missing")
 
+    # 3. START BACKGROUND WORK (COMMAND 91)
+    err, task_id = create_task(ctx.task_manager, "stake_locker", params={"locker": locker_code})
 
+    def run_staking():
+        from src.task_manager import stake_locker_identity
+        start_task(ctx.task_manager, task_id, "Broadcasting Command 91...")
+        
+        # Format code for RAIDA (8-byte null-padded)
+        clean_code = locker_code.replace('-', '').strip().upper().encode('ascii').ljust(8, b'\x00')
+        
+        # Execute production logic derived from cmd_locker.c
+        success = stake_locker_identity(clean_code, ctx, logger=ctx.logger)
+        
+        if success:
+            complete_task(ctx.task_manager, task_id, message="Identity Created")
+        else:
+            fail_task(ctx.task_manager, task_id, error="Consensus Failed")
+
+    threading.Thread(target=run_staking, name=f"Stake-{task_id[:4]}", daemon=True).start()
+
+    # 4. INSTANT RESPONSE
+    return request_handler.send_json({"status": "started", "task_id": task_id}, status=202)
 # ============================================================================
 # DATA ENDPOINTS
 # ============================================================================
@@ -2628,6 +2676,62 @@ def handle_wallet_balance(request_handler, context):
             "error": "Failed to calculate wallet balance",
             "details": str(e)
         })
+
+def handle_stake_mailbox(request_handler, context):
+    """
+    POST /api/mail/stake - Manual Staking Flow (First Login)
+    Required to establish identity before the client can send mail.
+    """
+    import asyncio
+    from src.locker_download import download_from_locker, LockerDownloadResult
+    from src.wallet_structure import get_wallet_path, DEFAULT_WALLET
+    from src.heal_file_io import move_coin_file
+
+    app_ctx = request_handler.server_instance.app_context
+    data = context.json or {}
+    
+    # 1. Capture and Clean Locker Code (AS8D-HJL)
+    raw_code = data.get('locker_code', '')
+    if not raw_code:
+        return request_handler.send_json_response(400, {"error": "Locker code required."})
+    
+    clean_code = raw_code.replace('-', '').strip().upper()
+    locker_bytes = clean_code.encode('ascii')[:8]
+
+    # 2. Call Command 91 (Download) 
+    # NOTE: If this fails with insufficient responses, it confirms servers lack CCV3.
+    wallet_path = get_wallet_path(DEFAULT_WALLET)
+    try:
+        result, coins = asyncio.run(download_from_locker(
+            locker_code=locker_bytes,
+            wallet_path=wallet_path,
+            db_handle=app_ctx.db_handle
+        ))
+    except Exception as e:
+        return request_handler.send_json_response(500, {"error": f"Staking process crashed: {e}"})
+
+    if result != LockerDownloadResult.SUCCESS:
+        return request_handler.send_json_response(502, {
+            "error": "RAIDA Infrastructure Error",
+            "details": "Command 91 failed. Ensure CCV3 is rolled out on all RAIDAs."
+        })
+
+    # 3. Activate Identity: Move coin to Bank and update config
+    if coins:
+        target_path = os.path.join(wallet_path, "Bank")
+        move_coin_file(coins[0], target_path)
+        
+        # Immediate update so user doesn't have to restart to send mail
+        app_ctx.config.identity.serial_number = coins[0].serial_number
+        app_ctx.config.identity.denomination = coins[0].denomination
+        
+        return request_handler.send_json_response(200, {
+            "status": "success", 
+            "serial_number": coins[0].serial_number,
+            "message": "Mailbox successfully staked."
+        })
+
+    return request_handler.send_json_response(404, {"error": "The provided locker was empty."})
 
 
 # ============================================================================

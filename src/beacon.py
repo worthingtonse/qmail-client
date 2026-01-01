@@ -64,6 +64,76 @@ except ImportError:
 # PUBLIC API
 # ============================================================================
 
+# def init_beacon(
+#     identity_config: IdentityConfig,
+#     beacon_config: BeaconConfig,
+#     network_config: NetworkConfig,
+#     key_file_path: str,
+#     state_file_path: str,
+#     logger_handle: Optional[object] = None
+# ) -> Optional[BeaconHandle]:
+#     """
+#     Initializes the Beacon Manager handle. 
+#     FIXED: Supports binary .key files by skipping the 39-byte header and slicing the 400-byte key.
+#     """
+#     log_debug(logger_handle, "Beacon", f"Initializing beacon from {key_file_path}...")
+    
+#     encryption_key = None
+#     try:
+#         if key_file_path.lower().endswith('.key'):
+#              if key_file_path.lower().endswith(('.key', '.bin')):
+#             # Determine offset: .BIN is 32, .KEY is 39
+#               offset = 32 if key_file_path.lower().endswith('.bin') else 39
+            
+#               with open(key_file_path, 'rb') as f:
+#                 f.seek(offset) 
+#                 full_key_bytes = f.read(400)
+                
+#                 if len(full_key_bytes) >= 400:
+#                     start = beacon_config.server_index * 16
+#                     encryption_key = full_key_bytes[start : start + 16]
+#                 else:
+#                     log_error(logger_handle, "Beacon", f"Key data too short in {key_file_path}")
+#                     return None
+#         else:
+#             # Fallback for legacy keys.txt (text-based hex lines)
+#             with open(key_file_path, 'r') as f:
+#                 keys = [line.strip() for line in f.readlines() if line.strip()]
+            
+#             if len(keys) <= beacon_config.server_index:
+#                 log_error(logger_handle, "Beacon", f"Key file has too few lines for index {beacon_config.server_index}.")
+#                 return None
+            
+#             encryption_key = bytes.fromhex(keys[beacon_config.server_index])
+
+#     except (IOError, ValueError) as e:
+#         log_error(logger_handle, "Beacon", f"Failed to read or parse beacon key: {e}")
+#         return None
+
+#     # Get or generate a persistent Device ID
+#     device_id, is_new = device_id_manager.get_or_create_device_id(state_file_path, logger_handle)
+
+#     # Parse beacon server host and port
+#     try:
+#         if not beacon_config.url.startswith("tcp://"):
+#             raise ValueError("Beacon URL must start with 'tcp://'")
+#         host, port_str = beacon_config.url.replace("tcp://", "").split(":")
+#         port = int(port_str)
+#     except (ValueError, IndexError) as e:
+#         log_error(logger_handle, "Beacon", f"Invalid beacon URL format '{beacon_config.url}': {e}")
+#         return None
+
+#     return BeaconHandle(
+#         identity=identity_config,
+#         beacon_config=beacon_config,
+#         network_config=network_config,
+#         beacon_server_info=ServerConfig(address=host, port=port, index=beacon_config.server_index),
+#         encryption_key=encryption_key,
+#         device_id=device_id,
+#         state_file_path=state_file_path,
+#         logger_handle=logger_handle
+#     )
+
 def init_beacon(
     identity_config: IdentityConfig,
     beacon_config: BeaconConfig,
@@ -74,60 +144,56 @@ def init_beacon(
 ) -> Optional[BeaconHandle]:
     """
     Initializes the Beacon Manager handle. 
-    FIXED: Supports binary .key files by skipping the 39-byte header and slicing the 400-byte key.
+    FIXED: Smart offset detection based on file size to handle .bin and .key correctly.
     """
     log_debug(logger_handle, "Beacon", f"Initializing beacon from {key_file_path}...")
     
     encryption_key = None
     try:
-        if key_file_path.lower().endswith('.key'):
-             if key_file_path.lower().endswith(('.key', '.bin')):
-            # Determine offset: .BIN is 32, .KEY is 39
-              offset = 32 if key_file_path.lower().endswith('.bin') else 39
-            
-              with open(key_file_path, 'rb') as f:
-                f.seek(offset) 
-                full_key_bytes = f.read(400)
-                
-                if len(full_key_bytes) >= 400:
-                    start = beacon_config.server_index * 16
-                    encryption_key = full_key_bytes[start : start + 16]
-                else:
-                    log_error(logger_handle, "Beacon", f"Key data too short in {key_file_path}")
-                    return None
+        # 1. Get exact file size to determine the header offset
+        file_size = os.path.getsize(key_file_path)
+        
+        # Mapping based on standard CloudCoin formats:
+        # 400 bytes: Raw AN block (Offset 0)
+        # 439 bytes: Format 9 Binary (Offset 39)
+        # 448 bytes: Legacy Binary (Offset 48)
+        if file_size == 400:
+            offset = 0
+        elif file_size == 439:
+            offset = 39
+        elif file_size == 448:
+            offset = 48
         else:
-            # Fallback for legacy keys.txt (text-based hex lines)
-            with open(key_file_path, 'r') as f:
-                keys = [line.strip() for line in f.readlines() if line.strip()]
+            # Fallback logic if it's a non-standard size
+            offset = 39 if key_file_path.lower().endswith('.bin') else 0
             
-            if len(keys) <= beacon_config.server_index:
-                log_error(logger_handle, "Beacon", f"Key file has too few lines for index {beacon_config.server_index}.")
+        with open(key_file_path, 'rb') as f:
+            f.seek(offset) 
+            full_key_bytes = f.read(400)
+            
+            if len(full_key_bytes) >= 400:
+                # Extract the 16-byte slice for the specific RAIDA
+                start = beacon_config.server_index * 16
+                encryption_key = full_key_bytes[start : start + 16]
+            else:
+                log_error(logger_handle, "Beacon", f"Key data too short in {key_file_path}")
                 return None
-            
-            encryption_key = bytes.fromhex(keys[beacon_config.server_index])
 
-    except (IOError, ValueError) as e:
+    except Exception as e:
         log_error(logger_handle, "Beacon", f"Failed to read or parse beacon key: {e}")
         return None
 
     # Get or generate a persistent Device ID
-    device_id, is_new = device_id_manager.get_or_create_device_id(state_file_path, logger_handle)
+    device_id, _ = device_id_manager.get_or_create_device_id(state_file_path, logger_handle)
 
     # Parse beacon server host and port
-    try:
-        if not beacon_config.url.startswith("tcp://"):
-            raise ValueError("Beacon URL must start with 'tcp://'")
-        host, port_str = beacon_config.url.replace("tcp://", "").split(":")
-        port = int(port_str)
-    except (ValueError, IndexError) as e:
-        log_error(logger_handle, "Beacon", f"Invalid beacon URL format '{beacon_config.url}': {e}")
-        return None
+    host, port_str = beacon_config.url.replace("tcp://", "").split(":")
 
     return BeaconHandle(
         identity=identity_config,
         beacon_config=beacon_config,
         network_config=network_config,
-        beacon_server_info=ServerConfig(address=host, port=port, index=beacon_config.server_index),
+        beacon_server_info=ServerConfig(address=host, port=int(port_str), index=beacon_config.server_index),
         encryption_key=encryption_key,
         device_id=device_id,
         state_file_path=state_file_path,
@@ -178,21 +244,26 @@ def start_beacon_monitor(
 def stop_beacon_monitor(handle: BeaconHandle, timeout: float = 10.0) -> bool:
     """
     Stops the background beacon monitoring thread gracefully.
-
-    Args:
-        handle: The BeaconHandle to stop.
-        timeout: How many seconds to wait for the thread to shut down.
-
-    Returns:
-        True if the monitor stopped cleanly, False if it timed out.
+    FIXED: Added check to prevent 'cannot join current thread' error.
     """
     if handle is None or not handle.is_running:
         log_info(handle.logger_handle, "Beacon", "Monitor is not running or handle is invalid.")
         return True
 
     log_info(handle.logger_handle, "Beacon", "Attempting to stop beacon monitor thread...")
+    
+    # 1. Signal the thread to stop via the Event object
     handle.shutdown_event.set()
 
+    # 2. Prevent self-joining deadlock
+    # Check if the thread calling this function IS the monitor thread itself
+    if threading.current_thread() == handle.monitor_thread:
+        log_debug(handle.logger_handle, "Beacon", "Stop called from within the monitor thread. Signaling only.")
+        handle.is_running = False
+        # We don't join here; we let the loop finish naturally
+        return True
+
+    # 3. If called from an external thread (like app.py shutdown), we join normally
     if handle.monitor_thread:
         handle.monitor_thread.join(timeout)
         if handle.monitor_thread.is_alive():
@@ -203,24 +274,15 @@ def stop_beacon_monitor(handle: BeaconHandle, timeout: float = 10.0) -> bool:
     log_info(handle.logger_handle, "Beacon", "Beacon monitor stopped successfully.")
     return True
 
-
 def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tuple[NetworkErrorCode, List[TellNotification]]:
     """
-    Performs a single, non-blocking PEEK request to check for tells
-    since a specific timestamp.
-
-    Args:
-        handle: The initialized BeaconHandle.
-        since_timestamp: Unix timestamp. If None, uses the last timestamp from state.
-
-    Returns:
-        A tuple of (NetworkErrorCode, List of TellNotification objects).
+    Performs a single, non-blocking PEEK request.
+    FIXED: Now handles Status 200 to trigger Reactive Healing.
     """
     if handle is None:
         return NetworkErrorCode.ERR_INVALID_PARAM, []
 
     timestamp_to_check = since_timestamp if since_timestamp is not None else handle.last_tell_timestamp
-    log_debug(handle.logger_handle, "Beacon", f"Performing PEEK for tells since timestamp {timestamp_to_check}.")
 
     conn = None
     try:
@@ -235,20 +297,23 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
-        peek_body = protocol.build_peek_body(
+        err_proto, peek_req, challenge, nonce = protocol.build_complete_peek_request(
+            raida_id=handle.beacon_server_info.index,
             denomination=handle.identity.denomination,
             serial_number=handle.identity.serial_number,
             device_id=handle.device_id,
             an=handle.encryption_key,
-            since_timestamp=timestamp_to_check
+            since_timestamp=timestamp_to_check,
+            encryption_type=0, 
+            logger_handle=handle.logger_handle
         )
+        
+        if err_proto != protocol.ProtocolErrorCode.SUCCESS:
+            return NetworkErrorCode.ERR_INVALID_PARAM, []
 
-        err, resp_header, resp_body = network.send_request(
+        err, resp_header, resp_body = network.send_raw_request(
             connection=conn,
-            command_group=protocol.CMD_GROUP_QMAIL,
-            command_code=protocol.CMD_PEEK,
-            body_data=peek_body,
-            encrypt=True,
+            raw_packet=peek_req,
             config=handle.network_config,
             logger_handle=handle.logger_handle
         )
@@ -256,8 +321,14 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
+        # --- REACTIVE HEALING TRIGGER ---
+        if resp_header.status == 200:
+            log_error(handle.logger_handle, "Beacon", f"PEEK failed: RAIDA {handle.beacon_server_info.index} reported INVALID AN (200).")
+            if hasattr(handle, 'on_an_invalid') and handle.on_an_invalid:
+                handle.on_an_invalid(handle.identity)
+            return NetworkErrorCode.ERR_INVALID_AN, []
+
         if resp_header.status != StatusCode.STATUS_SUCCESS:
-            log_debug(handle.logger_handle, "Beacon", f"PEEK returned status {resp_header.status}, no new tells.")
             return NetworkErrorCode.SUCCESS, []
 
         parse_err, tells = protocol.parse_tell_response(resp_body, handle.logger_handle)
@@ -265,18 +336,15 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
             return NetworkErrorCode.ERR_INVALID_RESPONSE, []
 
         if tells:
-            # Update the in-memory state of the handle
             latest_ts = max(t.timestamp for t in tells)
             if latest_ts > handle.last_tell_timestamp:
                 handle.last_tell_timestamp = latest_ts
-                _save_state(handle) # Persist the new latest timestamp
+                _save_state(handle) 
         
         return NetworkErrorCode.SUCCESS, tells
     finally:
         if conn:
             network.disconnect(conn, handle.logger_handle)
-
-
 # ============================================================================
 # INTERNAL STATE AND MONITORING LOGIC
 # ============================================================================
@@ -316,16 +384,15 @@ def _monitor_loop(handle: BeaconHandle):
     """
     The main loop for the background thread.
     Continuously polls the beacon server for new mail notifications.
+    FIXED: Uses shutdown_event.wait() to allow immediate termination on Ctrl+C.
     """
     log_info(handle.logger_handle, "BeaconLoop", "Monitoring loop started.")
     
-    # On first run, load state and perform a PEEK to catch up on missed messages
     _load_state(handle)
     if handle.last_tell_timestamp > 0:
-        log_info(handle.logger_handle, "BeaconLoop", "Performing initial PEEK to catch up on missed messages...")
+        log_info(handle.logger_handle, "BeaconLoop", "Performing initial PEEK...")
         err, tells = do_peek(handle)
         if err == NetworkErrorCode.SUCCESS and tells and handle.on_mail_received:
-            log_info(handle.logger_handle, "BeaconLoop", f"PEEK found {len(tells)} new messages.")
             try:
                 handle.on_mail_received(tells)
             except Exception as e:
@@ -338,19 +405,22 @@ def _monitor_loop(handle: BeaconHandle):
         try:
             err, tells = _do_one_ping_cycle(handle)
             
+            # Check shutdown immediately after a network call
+            if handle.shutdown_event.is_set(): 
+                break
+
             if err == NetworkErrorCode.SUCCESS:
                 retry_delay_sec = 1.0  
                 
                 if tells and handle.on_mail_received:
-                    log_info(handle.logger_handle, "BeaconLoop", f"Received {len(tells)} new mail notifications via PING.")
+                    log_info(handle.logger_handle, "BeaconLoop", f"Received {len(tells)} new mail notifications.")
                     try:
-                        # Update state with the latest timestamp from the new tells
                         latest_ts = max(t.timestamp for t in tells)
                         if latest_ts > handle.last_tell_timestamp:
                             handle.last_tell_timestamp = latest_ts
                             _save_state(handle)
 
-                        # Asynchronously invoke callback to avoid blocking the loop
+                        # Callback logic
                         cb_thread = threading.Thread(target=handle.on_mail_received, args=(tells,))
                         cb_thread.start()
                     except Exception as e:
@@ -358,35 +428,28 @@ def _monitor_loop(handle: BeaconHandle):
                 else:
                     log_debug(handle.logger_handle, "BeaconLoop", "Ping successful, no new mail.")
                 
-                continue
+                # FIXED: Wait for the interval even on success to prevent spinning
+                handle.shutdown_event.wait(timeout=handle.beacon_config.interval_sec)
 
             else:
-                log_warning(handle.logger_handle, "BeaconLoop", f"Ping cycle failed with error '{err.name}'. Retrying in {retry_delay_sec:.1f}s.")
+                log_warning(handle.logger_handle, "BeaconLoop", f"Ping cycle failed with '{err.name}'. Retrying...")
+                handle.shutdown_event.wait(timeout=retry_delay_sec)
+                retry_delay_sec = min(retry_delay_sec * 2, max_retry_delay_sec)
                 
         except Exception as e:
-            log_error(handle.logger_handle, "BeaconLoop", f"Unhandled exception in monitor loop: {e}. Retrying in {retry_delay_sec:.1f}s.")
-
-        wait_start_time = time.time()
-        while time.time() - wait_start_time < retry_delay_sec:
-            if handle.shutdown_event.wait(timeout=0.5):
-                break
-        
-        retry_delay_sec = min(retry_delay_sec * 2, max_retry_delay_sec)
+            log_error(handle.logger_handle, "BeaconLoop", f"Unhandled exception: {e}")
+            handle.shutdown_event.wait(timeout=retry_delay_sec)
 
     log_info(handle.logger_handle, "BeaconLoop", "Monitoring loop has been shut down.")
 
-
-def _do_one_ping_cycle(handle: BeaconHandle) -> (NetworkErrorCode, List[TellNotification]):
+def _do_one_ping_cycle(handle: BeaconHandle) -> Tuple[NetworkErrorCode, List[TellNotification]]:
     """
     Executes a single, complete long-poll PING cycle.
-    Connects, sends, waits, receives, parses, and disconnects.
-    This function demonstrates the clean abstraction provided by other modules.
+    FIXED: Includes Status 0 (NO_ERROR) as a valid success condition.
     """
     conn = None
     try:
-        # Connect to the beacon server, passing the user's full identity
-        # and encryption key. This is critical for the server to find the
-        # correct coin and decrypt the request body.
+        # 1. Connect to the beacon server
         err, conn = network.connect_to_server(
             server_info=handle.beacon_server_info,
             encryption_key=handle.encryption_key,
@@ -398,23 +461,24 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> (NetworkErrorCode, List[TellNoti
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
-        # 2. Build the PING request body using a protocol helper
-        # This keeps the byte-packing logic out of the beacon module.
-        ping_body = protocol.build_ping_body(
+        # 2. Build the COMPLETE PING request
+        err_proto, ping_req, challenge, nonce = protocol.build_complete_ping_request(
+            raida_id=handle.beacon_server_info.index,
             denomination=handle.identity.denomination,
             serial_number=handle.identity.serial_number,
             device_id=handle.device_id,
-            an=handle.encryption_key
+            an=handle.encryption_key,
+            encryption_type=0, 
+            logger_handle=handle.logger_handle
         )
+        
+        if err_proto != protocol.ProtocolErrorCode.SUCCESS:
+            return NetworkErrorCode.ERR_INVALID_PARAM, []
 
-        # 3. Send the request via the network module
-        # The network module handles header creation, encryption, and sending.
-        err, resp_header, resp_body = network.send_request(
+        # 3. Send via raw interface
+        err, resp_header, resp_body = network.send_raw_request(
             connection=conn,
-            command_group=protocol.CMD_GROUP_QMAIL,
-            command_code=protocol.CMD_PING,
-            body_data=ping_body,
-            encrypt=True, # Explicitly use encryption
+            raw_packet=ping_req,
             timeout_ms=handle.beacon_config.timeout_sec * 1000,
             config=handle.network_config,
             logger_handle=handle.logger_handle
@@ -423,19 +487,27 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> (NetworkErrorCode, List[TellNoti
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
-        # 4. Handle server status codes
-        if resp_header.status == StatusCode.STATUS_YOU_GOT_MAIL or resp_header.status == StatusCode.STATUS_SUCCESS:
-             # STATUS_SUCCESS (250) is used in the doc for new mail
+        # 4. Handle server status codes - FIXED: Added '0' and StatusCode.STATUS_SUCCESS
+        # Success statuses for new mail or quiet success
+        if resp_header.status in [StatusCode.STATUS_YOU_GOT_MAIL, StatusCode.STATUS_SUCCESS, 0]:
             pass # Continue to parse the body
-        elif resp_header.status == StatusCode.ERROR_UDP_FRAME_TIMEOUT: # Status 17
-            # This is the expected "no new mail" response for a long-poll
+            
+        # Normal "no mail" response for long-poll
+        elif resp_header.status == StatusCode.ERROR_UDP_FRAME_TIMEOUT: 
             return NetworkErrorCode.SUCCESS, []
+            
+        # Handle Invalid AN (Error 200)
+        elif resp_header.status == 200:
+            log_error(handle.logger_handle, "Beacon", f"RAIDA {handle.beacon_server_info.index} reported INVALID AN (200).")
+            if hasattr(handle, 'on_an_invalid') and handle.on_an_invalid:
+                handle.on_an_invalid(handle.identity)
+            return NetworkErrorCode.ERR_INVALID_AN, []
+            
         else:
-            log_warning(handle.logger_handle, "Beacon", f"Beacon server returned an unexpected status: {resp_header.status}")
+            log_warning(handle.logger_handle, "Beacon", f"Unexpected status: {resp_header.status}")
             return NetworkErrorCode.ERR_SERVER_ERROR, []
 
-        # 5. Parse the response body using a protocol helper
-        # This keeps the complex byte-parsing logic out of the beacon module.
+        # 5. Parse the response body
         parse_err, tells = protocol.parse_tell_response(resp_body, handle.logger_handle)
         if parse_err != protocol.ProtocolErrorCode.SUCCESS:
             return NetworkErrorCode.ERR_INVALID_RESPONSE, []
@@ -443,6 +515,5 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> (NetworkErrorCode, List[TellNoti
         return NetworkErrorCode.SUCCESS, tells
 
     finally:
-        # 6. Ensure disconnection
         if conn:
             network.disconnect(conn, handle.logger_handle)

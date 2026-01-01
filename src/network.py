@@ -181,6 +181,7 @@ class NetworkErrorCode(IntEnum):
     ERR_SERVER_ERROR = 6
     ERR_ENCRYPTION_FAILED = 7
     ERR_INVALID_PARAM = 8
+    ERR_INVALID_AN = 9
 
 
 # ============================================================================
@@ -652,57 +653,40 @@ def disconnect(
             f"Disconnected from {server_info}"
         )
 
-
 def send_request(
     connection: Connection,
     command_group: int,
     command_code: int,
     body_data: bytes,
-    encrypt: bool = True,
+    encrypt: bool = False, # Parameter kept for API compatibility
     timeout_ms: Optional[int] = None,
     config: Optional[NetworkConfig] = None,
     logger_handle: Optional[object] = None
 ) -> Tuple[NetworkErrorCode, Optional[ResponseHeader], Optional[bytes]]:
     """
     Send request to server and receive response.
-    FIXED: body_length in header now includes 2-byte terminator (+2).
-    FIXED: RAIDA ID mismatch no longer aborts the request.
+    ALIGNED WITH protocol.c: Forces EN=0 and includes terminator in Body Length.
     """
-    # Use config or defaults
     cfg = config or _DEFAULT_CONFIG
     timeout_ms = timeout_ms if timeout_ms is not None else cfg.read_timeout_ms
-    max_response_size = cfg.max_response_body_size
 
     if connection is None or not connection.connected:
-        log_error(logger_handle, NET_CONTEXT, "send_request failed", "not connected")
         return NetworkErrorCode.ERR_CONNECTION_FAILED, None, None
 
-    # Determine encryption and payload
-    encryption_type = ENCRYPTION_NONE
+    # --- PHASE I: NO ENCRYPTION ---
+    # Sean: "It’s fine to use no encryption for now."
+    encryption_type = ENCRYPTION_NONE 
     payload_to_send = body_data
 
-    # Even if encrypt=False, we prepare for encryption if requested and key exists
-    if encrypt and connection.encryption_key:
-        err, encrypted_body = _encrypt_body(
-            body_data,
-            connection.encryption_key,
-            connection.serial_number,
-            logger_handle
-        )
-        if err != NetworkErrorCode.SUCCESS:
-            return err, None, None
-        payload_to_send = encrypted_body
-        encryption_type = ENCRYPTION_AES_128
-
-    # --- PROTOCOL FIX: Body Length ---
+    # --- PROTOCOL ALIGNMENT: Body Length ---
     # The header BL (Body Length) MUST include the 2-byte terminator (>>).
+    # Body Size on server side = Header BL - 2 bytes terminator.
     body_length = len(payload_to_send) + 2
 
-    # Build nonce for header (last 2 bytes serve as echo)
+    # Nonce derivation (Deterministic per SN)
     nonce = _derive_encryption_nonce(connection.serial_number)[:8]
-    expected_echo = nonce[6:8]
 
-    # Build request header
+    # Build request header (32 bytes)
     header = _build_request_header(
         raida_id=connection.server.raida_id,
         command_group=command_group,
@@ -714,24 +698,15 @@ def send_request(
         nonce=nonce
     )
 
-    # Final packet: [Header(32)] + [Payload(N)] + [Terminator(2)]
-    # Terminator is ALWAYS unencrypted and follows the payload.
+    # Combine Header + Payload + Terminator (>>)
     request = header + payload_to_send + TERMINATOR
-    
-    expected_raida_id = connection.server.raida_id
     
     try:
         connection.socket.settimeout(timeout_ms / 1000.0)
         connection.socket.sendall(request)
         connection.last_activity = time.time()
-
-        log_debug(
-            logger_handle, NET_CONTEXT,
-            f"Sent {len(request)} bytes to RAIDA {connection.server.raida_id} "
-            f"(cmd={command_group}.{command_code})"
-        )
-    except sock_module.error as e:
-        log_error(logger_handle, NET_CONTEXT, "send_request failed", f"send error: {e}")
+    except Exception as e:
+        log_error(logger_handle, "Network", f"Send failed: {e}")
         return NetworkErrorCode.ERR_SEND_FAILED, None, None
 
     # Receive response header (32 bytes)
@@ -739,79 +714,30 @@ def send_request(
         response_header_data = b''
         while len(response_header_data) < RESPONSE_HEADER_SIZE:
             chunk = connection.socket.recv(RESPONSE_HEADER_SIZE - len(response_header_data))
-            if not chunk:
-                log_error(logger_handle, NET_CONTEXT, "send_request failed", "connection closed")
-                return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
+            if not chunk: break
             response_header_data += chunk
-    except sock_module.timeout:
-        log_error(logger_handle, NET_CONTEXT, "send_request failed", "timeout receiving header")
-        return NetworkErrorCode.ERR_TIMEOUT, None, None
-    except sock_module.error as e:
-        log_error(logger_handle, NET_CONTEXT, "send_request failed", f"receive error: {e}")
+            
+        if len(response_header_data) < RESPONSE_HEADER_SIZE:
+            return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
+            
+    except Exception:
         return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
 
-    # Parse response header
     err, resp_header = _parse_response_header(response_header_data)
     if err != NetworkErrorCode.SUCCESS:
         return err, None, None
 
-    # 1. Verify echo bytes match
-    if resp_header.echo != expected_echo:
-        strict_echo = cfg.strict_echo_validation
-        if strict_echo:
-            log_error(
-                logger_handle, NET_CONTEXT,
-                "send_request failed",
-                f"Echo mismatch: expected {expected_echo.hex()}, got {resp_header.echo.hex()}"
-            )
-            return NetworkErrorCode.ERR_INVALID_RESPONSE, None, None
-        else:
-            log_warning(
-                logger_handle, NET_CONTEXT,
-                f"Echo mismatch: expected {expected_echo.hex()}, got {resp_header.echo.hex()} (ignoring)"
-            )
-
-    # 2. Verify RAIDA ID matches expected server
-    if resp_header.raida_id != expected_raida_id:
-        # FIXED: Log warning but do NOT return error to allow testing to proceed.
-        log_warning(
-            logger_handle, NET_CONTEXT,
-            f"RAIDA ID mismatch: expected {expected_raida_id}, got {resp_header.raida_id}. Proceeding anyway."
-        )
-
-    # 3. Sanity check body size
-    if resp_header.body_size > max_response_size:
-        log_error(
-            logger_handle, NET_CONTEXT,
-            "send_request failed",
-            f"Response body too large: {resp_header.body_size} bytes"
-        )
-        return NetworkErrorCode.ERR_INVALID_RESPONSE, None, None
-
-    # Receive response body if present
+    # Receive response body
     response_body = b''
     if resp_header.body_size > 0:
         try:
             while len(response_body) < resp_header.body_size:
                 remaining = resp_header.body_size - len(response_body)
                 chunk = connection.socket.recv(min(remaining, 65536))
-                if not chunk:
-                    break
+                if not chunk: break
                 response_body += chunk
-        except (sock_module.timeout, sock_module.error) as e:
-            log_error(logger_handle, NET_CONTEXT, "send_request failed", f"body receive error: {e}")
+        except Exception:
             return NetworkErrorCode.ERR_RECEIVE_FAILED, resp_header, None
-
-    # Decrypt response body if encrypted
-    if encrypt and connection.encryption_key and response_body:
-        err_dec, decrypted_body = _decrypt_body(
-            response_body,
-            connection.encryption_key,
-            connection.serial_number,
-            logger_handle
-        )
-        if err_dec == NetworkErrorCode.SUCCESS:
-            response_body = decrypted_body
 
     connection.last_activity = time.time()
     return NetworkErrorCode.SUCCESS, resp_header, response_body
@@ -1038,7 +964,7 @@ def send_stripe(
     # Send using EN=0 as requested
     err, resp_header, _ = send_request(
         connection, CMD_GROUP_QMAIL, CMD_UPLOAD, bytes(body),
-        encrypt=True,
+        encrypt=False,
         logger_handle=logger_handle
     )
 
@@ -1119,7 +1045,7 @@ def receive_stripe(
     # Send request
     err, resp_header, resp_body = send_request(
         connection, CMD_GROUP_QMAIL, CMD_DOWNLOAD, bytes(body),
-        encrypt=(connection.encryption_key is not None),
+        encrypt=False,
         logger_handle=logger_handle
     )
 
@@ -1145,6 +1071,65 @@ def receive_stripe(
             downloaded_data = resp_body[8:8 + data_length]
 
     return NetworkErrorCode.SUCCESS, resp_header.status, downloaded_data
+
+
+
+def send_raw_request(
+    connection: Connection,
+    raw_packet: bytes,
+    timeout_ms: Optional[int] = None,
+    config: Optional[NetworkConfig] = None,
+    logger_handle: Optional[object] = None
+) -> Tuple[NetworkErrorCode, Optional[ResponseHeader], Optional[bytes]]:
+    """
+    Sends a pre-built request packet (header + payload + terminator) exactly as provided.
+    Skips any internal header building or encryption to fix the Double Header bug.
+    """
+    cfg = config or _DEFAULT_CONFIG
+    timeout_ms = timeout_ms if timeout_ms is not None else cfg.read_timeout_ms
+
+    if connection is None or not connection.connected:
+        return NetworkErrorCode.ERR_CONNECTION_FAILED, None, None
+
+    try:
+        connection.socket.settimeout(timeout_ms / 1000.0)
+        connection.socket.sendall(raw_packet)
+        connection.last_activity = time.time()
+    except Exception as e:
+        log_error(logger_handle, "Network", f"Raw send failed: {e}")
+        return NetworkErrorCode.ERR_SEND_FAILED, None, None
+
+    # --- Receive response header (32 bytes) ---
+    try:
+        response_header_data = b''
+        while len(response_header_data) < RESPONSE_HEADER_SIZE:
+            chunk = connection.socket.recv(RESPONSE_HEADER_SIZE - len(response_header_data))
+            if not chunk: break
+            response_header_data += chunk
+            
+        if len(response_header_data) < RESPONSE_HEADER_SIZE:
+            return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
+    except Exception:
+        return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
+
+    err, resp_header = _parse_response_header(response_header_data)
+    if err != NetworkErrorCode.SUCCESS:
+        return err, None, None
+
+    # --- Receive response body ---
+    response_body = b''
+    if resp_header.body_size > 0:
+        try:
+            while len(response_body) < resp_header.body_size:
+                remaining = resp_header.body_size - len(response_body)
+                chunk = connection.socket.recv(min(remaining, 65536))
+                if not chunk: break
+                response_body += chunk
+        except Exception:
+            return NetworkErrorCode.ERR_RECEIVE_FAILED, resp_header, None
+
+    connection.last_activity = time.time()
+    return NetworkErrorCode.SUCCESS, resp_header, response_body
 
 
 # ============================================================================

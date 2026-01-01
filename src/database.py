@@ -319,30 +319,25 @@ CREATE TABLE IF NOT EXISTS PendingTells (
     Status TEXT DEFAULT 'pending'
 );
 
--- ==========================================
--- 12. Received Tells (for download queue)
--- ==========================================
+-- Table for incoming email metadata (from .tell files)
 CREATE TABLE IF NOT EXISTS received_tells (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_guid TEXT NOT NULL UNIQUE,
-    locker_code TEXT NOT NULL,
-    file_type INTEGER NOT NULL,
-    version INTEGER,
-    file_size INTEGER,
-    status TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    file_guid TEXT UNIQUE,            -- The unique identifier for the mail package
+    locker_code BLOB,                 -- Code used to fetch stripes
+    tell_type INTEGER,                -- 0 for QMail, 1 for Payment
+    download_status INTEGER DEFAULT 0, -- 0=Metadata Only, 1=Downloaded
+    read_status INTEGER DEFAULT 0,     -- 0=Unread, 1=Read
+    local_path TEXT,                  -- Path to the file on local disk
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ==========================================
--- 13. Received Stripes (locations for files to be downloaded)
--- ==========================================
+-- Table for tracking stripe locations
 CREATE TABLE IF NOT EXISTS received_stripes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tell_id INTEGER NOT NULL,
-    server_ip TEXT NOT NULL,
-    stripe_id INTEGER NOT NULL,
-    is_parity BOOLEAN NOT NULL,
-    stripe_hash TEXT,
+    tell_id INTEGER,
+    server_ip TEXT,
+    stripe_index INTEGER,
+    is_parity BOOLEAN,
     FOREIGN KEY(tell_id) REFERENCES received_tells(id) ON DELETE CASCADE
 );
 
@@ -3742,6 +3737,51 @@ def fix_null_beacon_ids(
         log_error(handle.logger, DB_CONTEXT, "Failed to fix null beacon IDs", str(e))
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED, 0
+    
+
+
+def is_guid_in_database(handle, file_guid):
+    """Checks if a GUID has already been cached."""
+    cursor = handle.connection.cursor()
+    cursor.execute("SELECT 1 FROM received_tells WHERE file_guid = ?", (file_guid,))
+    return cursor.fetchone() is not None
+
+def store_received_tell(handle, file_guid, locker_code, tell_type):
+    """Saves incoming mail metadata."""
+    try:
+        cursor = handle.connection.cursor()
+        cursor.execute('''
+            INSERT INTO received_tells (file_guid, locker_code, tell_type)
+            VALUES (?, ?, ?)
+        ''', (file_guid, locker_code, tell_type))
+        handle.connection.commit()
+        return DatabaseErrorCode.SUCCESS, cursor.lastrowid
+    except Exception:
+        return DatabaseErrorCode.ERR_QUERY_FAILED, None
+
+def store_received_stripe(handle, tell_id, server_ip, stripe_index, is_parity):
+    """Caches server locations for later download."""
+    try:
+        cursor = handle.connection.cursor()
+        cursor.execute('''
+            INSERT INTO received_stripes (tell_id, server_ip, stripe_index, is_parity)
+            VALUES (?, ?, ?, ?)
+        ''', (tell_id, server_ip, stripe_index, is_parity))
+        handle.connection.commit()
+        return DatabaseErrorCode.SUCCESS
+    except Exception:
+        return DatabaseErrorCode.ERR_QUERY_FAILED
+
+def delete_email_locally(handle, file_guid):
+    """PHASE I DELETE: Local only. No network commands."""
+    cursor = handle.connection.cursor()
+    cursor.execute("SELECT local_path FROM received_tells WHERE file_guid = ?", (file_guid,))
+    row = cursor.fetchone()
+    if row and row['local_path'] and os.path.exists(row['local_path']):
+        os.remove(row['local_path'])
+    cursor.execute("DELETE FROM received_tells WHERE file_guid = ?", (file_guid,))
+    handle.connection.commit()
+    return DatabaseErrorCode.SUCCESS
 
 
 # ============================================================================

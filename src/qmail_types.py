@@ -85,6 +85,7 @@ class NetworkErrorCode(IntEnum):
     ERR_PROTOCOL = 5
     ERR_SERVER_ERROR = 6
     ERR_INVALID_RESPONSE = 7
+    ERR_INVALID_AN = 8
 
 
 class CryptoErrorCode(IntEnum):

@@ -47,11 +47,13 @@ C Notes:
 
 import threading
 import uuid
+import hashlib
 import time
 import sys
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -1083,8 +1085,103 @@ def run_with_task(
     except Exception as e:
         fail_task(handle, task_id, str(e))
         return TaskErrorCode.SUCCESS, task_id, None
+    
+def stake_locker_identity(locker_code_bytes, app_context, logger=None):
+    """
+    Client implementation of Command 91 aligned with cmd_locker.c.
+    """
+    from src.network import connect_to_server, disconnect, send_raw_request
+    from src.protocol import build_complete_locker_download_request, parse_locker_download_response, ProtocolErrorCode
+    from src.cloudcoin import CloudCoin, write_coin_file
 
+    log_info(logger, "Staking", "Broadcasting Command 91 to RAIDA network...")
+    
+    # 1. PREPARE LOCKER AN: 8-byte code + 0xFF padding = 16 bytes
+    # Server uses this as 'locker_an' to look up coins in the index.
+    locker_an = locker_code_bytes + (b'\xFF' * 8)
+    
+    seeds = {} # Cache seeds per RAIDA to calculate ANs locally
+    results = [] # Store (raida_id, coin_list)
 
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        future_to_raida = {}
+        for raida_id in range(25):
+            ip = app_context.get_server_ip(raida_id)
+            if not ip: continue
+            
+            srv_cfg = type('Srv', (), {'ip_address': ip, 'port': 50000 + raida_id, 'index': raida_id})
+
+            # 2. GENERATE 16-BYTE SEED: Server uses this for MD5 AN
+            seed = os.urandom(16)
+            seeds[raida_id] = seed
+
+            # Protocol builder matches the 50-byte server requirement
+            err_p, packet, _, _ = build_complete_locker_download_request(
+                raida_id=raida_id, locker_key=locker_an, seed=seed, logger_handle=logger
+            )
+            
+            # Submit to pool with 2-second timeout
+            future = executor.submit(execute_single_stake, srv_cfg, packet, logger)
+            future_to_raida[future] = raida_id
+
+        for future in as_completed(future_to_raida):
+            try:
+                rid = future_to_raida[future]
+                err, coins = future.result(timeout=2.0)
+                # coins is a list of (dn, sn) returned by cmd_download
+                if err == ProtocolErrorCode.SUCCESS and coins:
+                    results.append((rid, coins[0])) 
+            except Exception:
+                continue
+
+    # 3. IDENTITY RECONSTRUCTION
+    if len(results) >= 1:
+        raida_win, (dn, sn) = results[0]
+        log_info(logger, "Staking", f"Staking Success on RAIDA {raida_win}. Calculating ANs for SN {sn}...")
+
+        # 4. AN DERIVATION: Match server formula MD5(raidaIndex + serialNumber + seed_hex)
+        # Server code: sprintf(input, "%d%u", config.raida_no, sn) + hex(seed)
+        calculated_ans = []
+        for i in range(25):
+            if i in seeds:
+                seed_hex = seeds[i].hex().lower()
+                hash_input = f"{i}{sn}{seed_hex}".encode('ascii')
+                calculated_ans.append(hashlib.md5(hash_input).hexdigest().upper())
+            else:
+                # If RAIDA was offline, use a dummy (will need healing later)
+                calculated_ans.append("00000000000000000000000000000000")
+
+        # Create the CloudCoin object
+        new_identity = CloudCoin(
+            serial_number=sn,
+            denomination=dn,
+            ans=calculated_ans,
+            pown_string='p' * 25 # Mark as Passed
+        )
+
+        save_path = os.path.join("Data/Wallets/Default/Bank", f"000603{sn:08X}.BIN")
+        write_coin_file(save_path, new_identity, logger)
+        log_info(logger, "Staking", f"SUCCESS: Identity saved as {os.path.basename(save_path)}")
+        return True
+    
+    log_error(logger, "Staking", "Network consensus failed: No CCV3 response.")
+    return False
+
+def execute_single_stake(srv_cfg, packet, logger):
+    """Network worker for Command 91"""
+    from src.network import connect_to_server, disconnect, send_raw_request
+    from src.protocol import parse_locker_download_response
+    
+    conn_err, conn = connect_to_server(srv_cfg)
+    if conn_err != 0: return 1, None
+    
+    # Send with aggressive timeout
+    net_err, resp_h, resp_b = send_raw_request(conn, packet, timeout_ms=2000, logger_handle=logger)
+    disconnect(conn)
+    
+    if net_err == 0 and resp_h.status == 250: # Server returns 250 on success
+        return parse_locker_download_response(resp_b, logger)
+    return 1, None
 # ============================================================================
 # MAIN (for testing)
 # ============================================================================

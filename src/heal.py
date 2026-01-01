@@ -97,58 +97,47 @@ class HealResult:
 
 def find_limbo(wallet_path: str) -> Tuple[HealErrorCode, List[CloudCoinBin]]:
     """
-    STEP 3: Find status of coins in Limbo folder.
-
-    Limbo coins are those where a POWN request was sent but no response received.
-    The Find command checks both AN and PAN to determine which is current.
-
-    Args:
-        wallet_path: Path to wallet folder
-
-    Returns:
-        Tuple of (error_code, list of limbo coins with updated status)
+    STEP 3: Find status of coins.
+    Now checks BOTH Limbo and Fracked folders as requested.
     """
-    logger.info("STEP 3: Finding limbo coins...")
+    logger.info("STEP 3: Finding status for Limbo and Fracked coins...")
+    all_coins = []
 
+    # 1. Load from Limbo
     limbo_folder = os.path.join(wallet_path, FOLDER_LIMBO)
+    err_l, l_coins = load_coins_from_folder(limbo_folder)
+    if err_l == HealErrorCode.SUCCESS and l_coins:
+        all_coins.extend(l_coins)
 
-    # Load limbo coins
-    err, coins = load_coins_from_folder(limbo_folder)
-    if err != HealErrorCode.SUCCESS:
-        if err == HealErrorCode.ERR_FILE_NOT_FOUND:
-            logger.info("  -> No limbo folder found")
-            return HealErrorCode.SUCCESS, []
-        return err, []
+    # 2. Load from Fracked (Added per requirement)
+    fracked_folder = os.path.join(wallet_path, FOLDER_FRACKED)
+    err_f, f_coins = load_coins_from_folder(fracked_folder)
+    if err_f == HealErrorCode.SUCCESS and f_coins:
+        all_coins.extend(f_coins)
 
-    if not coins:
-        logger.info("  -> No limbo coins found")
+    if not all_coins:
+        logger.info("  -> No coins found in Limbo or Fracked folders.")
         return HealErrorCode.SUCCESS, []
 
-    logger.info(f"  -> Found {len(coins)} limbo coins")
+    logger.info(f"  -> Executing Find on {len(all_coins)} coins...")
+    
+    # Execute batch Find command (CMD 10)
+    find_results = find_coins_batch(all_coins)
 
-    # Execute Find command on all RAIDA (batch version)
-    find_results = find_coins_batch(coins)
-
-    # Process results for each coin
-    for coin_idx, coin in enumerate(coins):
+    # Process results (logic remains same for AN/PAN swapping)
+    for coin_idx, coin in enumerate(all_coins):
         for raida_id in range(RAIDA_COUNT):
             if raida_id in find_results:
                 result = find_results[raida_id][coin_idx]
                 if result == 'an':
-                    # Original AN is correct, update POWN to pass
                     coin.update_pown_char(raida_id, 'p')
                 elif result == 'pan':
-                    # PAN was accepted, swap PAN to AN and update POWN
                     coin.ans[raida_id] = coin.pans[raida_id]
                     coin.update_pown_char(raida_id, 'p')
                 elif result == 'neither':
-                    # Neither matched - counterfeit for this RAIDA
                     coin.update_pown_char(raida_id, 'f')
-                else:  # error
-                    coin.update_pown_char(raida_id, 'e')
 
-    logger.info("  -> Limbo find complete")
-    return HealErrorCode.SUCCESS, coins
+    return HealErrorCode.SUCCESS, all_coins
 
 
 # ============================================================================

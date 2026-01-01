@@ -307,35 +307,22 @@ def _get_default_raida_servers() -> List[ServerInfo]:
 # AN COMPUTATION FUNCTION
 # ============================================================================
 
-def compute_coin_an(raida_id: int, serial_number: int, seed: bytes) -> bytes:
+def compute_coin_an(denomination: int, serial_number: int, seed: bytes) -> bytes:
     """
-    Compute the AN for a coin using the RAIDA's formula.
-
-    This matches the server's C implementation exactly:
-        input_len = sprintf(input, "%d%u", config.raida_no, sn);
-        for (j = 0; j < 16; j++) {
-            input_len += sprintf(input + input_len, "%02x", seed[j]);
-        }
-        md5ilen(input, (char *)new_an, input_len);
-
-    The input is a STRING, not binary concatenation:
-    - RAIDA ID as decimal string (e.g., "5" or "24")
-    - Serial number as unsigned decimal string (e.g., "12345678")
-    - Seed as lowercase hex string (e.g., "0102030405060708090a0b0c0d0e0f10")
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        serial_number: Coin serial number (unsigned 32-bit)
-        seed: 16-byte seed sent in the DOWNLOAD request
-
-    Returns:
-        16-byte AN (MD5 hash)
+    Computes the NEW Authenticity Number for a downloaded coin.
+    Matches server formula: MD5(binary: 1-byte Denom + 4-byte SN + 16-byte Seed) + 0xFFFFFFFF
     """
-    # Build input string exactly as server does: "{raida_id}{serial_number}{seed_hex}"
-    # Note: seed.hex() produces lowercase hex, matching server's %02x format
-    input_str = f"{raida_id}{serial_number}{seed.hex()}"
-    return hashlib.md5(input_str.encode('ascii')).digest()
-
+    # 1. Binary concatenation: 1 byte Denom + 4 byte SN + 16 byte Seed = 21 bytes
+    # Use '>' for Big Endian to match the server's 'put_u32'
+    binary_input = struct.pack(">B", denomination) + struct.pack(">I", serial_number) + seed
+    
+    # 2. Hash the 21-byte buffer
+    digest = bytearray(hashlib.md5(binary_input).digest())
+    
+    # 3. CRUCIAL: Set the last 4 bytes to 0xFF for locker compatibility
+    digest[12:16] = b'\xff\xff\xff\xff'
+    
+    return bytes(digest)
 
 # ============================================================================
 # LOCKER DOWNLOAD FUNCTIONS (Command 91)
@@ -670,6 +657,26 @@ async def download_from_locker(
              f"total value={total_value}")
 
     return LockerDownloadResult.SUCCESS, saved_coins
+
+
+def derive_locker_keys(locker_code_str: str) -> list:
+    """
+    Derives 25 access keys for RAIDA.
+    Formula: MD5(str(raida_id) + locker_code) + 0xFFFFFFFF padding
+    """
+    keys = []
+    for raida_id in range(25):
+        # 1. Create the input string (e.g., "0VA9-7UEF")
+        input_str = f"{raida_id}{locker_code_str.strip().upper()}"
+        
+        # 2. Get the MD5 hash
+        hasher = hashlib.md5(input_str.encode('ascii'))
+        digest = bytearray(hasher.digest())
+        
+        # 3. CRUCIAL: Set the last 4 bytes to 0xFF
+        digest[12:16] = b'\xff\xff\xff\xff'
+        keys.append(bytes(digest))
+    return keys
 
 
 # ============================================================================
