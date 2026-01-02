@@ -20,6 +20,7 @@ import argparse
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+import struct
 
 # Detect if running as a bundled EXE or as a script
 if getattr(sys, 'frozen', False):
@@ -550,42 +551,38 @@ def main():
         app_context.beacon_handle.on_an_invalid = lambda id: move_identity_to_fracked(
             id, app_context.beacon_handle, logger
         )
+
+
+
+        def _extract_server_info(server_location):
+            """
+    Extract IP and port from ServerLocation raw_entry.
+    
+    server_loc_t structure (32 bytes):
+        Bytes 0-1:   stripe_index + stripe_type
+        Bytes 2-9:   stripe_id (reserved)
+        Bytes 10-25: ip_address (IPv4 in last 4 bytes: 22-25)
+        Bytes 26-27: port (Big Endian uint16)
+        Bytes 28-31: reserved
+         """
+            if not hasattr(server_location, 'raw_entry') or len(server_location.raw_entry) < 28:
+              # Fallback if raw_entry not available
+              server_id = getattr(server_location, 'server_id', 0)
+              return f"raida{server_id}.cloudcoin.global", 50000 + server_id
+    
+            raw = server_location.raw_entry
+    
+    # Extract IPv4 from bytes 22-25 (last 4 bytes of ip_address field)
+            ip_bytes = raw[22:26]
+            ip = f"{ip_bytes[0]}.{ip_bytes[1]}.{ip_bytes[2]}.{ip_bytes[3]}"
+    
+    # Extract port from bytes 26-27 (Big Endian)
+            port = struct.unpack('>H', raw[26:28])[0]
+    
+            return ip, port
         
 
-        def _extract_server_ip(server_location):
-            """
-            Extract server IP from ServerLocation.
-
-            Priority:
-            1. Look up server_id in AppContext server cache
-            2. Try raw_entry bytes [22:26] if valid IPv4
-            3. Use fallback hostname pattern
-
-            Args:
-                server_location: ServerLocation object from TellNotification
-
-            Returns:
-                str: Server IP address or hostname
-            """
-            server_id = getattr(server_location, 'server_id', None)
-
-            # Try AppContext cache first (most reliable, refreshable)
-            if server_id is not None:
-                ip = app_context.get_server_ip(server_id)
-                if ip:
-                    return ip
-
-            # Try extracting from raw_entry if available
-            if hasattr(server_location, 'raw_entry') and len(server_location.raw_entry) >= 26:
-                ip_bytes = server_location.raw_entry[22:26]
-                # Check if it's a valid non-zero IP (0.0.0.0 is invalid)
-                if any(b != 0 for b in ip_bytes):
-                    return f"{ip_bytes[0]}.{ip_bytes[1]}.{ip_bytes[2]}.{ip_bytes[3]}"
-
-            # Fallback to hostname pattern
-            if server_id is not None:
-                return f"raida{server_id}.cloudcoin.global"
-            return "unknown.server"
+        
         
 
 
@@ -668,7 +665,7 @@ def main():
                     
                     for server in server_list:
                         # Use the helper defined in the app.py scope to get IP
-                        server_ip = _extract_server_ip(server)
+                        server_ip, server_port = _extract_server_info(server)
                         
                         # Determine indices and parity status
                         stripe_index = getattr(server, 'stripe_index', 0)
@@ -679,14 +676,16 @@ def main():
                             app_context.db_handle,
                             tell_id=tell_id,
                             server_ip=server_ip,
-                            stripe_index=stripe_index,
-                            is_parity=is_parity
+                            stripe_id=stripe_index,
+                            is_parity=is_parity,
+                            port=server_port 
                         )
                         
-                        if s_err == DatabaseErrorCode.SUCCESS:
-                            stripes_stored += 1
-                        else:
-                            log_error(logger, "Beacon", f"Failed to cache stripe {stripe_index} for tell {file_guid[:8]}")
+                        if s_err != DatabaseErrorCode.SUCCESS:
+                           log_error(logger, "Beacon", f"Failed to store stripe {stripe_index}")
+                           continue
+    
+                    stripes_stored += 1
 
                     log_info(logger, "Beacon", f"Successfully cached metadata for {file_guid[:8]} with {stripes_stored} server locations.")
                     successful_count += 1

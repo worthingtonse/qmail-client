@@ -170,6 +170,8 @@ class StatusCode(IntEnum):
     ERROR_INTERNAL = 252
 
 
+from enum import IntEnum
+
 class NetworkErrorCode(IntEnum):
     """Network operation error codes."""
     SUCCESS = 0
@@ -182,6 +184,10 @@ class NetworkErrorCode(IntEnum):
     ERR_ENCRYPTION_FAILED = 7
     ERR_INVALID_PARAM = 8
     ERR_INVALID_AN = 9
+    # Added to fix "missing attribute" crashes
+    ERR_NOT_CONNECTED = 10
+    ERR_INTERNAL = 11
+    ERR_PROTOCOL_MISMATCH = 12
 
 
 # ============================================================================
@@ -200,10 +206,10 @@ class ServerInfo:
 @dataclass
 class Connection:
     """Active connection to a QMail server."""
-    socket: Optional[Any] = None  # sock_module.socket type
+    sock: Optional[Any] = None  # FIXED: Renamed from 'socket' to 'sock'
     server: Optional[ServerInfo] = None
     connected: bool = False
-    encryption_key: Optional[bytes] = None  # AN (Authenticity Number)
+    encryption_key: Optional[bytes] = None  
     denomination: int = 0
     serial_number: int = 0
     last_activity: float = 0.0
@@ -365,41 +371,18 @@ def _build_request_header(
 
 
 def _parse_response_header(data: bytes) -> Tuple[NetworkErrorCode, Optional[ResponseHeader]]:
-    """
-    Parse 32-byte response header from server.
-
-    Args:
-        data: Raw response data (at least 32 bytes)
-
-    Returns:
-        Tuple of (error code, parsed header or None)
-
-    C signature:
-        NetworkErrorCode parse_response_header(const uint8_t* data,
-                                               ResponseHeader* out_header);
-    """
-    if len(data) < RESPONSE_HEADER_SIZE:
+    if len(data) < 32:
         return NetworkErrorCode.ERR_INVALID_RESPONSE, None
 
     header = ResponseHeader()
     header.raida_id = data[0]
-    header.shard_id = data[1]
     header.status = data[2]
-    # data[3] reserved
-    # data[4-5] UDP frame count
-    header.echo = bytes(data[6:8])
-
-    # Body size (3 bytes, big-endian) at indices 9, 10, 11
+    
+    # FIXED: Per protocol.c, QMail Group 6 ALWAYS puts size at Index 9
+    # regardless of header length (32 or 48 bytes).
     header.body_size = (data[9] << 16) | (data[10] << 8) | data[11]
 
-    # Execution time (4 bytes, big-endian) at indices 12-15
-    header.execution_time_ns = struct.unpack(">I", data[12:16])[0]
-
-    # Signature (16 bytes) at indices 16-31
-    header.signature = bytes(data[16:32])
-
     return NetworkErrorCode.SUCCESS, header
-
 
 def _encrypt_body(
     body: bytes,
@@ -1072,65 +1055,66 @@ def receive_stripe(
 
     return NetworkErrorCode.SUCCESS, resp_header.status, downloaded_data
 
-
-
 def send_raw_request(
     connection: Connection,
-    raw_packet: bytes,
+    request_bytes: bytes = None, 
     timeout_ms: Optional[int] = None,
-    config: Optional[NetworkConfig] = None,
-    logger_handle: Optional[object] = None
-) -> Tuple[NetworkErrorCode, Optional[ResponseHeader], Optional[bytes]]:
+    config: Optional[Any] = None,
+    logger_handle: Optional[object] = None,
+    **kwargs 
+) -> Tuple[NetworkErrorCode, Optional[Any], Optional[bytes]]:
     """
-    Sends a pre-built request packet (header + payload + terminator) exactly as provided.
-    Skips any internal header building or encryption to fix the Double Header bug.
+    STRICT RAIDAX SYNC:
+    - Parses 3-byte size from Offset 9.
+    - Strips the mandatory 0x3E 0x3E trailer.
     """
-    cfg = config or _DEFAULT_CONFIG
-    timeout_ms = timeout_ms if timeout_ms is not None else cfg.read_timeout_ms
+    # 1. Resolve naming mismatch from background callers
+    req = request_bytes or kwargs.get('raw_packet')
+    if req is None:
+        return NetworkErrorCode.ERR_INVALID_PARAM, None, b''
 
-    if connection is None or not connection.connected:
-        return NetworkErrorCode.ERR_CONNECTION_FAILED, None, None
+    if not connection or not connection.socket:
+        return NetworkErrorCode.ERR_NOT_CONNECTED, None, b''
+
+    # Use getattr for object attribute safety
+    timeout_ms_val = getattr(config, 'read_timeout_ms', timeout_ms or 5000)
+    connection.socket.settimeout(timeout_ms_val / 1000.0)
 
     try:
-        connection.socket.settimeout(timeout_ms / 1000.0)
-        connection.socket.sendall(raw_packet)
-        connection.last_activity = time.time()
-    except Exception as e:
-        log_error(logger_handle, "Network", f"Raw send failed: {e}")
-        return NetworkErrorCode.ERR_SEND_FAILED, None, None
+        connection.socket.sendall(req)
 
-    # --- Receive response header (32 bytes) ---
-    try:
-        response_header_data = b''
-        while len(response_header_data) < RESPONSE_HEADER_SIZE:
-            chunk = connection.socket.recv(RESPONSE_HEADER_SIZE - len(response_header_data))
-            if not chunk: break
-            response_header_data += chunk
-            
-        if len(response_header_data) < RESPONSE_HEADER_SIZE:
-            return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
-    except Exception:
-        return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
+        # 2. Read 32-byte Header
+        header_data = connection.socket.recv(32)
+        if len(header_data) < 32:
+            return NetworkErrorCode.ERR_INVALID_RESPONSE, None, b''
 
-    err, resp_header = _parse_response_header(response_header_data)
-    if err != NetworkErrorCode.SUCCESS:
-        return err, None, None
+        from collections import namedtuple
+        Header = namedtuple('Header', ['raida_id', 'status', 'body_size'])
 
-    # --- Receive response body ---
-    response_body = b''
-    if resp_header.body_size > 0:
-        try:
-            while len(response_body) < resp_header.body_size:
-                remaining = resp_header.body_size - len(response_body)
-                chunk = connection.socket.recv(min(remaining, 65536))
+        # 3. Parse Size from Offset 9 (3 bytes)
+        # REQUIRED: protocol.c writes Group 6 body length at Index 9, 10, 11.
+        b_size = (header_data[9] << 16) | (header_data[10] << 8) | header_data[11]
+        resp_header = Header(header_data[0], header_data[2], b_size)
+
+        # 4. Read body and STRIP the '>>' trailer
+        response_body = b''
+        if resp_header.body_size > 0:
+            chunks = []
+            bytes_recvd = 0
+            while bytes_recvd < resp_header.body_size:
+                chunk = connection.socket.recv(min(resp_header.body_size - bytes_recvd, 4096))
                 if not chunk: break
-                response_body += chunk
-        except Exception:
-            return NetworkErrorCode.ERR_RECEIVE_FAILED, resp_header, None
+                chunks.append(chunk)
+                bytes_recvd += len(chunk)
+            
+            full_body = b''.join(chunks)
+            # Remove 0x3E 0x3E to prevent "Incomplete data" record misalignment
+            response_body = full_body[:-2] if full_body.endswith(b'\x3e\x3e') else full_body
 
-    connection.last_activity = time.time()
-    return NetworkErrorCode.SUCCESS, resp_header, response_body
-
+        connection.last_activity = time.time()
+        return NetworkErrorCode.SUCCESS, resp_header, response_body
+    except Exception:
+        return NetworkErrorCode.ERR_RECEIVE_FAILED, None, b''
 
 # ============================================================================
 # MAIN (for testing)

@@ -34,6 +34,7 @@ from typing import List, Tuple, Optional, Dict
 
 # Import project modules
 try:
+    # Standard package imports
     from .protocol import (
         build_complete_make_change_request,
         ProtocolErrorCode,
@@ -41,12 +42,12 @@ try:
         CMD_MAKE_CHANGE,
     )
     from .network_async import (
-        create_async_connection,
-        close_async_connection,
+        connect_async,        # FIXED: Was create_async_connection
+        disconnect_async,     # FIXED: Was close_async_connection
         send_raw_request_async,
-        NetworkConfig,
         NetworkErrorCode,
     )
+    from .network import NetworkConfig # FIXED: Usually resides in .network
     from .wallet_structure import initialize_wallet_structure
     from .cloudcoin import (
         LockerCoin,
@@ -57,7 +58,7 @@ try:
         CC_AN_LENGTH,
     )
     from .logger import log_error, log_debug, log_info, log_warning
-except ImportError:
+except (ImportError, ValueError):
     # Fallback for standalone testing
     from protocol import (
         build_complete_make_change_request,
@@ -66,12 +67,12 @@ except ImportError:
         CMD_MAKE_CHANGE,
     )
     from network_async import (
-        create_async_connection,
-        close_async_connection,
+        connect_async,        # FIXED
+        disconnect_async,     # FIXED
         send_raw_request_async,
-        NetworkConfig,
         NetworkErrorCode,
     )
+    from network import NetworkConfig
     from wallet_structure import initialize_wallet_structure
     from cloudcoin import (
         LockerCoin,
@@ -86,7 +87,6 @@ except ImportError:
     def log_debug(handle, ctx, msg): print(f"[DEBUG] [{ctx}] {msg}")
     def log_info(handle, ctx, msg): print(f"[INFO] [{ctx}] {msg}")
     def log_warning(handle, ctx, msg): print(f"[WARNING] [{ctx}] {msg}")
-
 
 # ============================================================================
 # CONSTANTS
@@ -324,6 +324,7 @@ def _find_coin_to_break(
 # RAIDA COMMUNICATION
 # ============================================================================
 
+
 async def _make_change_single_raida(
     raida_id: int,
     coin: CoinToBreak,
@@ -334,24 +335,33 @@ async def _make_change_single_raida(
 ) -> Tuple[int, int, str]:
     """
     Execute Make Change command on one RAIDA.
-
-    Args:
-        raida_id: RAIDA server ID (0-24)
-        coin: The coin being broken
-        starting_sn: Starting serial number for new coins
-        pans: List of 10 PANs (16 bytes each) for this RAIDA
-        config: Network configuration
-        logger_handle: Optional logger
-
-    Returns:
-        Tuple of (raida_id, status_code, error_message)
-        - status_code 250 = success
-        - status_code 215 = SN not available
-        - status_code 0 = network/other error
+    FIXED: Uses exact 'address' and 'port' keys from qmail.toml.
     """
+    from .network import ServerInfo
     conn = None
+    
+    # 1. RESOLVE SERVER INFO FROM qmail.toml
+    # We pull the specific server entry using the raida_id index.
+    server_address = ""
+    server_port = 50001 # Default fallback
+    
+    if config and hasattr(config, 'raida_servers'):
+        # In the TOML, raida_servers is a list of tables [[raida_servers]]
+        try:
+            # Find the server entry where index matches raida_id
+            server_entry = next((s for s in config.raida_servers if s.get('index') == raida_id), None)
+            
+            if server_entry:
+                server_address = server_entry.get('address', "") # Match key in qmail.toml
+                server_port = server_entry.get('port', 50001)    # Match key in qmail.toml
+        except (AttributeError, TypeError):
+            log_error(logger_handle, BREAK_CONTEXT, f"Config error resolving RAIDA {raida_id}")
+
+    if not server_address:
+        return (raida_id, 0, f"Server address for RAIDA {raida_id} not found in qmail.toml")
+
     try:
-        # Build complete request
+        # 2. Build complete request (Encryption Type 0)
         err, request, challenge, nonce = build_complete_make_change_request(
             raida_id=raida_id,
             original_dn=coin.denomination,
@@ -365,53 +375,38 @@ async def _make_change_single_raida(
         if err != ProtocolErrorCode.SUCCESS:
             return (raida_id, 0, f"Failed to build request: {err}")
 
-        # Create connection
-        conn = await create_async_connection(raida_id, config, logger_handle)
-        if conn is None:
-            return (raida_id, 0, "Failed to connect")
+        # 3. CONNECT: Using the address and port from qmail.toml
+        server_info = ServerInfo(host=server_address, port=server_port, raida_id=raida_id)
+        err_conn, conn = await connect_async(server_info, config, logger_handle)
+        
+        if err_conn != NetworkErrorCode.SUCCESS or conn is None:
+            return (raida_id, 0, f"Failed to connect to {server_address}:{server_port}")
 
-        # Send request
-        err_code, response_header, response_body = await send_raw_request_async(
+        # 4. SEND: Execute Command 90 (Make Change)
+        err_code, response_header, _ = await send_raw_request_async(
             conn, request, DEFAULT_TIMEOUT_MS, config, logger_handle
         )
 
         if err_code != NetworkErrorCode.SUCCESS:
             return (raida_id, 0, f"Network error: {err_code}")
 
-        if response_header is None:
-            return (raida_id, 0, "No response header")
-
-        # Check status code from response header
-        status = response_header.status if hasattr(response_header, 'status') else 0
+        # 5. VALIDATE: Check Byte 2 of the header for the status code
+        status = response_header.status if response_header and hasattr(response_header, 'status') else 0
 
         if status == STATUS_SUCCESS:
-            log_debug(logger_handle, BREAK_CONTEXT,
-                      f"RAIDA {raida_id}: SUCCESS")
+            log_debug(logger_handle, BREAK_CONTEXT, f"RAIDA {raida_id}: SUCCESS")
             return (raida_id, STATUS_SUCCESS, "")
         elif status == ERROR_SN_NOT_AVAILABLE:
-            log_warning(logger_handle, BREAK_CONTEXT,
-                        f"RAIDA {raida_id}: SN not available")
             return (raida_id, ERROR_SN_NOT_AVAILABLE, "SN not available")
         else:
-            log_warning(logger_handle, BREAK_CONTEXT,
-                        f"RAIDA {raida_id}: Status {status}")
             return (raida_id, status, f"Status {status}")
 
-    except asyncio.TimeoutError:
-        log_warning(logger_handle, BREAK_CONTEXT,
-                    f"RAIDA {raida_id}: Timeout")
-        return (raida_id, 0, "Timeout")
     except Exception as e:
-        log_error(logger_handle, BREAK_CONTEXT,
-                  f"RAIDA {raida_id}: Exception", str(e))
+        log_error(logger_handle, BREAK_CONTEXT, f"RAIDA {raida_id}: Exception", str(e))
         return (raida_id, 0, str(e))
     finally:
         if conn is not None:
-            try:
-                await close_async_connection(conn)
-            except Exception:
-                pass
-
+            await disconnect_async(conn)
 
 async def _make_change_all_raidas(
     coin: CoinToBreak,

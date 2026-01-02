@@ -105,58 +105,80 @@ def handle_health(request_handler, context):
 
 def handle_ping(request_handler, context):
     """
-    GET /api/qmail/ping - Beacon check for new mail
-
-    Returns any pending mail notifications from the beacon monitor.
-    Also performs a live peek to the beacon server if available.
+    GET /api/qmail/ping - Beacon check for new mail.
+    FIXED: Uses _get_an_for_download to solve 'identity_an_missing'.
     """
-    app_ctx = request_handler.server_instance.app_context
+    import asyncio
+    from .protocol import build_complete_ping_request, parse_tell_response
+    from .network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
+    from .network import ServerInfo
+    
+    app_ctx = getattr(request_handler.server_instance, 'app_context', None)
+    if not app_ctx:
+        return request_handler.send_json_response(500, {"error": "context_not_found"})
 
-    # Get any cached notifications from background monitor
-    cached_notifications = app_ctx.get_and_clear_notifications()
+    identity = getattr(app_ctx.config, 'identity', None)
+    if not identity:
+        return request_handler.send_json_response(401, {"error": "no_identity_found"})
 
-    # If beacon is available, also do a live peek
-    live_notifications = []
-    beacon_status = "disabled"
+    # Use the existing helper that knows how to find the AN in Wallets or Config
+    try:
+        an_block = _get_an_for_download(app_ctx)
+        # Use the first 16 bytes for RAIDA 11
+        an_bytes = an_block[:16] 
+    except Exception as e:
+        return request_handler.send_json_response(401, {"status": "error", "message": "identity_an_missing"})
 
-    if app_ctx.beacon_handle:
-        err, live_notifications = do_peek(app_ctx.beacon_handle)
-        if err == NetworkErrorCode.SUCCESS:
-            beacon_status = "connected"
-        else:
-            beacon_status = f"error ({err})"
+    async def perform_ping_task():
+        # 1. Resolve RAIDA 11 Info
+        raida_servers = getattr(app_ctx.config, 'raida_servers', [])
+        server_entry = next((s for s in raida_servers if getattr(s, 'index', -1) == 11), None)
+        if not server_entry: return {"status": "error", "message": "raida_11_not_found"}
 
-    # Combine notifications (cached from background + live peek)
-    all_notifications = cached_notifications + live_notifications
+        server_info = ServerInfo(host=getattr(server_entry, 'address', ''), 
+                                 port=getattr(server_entry, 'port', 50011), raida_id=11)
 
-    # Convert notifications to JSON-serializable format
-    messages = []
-    for notif in all_notifications:
-        messages.append({
-            "file_guid": notif.file_guid.hex() if hasattr(notif, 'file_guid') else "",
-            "locker_code": notif.locker_code.hex() if hasattr(notif, 'locker_code') else "",
-            "timestamp": notif.timestamp if hasattr(notif, 'timestamp') else 0,
-            "tell_type": notif.tell_type if hasattr(notif, 'tell_type') else 0,
-            "server_count": notif.server_count if hasattr(notif, 'server_count') else 0,
-        })
+        err_conn, conn = await connect_async(server_info, config=app_ctx.config)
+        if err_conn != NetworkErrorCode.SUCCESS: return {"status": "error", "message": "offline"}
 
-    response = {
-        "status": "ok",
-        "timestamp": int(time.time()),
-        "beacon_status": beacon_status,
-        "has_mail": len(messages) > 0,
-        "message_count": len(messages),
-        "messages": messages
-    }
-    request_handler.send_json_response(200, response)
+        try:
+            # 2. Command 62 PING
+            err_proto, req, _, _ = build_complete_ping_request(11, identity.denomination, identity.serial_number, 0, an_bytes, 0)
+            
+            # send_raw_request_async will handle the trailer stripping
+            net_err, resp_h, resp_b = await send_raw_request_async(conn, req)
+            
+            if net_err != NetworkErrorCode.SUCCESS: return {"status": "error", "message": "net_failure"}
+            
+            # Handle Fracked status
+            if resp_h.status == 200:
+                from src.app import move_identity_to_fracked
+                move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
+                return {"status": "healing", "message": "coin_fracked"}
 
+            # 3. Parse and Return
+            err_parse, notifications = parse_tell_response(resp_b, app_ctx.logger)
+            return {
+                "status": "ok", 
+                "has_mail": len(notifications) > 0,
+                "message_count": len(notifications),
+                "messages": [n.to_dict() if hasattr(n, 'to_dict') else str(n) for n in notifications]
+            }
+        finally:
+            await disconnect_async(conn)
 
+    try:
+        # Use existing asyncio loop if possible
+        result = asyncio.run(perform_ping_task())
+        request_handler.send_json_response(200, result if result else {"status": "error"})
+    except Exception as e:
+        request_handler.send_json_response(500, {"error": str(e)})
 # ============================================================================
 
 def handle_mail_send(request_handler, context):
     """
     POST /api/mail/send - Send an email
-    REASON: Fixed NoneType crash in int() conversion and restored all original logic.
+    FIXED: Uses standardized identity borrowing and triggers healing on Status 200.
     """
     from src.email_sender import send_email_async, SendEmailErrorCode, validate_request
     from src.qmail_types import SendEmailRequest
@@ -168,136 +190,64 @@ def handle_mail_send(request_handler, context):
     email_data = context.json if context.json else {}
     request_obj = SendEmailRequest()
 
-    # --- RESTORED: Full Parsing Logic (JSON & Multipart) ---
+    # --- Full Parsing Logic ---
     if 'multipart/form-data' in content_type.lower():
         form_data = email_data  
         request_obj.email_file = form_data.get('email_file', b'')
         request_obj.searchable_text = form_data.get('searchable_text', '')
         request_obj.subject = form_data.get('subject', '')
-        request_obj.subsubject = form_data.get('subsubject')
         request_obj.to_recipients = form_data.get('to', [])
-        request_obj.cc_recipients = form_data.get('cc', [])
-        request_obj.bcc_recipients = form_data.get('bcc', [])
         request_obj.attachment_paths = form_data.get('attachments', [])
-        
-        raw_weeks = form_data.get('storage_weeks', 8)
-        request_obj.storage_weeks = int(raw_weeks) if raw_weeks is not None else 8
+        request_obj.storage_weeks = int(form_data.get('storage_weeks', 8))
     else:
-        # JSON parsing CBDF
         if not email_data.get("to") or not email_data.get("subject"):
             request_handler.send_json_response(400, {"error": "Missing 'to' or 'subject'", "status": "error"})
             return
-        ## CBDF
         body_text = email_data.get('body', '')
         request_obj.email_file = body_text.encode('utf-8') if body_text else b''
         request_obj.searchable_text = body_text
         request_obj.subject = email_data.get('subject', '')
-        request_obj.subsubject = email_data.get('subsubject')
-
         to_list = email_data.get('to', [])
         request_obj.to_recipients = to_list if isinstance(to_list, list) else [to_list]
-        
-        cc_list = email_data.get('cc', [])
-        request_obj.cc_recipients = cc_list if isinstance(cc_list, list) else [cc_list] if cc_list else []
-        
-        bcc_list = email_data.get('bcc', [])
-        request_obj.bcc_recipients = bcc_list if isinstance(bcc_list, list) else [bcc_list] if bcc_list else []
-        
-        request_obj.attachment_paths = email_data.get('attachments', [])
-        
-        raw_weeks = email_data.get('storage_weeks', 8)
-        request_obj.storage_weeks = int(raw_weeks) if raw_weeks is not None else 8
+        request_obj.storage_weeks = int(email_data.get('storage_weeks', 8))
 
-    # --- RESTORED: Your original Validation block ---
-    try:
-        err, err_msg = validate_request(request=request_obj)
-    except Exception as e:
-        log_error(app_ctx.logger, "API", f"Validation crashed: {e}")
-        request_handler.send_json_response(500, {"error": f"Validation logic error: {e}", "status": "error"})
-        return
-
+    # --- Validation ---
+    err, err_msg = validate_request(request=request_obj)
     if err != SendEmailErrorCode.SUCCESS:
         request_handler.send_json_response(400, {"error": err_msg, "error_code": int(err), "status": "error"})
         return
 
-   #  Robust Server List Generation ---
-    servers = []
-    config_servers = getattr(app_ctx.config, 'qmail_servers', []) or []
-    
-    for i in range(5):
-        if i < len(config_servers):
-            s = config_servers[i]
-            real_idx = getattr(s, 'index', None)
-            
-            if real_idx is None:
-                import re
-                if re.search(r'[a-zA-Z]', s.address):
-                    match = re.search(r'raida(\d+)', s.address.lower())
-                    real_idx = int(match.group(1)) if match else i
-                else:
-                    real_idx = i
-            
-            servers.append({
-                'address': str(s.address),
-                'port': int(getattr(s, 'port', 443)),
-                'index': real_idx
-            })
-        else:
-            servers.append({'address': f'raida{i}.cloudcoin.global', 'port': 443, 'index': i})
+    # --- Standardized Identity Borrowing ---
+    identity = app_ctx.config.identity
+    try:
+        # Returns full 400 bytes, handling 39/48 byte offsets
+        identity.authenticity_number = _get_an_for_download(app_ctx)
+    except Exception as e:
+        log_error(app_ctx.logger, "API", f"Failed to borrow identity AN: {e}")
+        request_handler.send_json_response(403, {"error": "Identity coin missing or inaccessible", "status": "error"})
+        return
 
     # Task Registration
-    err_task, task_id = create_task(app_ctx.task_manager, "send", {"subject": request_obj.subject})
+    _, task_id = create_task(app_ctx.task_manager, "send", {"subject": request_obj.subject})
     start_task(app_ctx.task_manager, task_id, "Initializing send process")
-
-    # Identity Borrowing
-    identity = app_ctx.config.identity
-    if identity and (not getattr(identity, 'authenticity_number', None) or len(identity.authenticity_number) < 800):
-        base_name = f"0006{identity.denomination:02X}{identity.serial_number:08X}"
-        path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
-        path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY"
-        key_file = path_bin if os.path.exists(path_bin) else path_key
-        
-        if os.path.exists(key_file):
-            with open(key_file, 'rb') as f:
-                header = f.read(32)
-                format_type = header[0]
-                offset = 39 if format_type == 9 else 48 if format_type == 0 else 32
-                f.seek(offset)
-                identity.authenticity_number = f.read(400).hex()
 
     def process_send():
         try:
-            def messenger(state):
-                update_task_progress(app_ctx.task_manager, task_id, state.progress, state.message)
-
             err, result = send_email_async(
-                request_obj, identity, app_ctx.db_handle, servers,
-                app_ctx.thread_pool.executor, messenger, app_ctx.logger
+                request_obj, identity, app_ctx.db_handle, app_ctx.config.qmail_servers,
+                app_ctx.thread_pool.executor, 
+                lambda s: update_task_progress(app_ctx.task_manager, task_id, s.progress, s.message), 
+                app_ctx.logger
             )
             
             if result.success:
-                final_res = {
-                    "success": True,
-                    "file_group_guid": result.file_group_guid.hex() if isinstance(result.file_group_guid, bytes) else "",
-                    "file_count": getattr(result, 'file_count', 1),
-                    "upload_results": [
-                        {"server": getattr(r, 'server_id', ""), "success": getattr(r, 'success', False)} 
-                        for r in (result.upload_results or [])
-                    ]
-                }
-                complete_task(app_ctx.task_manager, task_id, final_res, "Email sent successfully")
+                complete_task(app_ctx.task_manager, task_id, {"success": True}, "Email sent successfully")
             else:
                 # --- REACTIVE HEALING INTEGRATION ---
-                # result.upload_results contains 'status' from network.send_stripe
-                is_fracked = False
-                for upload_res in getattr(result, 'upload_results', []):
-                    if getattr(upload_res, 'status', 0) == 200:
-                        is_fracked = True
-                        break
-                
+                is_fracked = any(getattr(r, 'status', 0) == 200 for r in (result.upload_results or []))
                 if is_fracked:
                     from src.app import move_identity_to_fracked
-                    log_error(app_ctx.logger, "API", f"Reactive Healing triggered for SN {identity.serial_number} due to status 200.")
+                    log_error(app_ctx.logger, "API", f"Reactive Healing triggered for SN {identity.serial_number}")
                     move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
                 
                 fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
@@ -310,98 +260,61 @@ def handle_mail_send(request_handler, context):
     request_handler.send_json_response(202, {
         "status": "accepted",
         "task_id": task_id,
-        "message": "Email queued for sending",
-        "file_group_guid": "",
-        "file_count": 1 + len(request_obj.attachment_paths),
-        "estimated_cost": 0.0
+        "message": "Email queued for sending"
     })
 
 def handle_mail_download(request_handler, context):
     """
-    GET /api/mail/download/{id} - Download an email by ID
+    GET /api/mail/download/{id} - Download email by ID
     STRICT VERSION: Now handles Status 200 to trigger Reactive Healing.
     """
-    # Get app context
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
     logger = app_ctx.logger
 
-    # Extract and validate file_guid
-    file_guid = context.path_params.get('id')
-    if not file_guid:
-        request_handler.send_json_response(400, {"error": "Missing file_guid"})
+    file_guid = context.path_params.get('id', '').replace('-', '').strip()
+    if len(file_guid) != 32:
+        request_handler.send_json_response(400, {"error": "Invalid file_guid format"})
         return
 
-    # Validate GUID format
-    clean_guid = file_guid.replace('-', '').strip()
-    if len(clean_guid) != 32:
-        request_handler.send_json_response(400, {"error": "Invalid file_guid format", "details": "Expected 32 hex characters"})
-        return
-
-    # Extract file_type parameter
-    file_type_list = context.query_params.get('file_type', ['0'])
-    file_type = int(file_type_list[0]) if file_type_list else 0
-
-    log_info(logger, "API", f"Download request for file_guid: {file_guid}")
-
-    err, tell_info = get_received_tell_by_guid(db_handle, file_guid)
-    if err == DatabaseErrorCode.ERR_NOT_FOUND:
-        log_error(logger, "API", f"Tell not found: {file_guid}")
-        request_handler.send_json_response(404, {"error": "File not found", "details": "No tell notification received"})
-        return
-
-    # Get user credentials from config
+    # Get credentials
     try:
         identity = app_ctx.config.identity
-        denomination = identity.denomination
-        serial_number = identity.serial_number
-        device_id = getattr(identity, 'device_id', 0)
         an = _get_an_for_download(app_ctx)
     except Exception as e:
         request_handler.send_json_response(500, {"error": "Configuration error", "details": str(e)})
         return
 
-    # Download the file
+    # Download file
     try:
-        # download_file_sync should be updated to return (bytes, status)
         file_bytes, status = download_file_sync(
             db_handle=db_handle,
             file_guid=file_guid,
-            file_type=file_type,
-            denomination=denomination,
-            serial_number=serial_number,
-            device_id=device_id,
+            denomination=identity.denomination,
+            serial_number=identity.serial_number,
+            device_id=getattr(identity, 'device_id', 0),
             an=an
         )
 
         # --- REACTIVE HEALING INTEGRATION ---
-        # Triggered if RAIDA reported ERROR_INVALID_AN (200) Per protocol.c:502
         if status == 200:
             from src.app import move_identity_to_fracked
-            log_error(logger, "API", f"Download failed (Status 200): Identity coin fracked. Initiating healing.")
-            move_identity_to_fracked(app_ctx.config.identity, app_ctx.beacon_handle, logger)
-            request_handler.send_json_response(401, {
-                "error": "Authentication failed - Coin fracked",
-                "details": "The identity coin was rejected by RAIDA and moved to Fracked for repair."
-            })
+            log_error(logger, "API", "Download failed (200). Initiating healing.")
+            move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
+            request_handler.send_json_response(401, {"error": "Authentication failed - Coin fracked"})
             return
 
-        log_info(logger, "API", f"Download complete: {len(file_bytes)} bytes for {file_guid}")
-
-        # Return raw bytes
+        # Success: Return raw bytes
         request_handler.send_response(200)
         request_handler.send_header('Content-Type', 'application/octet-stream')
         request_handler.send_header('Content-Length', str(len(file_bytes)))
         request_handler.send_header('Content-Disposition', f'attachment; filename="{file_guid}.bin"')
-        request_handler.send_header('X-File-GUID', file_guid)
-        request_handler.send_header('X-File-Type', str(file_type))
         request_handler.end_headers()
         request_handler.wfile.write(file_bytes)
 
     except Exception as e:
-        log_error(logger, "API", f"Download failed for {file_guid}: {e}")
+        log_error(logger, "API", f"Download failed: {e}")
         request_handler.send_json_response(500, {"error": "Download failed", "details": str(e)})
-
 
 ## DONT DELETE
 
@@ -574,33 +487,25 @@ from src.task_manager import create_task, start_task, complete_task, fail_task #
 
 def handle_create_mailbox(request_handler, request_context):
     """
-    STALL-PROOF VERSION: Reads body even if Content-Length is missing.
+    POST /api/mail/create-mailbox - Create new mailbox
+    FIXED: Corrected method call to send_json_response.
     """
-    # 1. BREAK THE READ-HANG
-    # We set a timeout and try to read the body manually
+    # Stall-Proof body reading logic
     request_handler.connection.settimeout(2.0)
     data = {}
     try:
         content_length = int(request_handler.headers.get('Content-Length', 0))
-        
         if content_length > 0:
-            # Standard path: read the specified length
             post_data = request_handler.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
         else:
-            # FALLBACK: If Content-Length is missing, we try to read the available buffer
-            # This is helpful if Postman isn't sending the length header
-            request_handler.connection.setblocking(False) # Don't wait for more bytes
-            try:
-                # Try to read up to 4KB of whatever is currently in the pipe
-                post_data = request_handler.connection.recv(4096)
-                # We need to skip the HTTP headers if they were bundled in this recv
-                if b'\r\n\r\n' in post_data:
-                    post_data = post_data.split(b'\r\n\r\n')[1]
-                if post_data:
-                    data = json.loads(post_data.decode('utf-8'))
-            except:
-                pass # No data found in buffer
+            # Fallback for missing Content-Length
+            request_handler.connection.setblocking(False)
+            post_data = request_handler.connection.recv(4096)
+            if b'\r\n\r\n' in post_data:
+                post_data = post_data.split(b'\r\n\r\n')[1]
+            if post_data:
+                data = json.loads(post_data.decode('utf-8'))
     except Exception as e:
         print(f"[DEBUG] API Read Error: {e}")
     finally:
@@ -609,40 +514,31 @@ def handle_create_mailbox(request_handler, request_context):
 
     locker_code = data.get("locker_code")
     if not locker_code:
-        # If we still have no locker_code, it means the body truly didn't arrive
-        return request_handler.send_error(400, "Request Body Missing (No Content-Length found)")
+        return request_handler.send_error(400, "Request Body Missing (No locker_code found)")
 
-    # 2. CONTEXT LOOKUP
-    ctx = None
-    if hasattr(request_context, 'server') and hasattr(request_context.server, 'app_context'):
-        ctx = request_context.server.app_context
-    elif hasattr(request_handler, 'server_instance') and hasattr(request_handler.server_instance, 'app_context'):
-        ctx = request_handler.server_instance.app_context
+    # Context Lookup
+    app_ctx = request_handler.server_instance.app_context
+    if not app_ctx: return request_handler.send_error(500, "AppContext Missing")
 
-    if not ctx: return request_handler.send_error(500, "AppContext Missing")
-
-    # 3. START BACKGROUND WORK (COMMAND 91)
-    err, task_id = create_task(ctx.task_manager, "stake_locker", params={"locker": locker_code})
+    # Start work (Command 91)
+    _, task_id = create_task(app_ctx.task_manager, "stake_locker", params={"locker": locker_code})
 
     def run_staking():
         from src.task_manager import stake_locker_identity
-        start_task(ctx.task_manager, task_id, "Broadcasting Command 91...")
-        
-        # Format code for RAIDA (8-byte null-padded)
+        start_task(app_ctx.task_manager, task_id, "Broadcasting Command 91...")
         clean_code = locker_code.replace('-', '').strip().upper().encode('ascii').ljust(8, b'\x00')
         
-        # Execute production logic derived from cmd_locker.c
-        success = stake_locker_identity(clean_code, ctx, logger=ctx.logger)
-        
-        if success:
-            complete_task(ctx.task_manager, task_id, message="Identity Created")
+        if stake_locker_identity(clean_code, app_ctx, logger=app_ctx.logger):
+            complete_task(app_ctx.task_manager, task_id, message="Identity Created")
         else:
-            fail_task(ctx.task_manager, task_id, error="Consensus Failed")
+            fail_task(app_ctx.task_manager, task_id, error="Consensus Failed")
 
     threading.Thread(target=run_staking, name=f"Stake-{task_id[:4]}", daemon=True).start()
 
+    # Use corrected method name
+    return request_handler.send_json_response(202, {"status": "started", "task_id": task_id})
     # 4. INSTANT RESPONSE
-    return request_handler.send_json({"status": "started", "task_id": task_id}, status=202)
+    return request_handler.send_json_response(202, {"status": "started", "task_id": task_id})
 # ============================================================================
 # DATA ENDPOINTS
 # ============================================================================

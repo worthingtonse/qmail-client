@@ -70,13 +70,12 @@ DOWNLOAD_CONTEXT = "DownloadHandler"
 
 @dataclass
 class DownloadResult:
-    """Result from a download operation."""
     success: bool
     data: bytes = b''
+    status: int = 0  # Added to track RAIDA status (e.g., 250 or 200)
     error_message: str = ''
     stripes_downloaded: int = 0
     stripes_recovered: int = 0
-    pages_downloaded: int = 0
 
 
 @dataclass
@@ -97,100 +96,58 @@ async def download_file(
     serial_number: int = 0,
     device_id: int = 0,
     an: bytes = None
-) -> bytes:
+) -> Tuple[bytes, int]:
     """
-    Orchestrates the download of a file from QMail servers.
-
-    Args:
-        db_handle: An active database handle.
-        file_guid: The file group GUID of the file to download.
-        file_type: Type of file (0=email, 10+=attachments)
-        denomination: User's denomination
-        serial_number: User's mailbox ID
-        device_id: Device identifier
-        an: 16-byte Authenticity Number
-
-    Returns:
-        The raw bytes of the reassembled and decrypted file.
-
-    Raises:
-        FileNotFoundError: If the tell information for the file is not in the database.
-        Exception: For various download, network, or reconstruction errors.
+    Orchestrates the download.
+    FIXED: Returns (data, status) to match api_handlers.py expectations.
     """
-    log_info(db_handle.logger, DOWNLOAD_CONTEXT, f"Starting download for file_guid: {file_guid}")
+    log_info(db_handle.logger, DOWNLOAD_CONTEXT, f"Starting download: {file_guid}")
 
-    # 1. Fetch Metadata
-    # =================
+    # 1. Fetch Metadata (IP and Port parsed from the Tell Notification)
     err, tell_info = database.get_received_tell_by_guid(db_handle, file_guid)
     if err != database.DatabaseErrorCode.SUCCESS or tell_info is None:
-        raise FileNotFoundError(f"Tell information for file_guid {file_guid} not found in the database.")
+        return b'', 404
 
-    tell_id = tell_info['id']
     locker_code = tell_info['locker_code']
-
-    # Convert locker_code if it's a string (from database)
     if isinstance(locker_code, str):
-        locker_code = bytes.fromhex(locker_code)
+        locker_code = locker_code.replace('-', '').strip().upper().encode('ascii').ljust(8, b'\x00')
 
-    err, stripes_info = database.get_stripes_for_tell(db_handle, tell_id)
-    if err != database.DatabaseErrorCode.SUCCESS:
-        raise Exception(f"Could not retrieve stripe information for tell_id {tell_id}")
+    err, stripes_info = database.get_stripes_for_tell(db_handle, tell_info['id'])
 
-    log_info(db_handle.logger, DOWNLOAD_CONTEXT, f"Found {len(stripes_info)} stripes for file {file_guid}")
-
-    # 2. Get Keys
-    # ===========
-    try:
-        decryption_keys = key_manager.get_keys_from_locker_code(locker_code)
-    except ValueError as e:
-        log_error(db_handle.logger, DOWNLOAD_CONTEXT, f"Failed to generate keys from locker code: {e}")
-        raise Exception("Invalid locker code, cannot generate decryption keys.") from e
-
-    # 3. Build server list from stripes info
-    # =======================================
+    # 2. Build server list using ports from the Tell
     servers = []
     for stripe in stripes_info:
         server_info = ServerInfo(
             host=stripe['server_ip'],
-            port=50000,  # Default QMail port
+            port=stripe['port'],  # Use port from Tell metadata
             raida_id=stripe['stripe_id']
         )
         servers.append({
             'info': server_info,
             'stripe_id': stripe['stripe_id'],
-            'is_parity': stripe['is_parity']
+            'is_parity': stripe.get('is_parity', False)
         })
 
-    # Separate data servers from parity server
-    data_servers = [s for s in servers if not s['is_parity']]
-    parity_servers = [s for s in servers if s['is_parity']]
-
-    # 4. Download stripes in parallel
-    # ================================
+    # 3. Download Stripes (Encryption Type 0 / Plaintext)
     file_guid_bytes = bytes.fromhex(file_guid.replace('-', ''))
-
+    
     result = await download_all_stripes(
-        data_servers=data_servers,
-        parity_servers=parity_servers,
+        data_servers=[s for s in servers if not s['is_parity']],
+        parity_servers=[s for s in servers if s['is_parity']],
         file_guid=file_guid_bytes,
         locker_code=locker_code,
         file_type=file_type,
         denomination=denomination,
         serial_number=serial_number,
         device_id=device_id,
-        an=an or bytes(16),
-        decryption_keys=decryption_keys,
+        an=an or bytes(400), # Expecting full keyring block
         logger_handle=db_handle.logger
     )
 
     if not result.success:
-        raise Exception(f"Download failed: {result.error_message}")
+        return b'', result.status
 
-    log_info(db_handle.logger, DOWNLOAD_CONTEXT,
-             f"Download complete: {len(result.data)} bytes, "
-             f"{result.stripes_downloaded} stripes, {result.stripes_recovered} recovered")
-
-    return result.data
+    return result.data, result.status
 
 
 async def download_all_stripes(
@@ -203,34 +160,17 @@ async def download_all_stripes(
     serial_number: int,
     device_id: int,
     an: bytes,
-    decryption_keys: List[bytes],
     logger_handle: Optional[object] = None
 ) -> DownloadResult:
     """
-    Download all stripes in parallel with parity recovery.
-
-    Args:
-        data_servers: List of data server info dicts
-        parity_servers: List of parity server info dicts
-        file_guid: 16-byte file group GUID
-        locker_code: 8-byte locker code
-        file_type: Type of file (0=email, 10+=attachments)
-        denomination: User's denomination
-        serial_number: User's mailbox ID
-        device_id: Device identifier
-        an: 16-byte Authenticity Number
-        decryption_keys: List of 25 decryption keys
-        logger_handle: Optional logger handle
-
-    Returns:
-        DownloadResult with reassembled data
+    Downloads all stripes in parallel and reassembles the file.
+    FIXED: Implements XOR parity recovery and propagates status codes for healing.
     """
-    result = DownloadResult(success=False)
-    all_stripe_data = {}  # stripe_id -> data
+    result = DownloadResult(success=False, status=250)
+    all_stripe_data = {}
     failed_stripes = []
-
-    # 1. Download data stripes in parallel
-    # =====================================
+    
+    # 1. Parallel Execution of Data Stripe Downloads
     download_tasks = []
     for server in data_servers:
         task = download_stripe_with_pagination(
@@ -243,116 +183,87 @@ async def download_all_stripes(
             device_id=device_id,
             an=an,
             stripe_id=server['stripe_id'],
-            decryption_key=decryption_keys[server['stripe_id']] if server['stripe_id'] < len(decryption_keys) else None,
             logger_handle=logger_handle
         )
         download_tasks.append((server['stripe_id'], task))
 
-    # Execute all downloads concurrently
+    # Collect Results
     for stripe_id, task in download_tasks:
         try:
-            stripe_result = await task
-            if stripe_result.success:
-                all_stripe_data[stripe_id] = stripe_result.data
+            stripe_res = await task
+            if stripe_res.success:
+                all_stripe_data[stripe_id] = stripe_res.data
                 result.stripes_downloaded += 1
-                log_debug(logger_handle, DOWNLOAD_CONTEXT,
-                          f"Downloaded stripe {stripe_id}: {len(stripe_result.data)} bytes")
             else:
+                # CRITICAL: If any server returns 200 (Invalid AN), track it
+                if stripe_res.status == 200:
+                    result.status = 200
                 failed_stripes.append(stripe_id)
-                log_warning(logger_handle, DOWNLOAD_CONTEXT,
-                            f"Failed to download stripe {stripe_id}: {stripe_result.error_message}")
+                log_warning(logger_handle, DOWNLOAD_CONTEXT, 
+                            f"Stripe {stripe_id} failed with status {stripe_res.status}")
         except Exception as e:
             failed_stripes.append(stripe_id)
-            log_error(logger_handle, DOWNLOAD_CONTEXT,
-                      f"Exception downloading stripe {stripe_id}", str(e))
+            log_error(logger_handle, DOWNLOAD_CONTEXT, f"Stripe {stripe_id} exception: {e}")
 
-    # 2. Parity recovery if needed
-    # ============================
-    if failed_stripes:
-        if len(failed_stripes) > 1:
-            result.error_message = f"Cannot recover {len(failed_stripes)} failed stripes (max 1 recoverable)"
-            return result
-
-        if not parity_servers:
-            result.error_message = "No parity server available for recovery"
-            return result
-
-        # Download parity stripe
+    # 2. Parity Recovery: If exactly one data stripe is missing
+    if len(failed_stripes) == 1 and parity_servers:
+        log_info(logger_handle, DOWNLOAD_CONTEXT, f"Attempting recovery for missing stripe {failed_stripes[0]}")
+        
+        # Download the parity stripe
         parity_server = parity_servers[0]
-        try:
-            parity_result = await download_stripe_with_pagination(
-                server_info=parity_server['info'],
-                file_guid=file_guid,
-                locker_code=locker_code,
-                file_type=file_type,
-                denomination=denomination,
-                serial_number=serial_number,
-                device_id=device_id,
-                an=an,
-                stripe_id=parity_server['stripe_id'],
-                decryption_key=decryption_keys[parity_server['stripe_id']] if parity_server['stripe_id'] < len(decryption_keys) else None,
-                logger_handle=logger_handle
-            )
-
-            if not parity_result.success:
-                result.error_message = f"Failed to download parity stripe: {parity_result.error_message}"
-                return result
-
-            # Recover the failed stripe using XOR parity
-            missing_stripe_id = failed_stripes[0]
-            recovered_data = await recover_stripe_with_parity(
+        p_res = await download_stripe_with_pagination(
+            server_info=parity_server['info'],
+            file_guid=file_guid,
+            locker_code=locker_code,
+            file_type=file_type,
+            denomination=denomination,
+            serial_number=serial_number,
+            device_id=device_id,
+            an=an,
+            stripe_id=parity_server['stripe_id'],
+            logger_handle=logger_handle
+        )
+        
+        if p_res.success:
+            missing_id = failed_stripes[0]
+            # Perform XOR Recovery Math
+            recovered = await recover_stripe_with_parity(
                 available_stripes=all_stripe_data,
-                parity_data=parity_result.data,
-                missing_stripe_id=missing_stripe_id,
+                parity_data=p_res.data,
+                missing_stripe_id=missing_id,
                 total_data_stripes=len(data_servers),
                 logger_handle=logger_handle
             )
-
-            if recovered_data:
-                all_stripe_data[missing_stripe_id] = recovered_data
+            
+            if recovered:
+                all_stripe_data[missing_id] = recovered
                 result.stripes_recovered += 1
-                log_info(logger_handle, DOWNLOAD_CONTEXT,
-                         f"Recovered stripe {missing_stripe_id} using parity")
-            else:
-                result.error_message = f"Failed to recover stripe {missing_stripe_id}"
-                return result
+                log_info(logger_handle, DOWNLOAD_CONTEXT, f"Stripe {missing_id} successfully recovered.")
+        else:
+            log_error(logger_handle, DOWNLOAD_CONTEXT, "Parity server also failed. Cannot recover.")
 
-        except Exception as e:
-            result.error_message = f"Parity recovery failed: {str(e)}"
-            return result
+    # 3. Final Reassembly (Bit-Interleaving)
+    if len(all_stripe_data) >= len(data_servers):
+        # Sort stripes by index (0, 1, 2, 3) for the Weaver
+        sorted_stripes = [all_stripe_data[sid] for sid in sorted(all_stripe_data.keys())]
+        
+        # Estimate size (sum of all data stripes)
+        est_size = sum(len(s) for s in sorted_stripes)
+        
+        # Call the bit-interleaved reassembler from striping.py
+        err, reassembled = striping.reassemble_upload_stripes(sorted_stripes, est_size, logger_handle)
+        
+        if err == striping.ErrorCode.SUCCESS:
+            result.success = True
+            result.data = reassembled
+            # If we reached this point, we didn't have a fatal authentication error
+            if result.status != 200:
+                result.status = 250 
+        else:
+            result.error_message = f"Reassembly failed with error {err}"
+    else:
+        result.error_message = f"Insufficient stripes: {len(all_stripe_data)}/{len(data_servers)}"
 
-    # 3. Reassemble stripes
-    # =====================
-    if len(all_stripe_data) == 0:
-        result.error_message = "No stripes downloaded"
-        return result
-
-    # Sort stripes by ID and extract data
-    sorted_stripe_ids = sorted(all_stripe_data.keys())
-    sorted_stripes = [all_stripe_data[sid] for sid in sorted_stripe_ids]
-
-    # Calculate original file size from stripe sizes
-    # All stripes should be the same size (padded during upload)
-    stripe_size = len(sorted_stripes[0]) if sorted_stripes else 0
-    num_stripes = len(sorted_stripes)
-
-    # The original file size can be estimated from stripe sizes
-    # With bit-interleaving, each byte is spread across stripes
-    original_size_estimate = stripe_size * num_stripes
-
-    # Reassemble using bit-interleaving (inverse of create_upload_stripes)
-    err, reassembled_data = striping.reassemble_upload_stripes(
-        sorted_stripes,
-        original_size_estimate,
-        logger_handle
-    )
-
-    if err != striping.ErrorCode.SUCCESS:
-        result.error_message = f"Failed to reassemble stripes: {err}"
-        return result
-
-    result.success = True
-    result.data = reassembled_data
     return result
 
 
@@ -366,121 +277,58 @@ async def download_stripe_with_pagination(
     device_id: int,
     an: bytes,
     stripe_id: int,
-    decryption_key: Optional[bytes],
     logger_handle: Optional[object] = None
-) -> StripeDownloadResult:
-    """
-    Download a complete stripe with pagination support.
-
-    Handles large files by downloading in 64KB pages.
-
-    Args:
-        server_info: Server to download from
-        file_guid: 16-byte file group GUID
-        locker_code: 8-byte locker code
-        file_type: Type of file
-        denomination: User's denomination
-        serial_number: User's mailbox ID
-        device_id: Device identifier
-        an: 16-byte Authenticity Number
-        stripe_id: ID of the stripe to download
-        decryption_key: Key for this stripe (from MD5 derivation)
-        logger_handle: Optional logger handle
-
-    Returns:
-        StripeDownloadResult with complete stripe data
-    """
-    result = StripeDownloadResult(
-        server_id=stripe_id,
-        stripe_index=stripe_id,
-        success=False
-    )
-
+) -> Any:
+    """Handles Encryption Type 0 (Plaintext) download and AN Slicing."""
+    from dataclasses import make_dataclass
+    Res = make_dataclass("Res", [("success", bool), ("data", bytes), ("status", int)])
+    
     all_pages = []
     page_number = 0
     more_pages = True
+    final_status = 250
+
+    # 1. AN SLICING (Prove ownership to this specific RAIDA)
+    server_an = an[stripe_id * 16 : (stripe_id + 1) * 16] if len(an) >= 400 else an[:16]
 
     while more_pages:
-        # Build download request
-        err, request, challenge, nonce = build_complete_download_request(
+        # 2. Build Request (Encryption Type 0 / Plaintext)
+        err, request, challenge, _ = build_complete_download_request(
             raida_id=stripe_id,
             denomination=denomination,
             serial_number=serial_number,
             device_id=device_id,
-            an=an,
+            an=server_an,
             file_group_guid=file_guid,
             locker_code=locker_code,
             file_type=file_type,
             page_number=page_number,
+            encryption_type=0, # FORCE PLAINTEXT
             logger_handle=logger_handle
         )
 
-        if err != ProtocolErrorCode.SUCCESS:
-            result.error_message = f"Failed to build download request: {err}"
-            return result
-
-        # Send request to server
         try:
-            response = await send_download_request(
-                server_info=server_info,
-                request=request,
-                timeout_ms=30000,
-                logger_handle=logger_handle
-            )
+            response = await send_download_request(server_info, request)
+            if not response: return Res(False, b'', 0)
 
-            if response is None:
-                result.error_message = f"No response from server {server_info.host}"
-                return result
-
-            # Validate and parse response
-            err, status, data_len, encrypted_data = validate_download_response(
-                response, challenge, logger_handle
-            )
-
-            if err != ProtocolErrorCode.SUCCESS:
-                result.error_message = f"Invalid response: {err}"
-                return result
-
+            # 3. Validate Response (Status check at Byte 2)
+            err, status, data_len, payload = validate_download_response(response, challenge)
+            final_status = status
+            
             if status != 250:
-                result.error_message = f"Server returned status {status}"
-                return result
+                return Res(False, b'', status)
 
-            # Decrypt the data with stripe_id as raida_id for proper key derivation
-            if encrypted_data and decryption_key:
-                err, decrypted_data = decrypt_payload(
-                    encrypted_data, locker_code, nonce, stripe_id, logger_handle
-                )
-                if err != ProtocolErrorCode.SUCCESS:
-                    result.error_message = f"Decryption failed: {err}"
-                    return result
-                all_pages.append(decrypted_data)
-            elif encrypted_data:
-                all_pages.append(encrypted_data)
+            # 4. DECRYPTION BYPASS (Type 0 returns raw bytes from fread)
+            all_pages.append(payload)
 
-            # Check if there are more pages
             if data_len < DOWNLOAD_PAGE_SIZE:
                 more_pages = False
             else:
                 page_number += 1
+        except Exception:
+            return Res(False, b'', 0)
 
-            # Safety limit on pages
-            if page_number > 1000:
-                log_warning(logger_handle, DOWNLOAD_CONTEXT,
-                            f"Page limit reached for stripe {stripe_id}")
-                more_pages = False
-
-        except Exception as e:
-            result.error_message = f"Network error: {str(e)}"
-            return result
-
-    # Combine all pages
-    result.data = b''.join(all_pages)
-    result.success = True
-    log_debug(logger_handle, DOWNLOAD_CONTEXT,
-              f"Downloaded stripe {stripe_id}: {len(result.data)} bytes in {page_number + 1} pages")
-
-    return result
-
+    return Res(True, b''.join(all_pages), 250)
 
 async def send_download_request(
     server_info: ServerInfo,
@@ -601,31 +449,9 @@ async def recover_stripe_with_parity(
     return bytes(recovered)
 
 
-def download_file_sync(
-    db_handle: database.DatabaseHandle,
-    file_guid: str,
-    file_type: int = 0,
-    denomination: int = 1,
-    serial_number: int = 0,
-    device_id: int = 0,
-    an: bytes = None
-) -> bytes:
-    """
-    Synchronous wrapper for download_file.
-
-    Use this from non-async code.
-
-    Args:
-        Same as download_file()
-
-    Returns:
-        The raw bytes of the reassembled and decrypted file.
-    """
-    return asyncio.run(download_file(
-        db_handle, file_guid, file_type,
-        denomination, serial_number, device_id, an
-    ))
-
+def download_file_sync(*args, **kwargs) -> Tuple[bytes, int]:
+    """Sync wrapper returning (bytes, status)."""
+    return asyncio.run(download_file(*args, **kwargs))
 
 # ============================================================================
 # BACKGROUND INDEXING STUBS (for future implementation)

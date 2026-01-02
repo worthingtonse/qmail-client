@@ -336,8 +336,10 @@ CREATE TABLE IF NOT EXISTS received_stripes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tell_id INTEGER,
     server_ip TEXT,
-    stripe_index INTEGER,
+    stripe_id INTEGER,
     is_parity BOOLEAN,
+    port INTEGER,
+    stripe_hash TEXT,  -- ADD THIS LINE
     FOREIGN KEY(tell_id) REFERENCES received_tells(id) ON DELETE CASCADE
 );
 
@@ -352,7 +354,7 @@ CREATE INDEX IF NOT EXISTS idx_attachments_email ON Attachments(EmailID);
 CREATE INDEX IF NOT EXISTS idx_servers_available ON QMailServers(is_available);
 CREATE INDEX IF NOT EXISTS idx_servers_parity ON QMailServers(use_for_parity);
 CREATE INDEX IF NOT EXISTS idx_pending_tells_status ON PendingTells(Status);
-CREATE INDEX IF NOT EXISTS idx_received_tells_status ON received_tells(status);
+CREATE INDEX IF NOT EXISTS idx_received_tells_download_status ON received_tells(download_status);
 CREATE INDEX IF NOT EXISTS idx_received_tells_file_guid ON received_tells(file_guid);
 CREATE INDEX IF NOT EXISTS idx_received_stripes_tell_id ON received_stripes(tell_id);
 """
@@ -2905,7 +2907,7 @@ def store_received_tell(
     handle: DatabaseHandle,
     file_guid: str,
     locker_code: bytes,
-    file_type: int = 0,
+    tell_type: int = 0,
     version: int = 1,
     file_size: int = 0,
     status: str = 'pending'
@@ -2943,11 +2945,10 @@ def store_received_tell(
     try:
         cursor = handle.connection.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO received_tells
-            (file_guid, locker_code, file_type, version, file_size, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (file_guid, locker_code_hex, file_type, version, file_size, status))
-
+        INSERT OR REPLACE INTO received_tells
+        (file_guid, locker_code, tell_type)
+         VALUES (?, ?, ?)
+        """, (file_guid, locker_code_hex, tell_type))
         handle.connection.commit()
         tell_id = cursor.lastrowid
 
@@ -3172,7 +3173,7 @@ def get_pending_download_count(handle: DatabaseHandle) -> Tuple[DatabaseErrorCod
 
     try:
         cursor = handle.connection.cursor()
-        cursor.execute("SELECT COUNT(*) FROM received_tells WHERE status = 'pending'")
+        cursor.execute("SELECT COUNT(*) FROM received_tells WHERE download_status = 0")
         count = cursor.fetchone()[0]
         return DatabaseErrorCode.SUCCESS, count
 
@@ -3746,30 +3747,89 @@ def is_guid_in_database(handle, file_guid):
     cursor.execute("SELECT 1 FROM received_tells WHERE file_guid = ?", (file_guid,))
     return cursor.fetchone() is not None
 
-def store_received_tell(handle, file_guid, locker_code, tell_type):
-    """Saves incoming mail metadata."""
-    try:
-        cursor = handle.connection.cursor()
-        cursor.execute('''
-            INSERT INTO received_tells (file_guid, locker_code, tell_type)
-            VALUES (?, ?, ?)
-        ''', (file_guid, locker_code, tell_type))
-        handle.connection.commit()
-        return DatabaseErrorCode.SUCCESS, cursor.lastrowid
-    except Exception:
-        return DatabaseErrorCode.ERR_QUERY_FAILED, None
+def store_received_tell(
+    handle: DatabaseHandle,
+    file_guid: str,
+    locker_code: bytes,
+    tell_type: int = 0,  # Changed from file_type
+    version: int = 1,    # Keep for backward compatibility but don't use
+    file_size: int = 0,  # Keep for backward compatibility but don't use
+    status: str = 'pending'  # Keep for backward compatibility but don't use
+) -> Tuple[DatabaseErrorCode, int]:
+    """Store a received tell notification in the database."""
+    if handle is None or handle.connection is None:
+        return DatabaseErrorCode.ERR_INVALID_PARAM, -1
 
-def store_received_stripe(handle, tell_id, server_ip, stripe_index, is_parity):
-    """Caches server locations for later download."""
+    if not file_guid or locker_code is None:
+        return DatabaseErrorCode.ERR_INVALID_PARAM, -1
+
+    # Convert locker_code to hex string for storage
+    locker_code_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
+
     try:
         cursor = handle.connection.cursor()
-        cursor.execute('''
-            INSERT INTO received_stripes (tell_id, server_ip, stripe_index, is_parity)
-            VALUES (?, ?, ?, ?)
-        ''', (tell_id, server_ip, stripe_index, is_parity))
+        cursor.execute("""
+            INSERT OR REPLACE INTO received_tells
+            (file_guid, locker_code, tell_type)
+            VALUES (?, ?, ?)
+        """, (file_guid, locker_code_hex, tell_type))
+
         handle.connection.commit()
+        tell_id = cursor.lastrowid
+
+        log_info(handle.logger, DB_CONTEXT, f"Stored received tell: {file_guid}, id={tell_id}")
+        return DatabaseErrorCode.SUCCESS, tell_id
+
+    except sqlite3.Error as e:
+        log_error(handle.logger, DB_CONTEXT, "Failed to store received tell", str(e))
+        handle.connection.rollback()
+        return DatabaseErrorCode.ERR_QUERY_FAILED, -1
+
+def store_received_stripe(
+    handle: DatabaseHandle,
+    tell_id: int,
+    server_ip: str,
+    stripe_id: int,
+    is_parity: bool,
+    port: int,
+    stripe_hash: str = None
+) -> DatabaseErrorCode:
+    """
+    Store stripe location information for a received tell.
+
+    Args:
+        handle: Database handle
+        tell_id: ID of the parent tell
+        server_ip: Server IP address or hostname
+        stripe_id: Stripe index (0-based)
+        is_parity: True if this is a parity stripe
+        port: Server port number
+        stripe_hash: Optional hash of stripe data for verification
+
+    Returns:
+        DatabaseErrorCode
+    """
+    if handle is None or handle.connection is None:
+        return DatabaseErrorCode.ERR_INVALID_PARAM
+
+    if tell_id < 0 or not server_ip:
+        return DatabaseErrorCode.ERR_INVALID_PARAM
+
+    try:
+        cursor = handle.connection.cursor()
+        cursor.execute("""
+            INSERT INTO received_stripes
+            (tell_id, server_ip, stripe_id, is_parity, port, stripe_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (tell_id, server_ip, stripe_id, is_parity, port, stripe_hash))
+
+        handle.connection.commit()
+        log_info(handle.logger, DB_CONTEXT, f"Stored stripe {stripe_id} for tell {tell_id}")
         return DatabaseErrorCode.SUCCESS
-    except Exception:
+
+    except sqlite3.Error as e:
+        log_error(handle.logger, DB_CONTEXT, "Failed to store stripe", str(e))
+        handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED
 
 def delete_email_locally(handle, file_guid):

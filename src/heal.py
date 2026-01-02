@@ -32,27 +32,27 @@ from typing import List, Set, Dict, Tuple
 from dataclasses import dataclass, field
 
 # Import from modular components
-from .heal_protocol import (
+from heal_protocol import (
     RAIDA_COUNT, QUORUM_REQUIRED, HealErrorCode,
     generate_pg, calculate_new_an
 )
-from .heal_file_io import (
+from heal_file_io import (
     CloudCoinBin, load_coins_from_folder, move_coin_file,
     FOLDER_BANK, FOLDER_FRACKED, FOLDER_LIMBO, FOLDER_COUNTERFEIT, FOLDER_SUSPECT,
     ensure_wallet_folders_exist, check_wallet_folders_exist
 )
-from .heal_network import (
+from heal_network import (
     get_tickets_for_coins_batch, find_coins_batch, fix_coins_on_raida_set_batch
 )
-from .heal_encryption import (
+from heal_encryption import (
     EncryptionHealth, check_encryption, fix_encryption
 )
 
 # Import wallet structure initialization
 try:
-    from .wallet_structure import initialize_wallet_structure
+    from wallet_structure import initialize_wallet_structure
 except ImportError:
-    from .wallet_structure import initialize_wallet_structure
+    from wallet_structure import initialize_wallet_structure
 
 
 # ============================================================================

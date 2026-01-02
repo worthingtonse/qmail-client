@@ -214,19 +214,17 @@ def parse_tell_response(
 ) -> Tuple[ProtocolErrorCode, List[TellNotification]]:
     """
     Parses the decrypted response body from a PING or PEEK command.
-
-    This implements the correct parsing logic for the "Tell Array" structure
-    as documented in QMAIL_PING_COMMAND.md, including the variable-length
-    server list.
-
-    Args:
-        response_body: The raw, decrypted bytes of the response payload.
-        logger_handle: Optional logger handle.
-
-    Returns:
-        A tuple containing:
-        - ProtocolErrorCode indicating success or failure.
-        - A list of TellNotification objects.
+    
+    Matches tell_file_header_t from tell.h (40 bytes):
+    - Offset +0:  cluster_id (4 bytes)
+    - Offset +4:  sender_coin_id (2 bytes)
+    - Offset +6:  sender_denomination (1 byte)
+    - Offset +7:  sender_serial_number (4 bytes, Big Endian)
+    - Offset +11: timestamp (4 bytes, Big Endian)
+    - Offset +15: tell_type (1 byte)
+    - Offset +16: email_id/file_guid (16 bytes)
+    - Offset +32: total_file_size (4 bytes, Big Endian)
+    - Offset +36: stripe_count (4 bytes, Big Endian)
     """
     if not response_body or len(response_body) < 8:
         log_debug(logger_handle, "Protocol", "Tell response is empty or too short for a header.")
@@ -236,66 +234,73 @@ def parse_tell_response(
         tell_count = response_body[0]
         total_tells = struct.unpack('>H', response_body[1:3])[0]
 
-        log_debug(logger_handle, "Protocol", f"Parsing tell response. Header: tell_count={tell_count}, total_tells_remaining={total_tells}")
+        log_debug(logger_handle, "Protocol", 
+                  f"Parsing tell response. Header: tell_count={tell_count}, total_tells_remaining={total_tells}")
 
         if tell_count == 0:
             return ProtocolErrorCode.SUCCESS, []
 
         notifications = []
-        offset = 8  # Tells start after the 8-byte response header
+        offset = 8  # Tells start after 8-byte response header
 
         for i in range(tell_count):
-            # Each tell has a fixed header of 40 bytes before the server list
-            min_tell_size = 40
+            min_tell_size = 40  # tell_file_header_t is 40 bytes
             if offset + min_tell_size > len(response_body):
-                log_error(logger_handle, "Protocol", f"Incomplete data for tell #{i+1} at offset {offset}.")
+                log_error(logger_handle, "Protocol", 
+                         f"Incomplete data for tell #{i+1} at offset {offset}.")
                 return ProtocolErrorCode.ERR_INCOMPLETE_DATA, notifications
 
             tell = TellNotification()
 
-            # Parse the fixed-size part of the tell
-            tell.file_guid = response_body[offset : offset + 16]
-            tell.locker_code = response_body[offset + 16 : offset + 24]
-            tell.timestamp = struct.unpack('>I', response_body[offset + 24 : offset + 28])[0]
-            tell.tell_type = response_body[offset + 28]
-            # byte 29 is reserved
-            tell.server_count = response_body[offset + 30]
-            # bytes 31-39 are reserved
+            # Parse with correct offsets matching C struct
+            tell.timestamp = struct.unpack('>I', response_body[offset + 11 : offset + 15])[0]
+            tell.tell_type = response_body[offset + 15]
+            tell.file_guid = response_body[offset + 16 : offset + 32]  # 16 bytes
+            tell.server_count = struct.unpack('>I', response_body[offset + 36 : offset + 40])[0]
 
-            # Move offset past the fixed part
-            offset += min_tell_size
+            offset += 40  # Move past header
 
-            # Parse the variable-length server list
+            # Parse server list (server_loc_t: 32 bytes each)
             server_list = []
-            for _ in range(tell.server_count):
-                server_entry_size = 32
-                if offset + server_entry_size > len(response_body):
-                    log_error(logger_handle, "Protocol", f"Incomplete data for server list in tell #{i+1}.")
-                    # Stop parsing this tell, but keep already parsed ones
-                    offset = len(response_body) # Force outer loop to break
+            for s in range(tell.server_count):
+                if offset + 32 > len(response_body):
+                    log_error(logger_handle, "Protocol", 
+                             f"Incomplete data for server list in tell #{i+1}.")
                     break
 
-                server_data = response_body[offset : offset + server_entry_size]
-
+                server_data = response_body[offset : offset + 32]
+                
                 location = ServerLocation(
                     stripe_index=server_data[0],
-                    total_stripes=server_data[1],
-                    server_id=server_data[2],
+                    total_stripes=tell.server_count,
+                    server_id=server_data[0],
                     raw_entry=server_data
                 )
                 server_list.append(location)
-                offset += server_entry_size
+                offset += 32
 
             tell.server_list = server_list
+
+            # Parse footer (tell_file_footer_t: tag + length + 16-byte locker = 18 bytes)
+            if offset + 18 <= len(response_body):
+                footer_tag = response_body[offset]
+                footer_len = response_body[offset + 1]
+                if footer_tag == 0x50 and footer_len == 16:
+                    tell.locker_code = response_body[offset + 2 : offset + 18]
+                    offset += 18
+                else:
+                    tell.locker_code = bytes(16)
+            else:
+                tell.locker_code = bytes(16)
+
             notifications.append(tell)
 
         return ProtocolErrorCode.SUCCESS, notifications
 
     except (struct.error, IndexError) as e:
-        log_error(logger_handle, "Protocol", f"Failed to parse tell response due to malformed data: {e}")
+        log_error(logger_handle, "Protocol", 
+                 f"Failed to parse tell response due to malformed data: {e}")
         return ProtocolErrorCode.ERR_INVALID_BODY, []
-
-
 # ============================================================================
 # PING/PEEK COMMAND FUNCTIONS
 # ============================================================================
@@ -496,6 +501,8 @@ def build_complete_peek_request(
     if err != 0: return err, b'', b'', b''
     
     return 0, header + payload, challenge, header[24:32]
+
+
 def build_complete_ping_request(
     raida_id: int,
     denomination: int,
@@ -505,13 +512,18 @@ def build_complete_ping_request(
     encryption_type: int = 0,
     **kwargs
 ) -> Tuple[int, bytes, bytes, bytes]:
-    """Wraps header and unpadded PING body. Returns 4 values for test compatibility."""
-    # 1. Build Payload and Challenge
+    """
+    Build a complete PING request (header + payload).
+    
+    FIXED: Now calls build_ping_header to ensure Command 62 is used. 
+    Using build_tell_header previously caused Status 16 misrouting errors.
+    """
+    # 1. Build the 50-byte unpadded PING body and its 16-byte challenge
     payload, challenge = build_ping_body(denomination, serial_number, device_id, an)
 
-    # 2. Build Header with the EXACT unpadded length (50 bytes)
-    # Reuses your build_tell_header logic to ensure zero-nonce for Type 0
-    err, header = build_tell_header(
+    # 2. Build the Header using the correct PING command code (62)
+    # This function correctly sets header[5] = CMD_PING
+    err, header = build_ping_header(
         raida_id=raida_id,
         an=an,
         body_length=len(payload),
@@ -520,10 +532,15 @@ def build_complete_ping_request(
         encryption_type=encryption_type,
         **kwargs
     )
-    if err != 0: return err, b'', b'', b''
     
-    return 0, header + payload, challenge, header[24:32]
-
+    if err != 0: 
+        return err, b'', b'', b''
+    
+    # 3. Combine header and payload
+    # For Type 0, the nonce at header[24:32] will be 8 null bytes
+    complete_request = header + payload
+    
+    return 0, complete_request, challenge, header[24:32]
 # ============================================================================
 # UPLOAD COMMAND FUNCTIONS (Added by opus45)
 # ============================================================================

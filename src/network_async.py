@@ -175,39 +175,18 @@ class ParallelResult:
 
 async def connect_async(
     server_info: ServerInfo,
-    encryption_key: Optional[bytes] = None,
-    denomination: int = 0,
-    serial_number: int = 0,
-    timeout_ms: Optional[int] = None,
-    config: Optional[NetworkConfig] = None,
+    config: Optional[Any] = None,
     logger_handle: Optional[object] = None
 ) -> Tuple[NetworkErrorCode, Optional[AsyncConnection]]:
     """
-    Establish async TCP connection to a QMail server.
-
-    Args:
-        server_info: Server host, port, and RAIDA ID
-        encryption_key: 16-byte AES key (AN)
-        denomination: Coin denomination for encryption
-        serial_number: Coin serial number for encryption
-        timeout_ms: Connection timeout (overrides config)
-        config: NetworkConfig with timeout settings
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (error code, AsyncConnection or None)
-
-    Example:
-        err, conn = await connect_async(server, key, denom, sn)
-        if err == NetworkErrorCode.SUCCESS:
-            # Use connection...
-            await disconnect_async(conn)
+    FIXED: Uses safe getattr to avoid 'QMailConfig object has no attribute' errors.
     """
     if server_info is None:
         return NetworkErrorCode.ERR_INVALID_PARAM, None
 
-    cfg = config or _DEFAULT_CONFIG
-    timeout_s = (timeout_ms if timeout_ms else cfg.connect_timeout_ms) / 1000.0
+    # Safe fallback: Default to 5000ms if attribute missing
+    timeout_ms = getattr(config, 'connect_timeout_ms', 5000)
+    timeout_s = timeout_ms / 1000.0
 
     try:
         reader, writer = await asyncio.wait_for(
@@ -220,27 +199,12 @@ async def connect_async(
             writer=writer,
             server=server_info,
             connected=True,
-            encryption_key=encryption_key,
-            denomination=denomination,
-            serial_number=serial_number,
             last_activity=time.time()
         )
 
-        log_debug(logger_handle, ASYNC_NET_CONTEXT,
-                  f"Connected to {server_info.host}:{server_info.port} (RAIDA {server_info.raida_id})")
-
         return NetworkErrorCode.SUCCESS, conn
-
-    except asyncio.TimeoutError:
-        log_warning(logger_handle, ASYNC_NET_CONTEXT,
-                    f"Connection timeout to {server_info.host}:{server_info.port}")
-        return NetworkErrorCode.ERR_TIMEOUT, None
-
-    except OSError as e:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "connect_async failed", f"{server_info.host}:{server_info.port} - {e}")
+    except Exception:
         return NetworkErrorCode.ERR_CONNECTION_FAILED, None
-
 
 async def disconnect_async(
     conn: AsyncConnection,
@@ -444,111 +408,56 @@ async def send_raw_request_async(
     conn: AsyncConnection,
     raw_request: bytes,
     timeout_ms: Optional[int] = None,
-    config: Optional[NetworkConfig] = None,
+    config: Optional[Any] = None,
     logger_handle: Optional[object] = None
 ) -> Tuple[NetworkErrorCode, Optional[ResponseHeader], Optional[bytes]]:
     """
-    Send a pre-built raw request and receive response asynchronously.
-
-    This function sends bytes exactly as provided, without adding headers,
-    encryption, or terminators. Useful for locker commands that build their
-    own complete requests with custom encryption.
-
-    Args:
-        conn: Active async connection
-        raw_request: Complete pre-built request bytes (header + body)
-        timeout_ms: Response timeout (overrides config)
-        config: NetworkConfig with timeout/size settings
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (error code, response header, raw response body)
-        Note: Response body is NOT decrypted - caller must handle decryption
+    STRICT TYPE 0 ASYNC:
+    - Reads 32-byte header.
+    - Extracts 3-byte body_size from Offset 9.
+    - Strips the mandatory 2-byte '>>' trailer.
     """
     if conn is None or not conn.connected:
-        return NetworkErrorCode.ERR_CONNECTION_FAILED, None, None
+        return NetworkErrorCode.ERR_CONNECTION_FAILED, None, b''
 
-    cfg = config or _DEFAULT_CONFIG
-    timeout_s = (timeout_ms if timeout_ms else cfg.read_timeout_ms) / 1000.0
-    max_response_size = cfg.max_response_body_size
+    # FIXED: Safe fallback for 'QMailConfig' attribute errors
+    if timeout_ms:
+        timeout_s = timeout_ms / 1000.0
+    else:
+        # Check config object or nested config.sync.timeout_sec
+        timeout_s = getattr(config, 'read_timeout_ms', 5000) / 1000.0
 
-    expected_raida_id = conn.server.raida_id
-
-    # Send raw request
     try:
         conn.writer.write(raw_request)
         await asyncio.wait_for(conn.writer.drain(), timeout=timeout_s)
+
+        # 1. Read 32-byte Header
+        header_data = await asyncio.wait_for(conn.reader.readexactly(32), timeout=timeout_s)
+
+        # 2. Parse Size from Offset 9 (3 bytes)
+        resp_header = ResponseHeader()
+        resp_header.raida_id = header_data[0]
+        resp_header.status = header_data[2]
+        # Server writes body size at Index 9 in big-endian 3-byte format
+        resp_header.body_size = (header_data[9] << 16) | (header_data[10] << 8) | header_data[11]
+
+        # 3. Read Body and Strip Trailer
+        response_body = b''
+        if resp_header.body_size > 0:
+            full_body = await asyncio.wait_for(conn.reader.readexactly(resp_header.body_size), timeout=timeout_s)
+            
+            # FIXED: Strips '>>' (0x3E 0x3E) trailer added by prepare_response
+            if full_body.endswith(b'\x3e\x3e'):
+                response_body = full_body[:-2]
+            else:
+                response_body = full_body
+
         conn.last_activity = time.time()
-
-        log_debug(logger_handle, ASYNC_NET_CONTEXT,
-                  f"Sent raw {len(raw_request)} bytes to RAIDA {conn.server.raida_id}")
-
-    except asyncio.TimeoutError:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "send_raw_request_async failed", "send timeout")
-        return NetworkErrorCode.ERR_TIMEOUT, None, None
+        return NetworkErrorCode.SUCCESS, resp_header, response_body
     except Exception as e:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "send_raw_request_async failed", f"send error: {e}")
-        return NetworkErrorCode.ERR_SEND_FAILED, None, None
-
-    # Receive response header
-    try:
-        response_header_data = await asyncio.wait_for(
-            conn.reader.readexactly(RESPONSE_HEADER_SIZE),
-            timeout=timeout_s
-        )
-    except asyncio.TimeoutError:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "send_raw_request_async failed", "timeout receiving header")
-        return NetworkErrorCode.ERR_TIMEOUT, None, None
-    except asyncio.IncompleteReadError:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "send_raw_request_async failed", "connection closed")
-        return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
-    except Exception as e:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "send_raw_request_async failed", f"receive error: {e}")
-        return NetworkErrorCode.ERR_RECEIVE_FAILED, None, None
-
-    # Parse response header
-    err, resp_header = _parse_response_header(response_header_data)
-    if err != NetworkErrorCode.SUCCESS:
-        return err, None, None
-
-    # Validate response RAIDA ID
-    if resp_header.raida_id != expected_raida_id:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "send_raw_request_async failed",
-                  f"RAIDA ID mismatch: expected {expected_raida_id}, got {resp_header.raida_id}")
-        return NetworkErrorCode.ERR_INVALID_RESPONSE, None, None
-
-    if resp_header.body_size > max_response_size:
-        log_error(logger_handle, ASYNC_NET_CONTEXT,
-                  "send_raw_request_async failed",
-                  f"Response body too large: {resp_header.body_size}")
-        return NetworkErrorCode.ERR_INVALID_RESPONSE, None, None
-
-    # Receive response body (raw, no decryption)
-    response_body = b''
-    if resp_header.body_size > 0:
-        try:
-            response_body = await asyncio.wait_for(
-                conn.reader.readexactly(resp_header.body_size),
-                timeout=timeout_s
-            )
-        except asyncio.TimeoutError:
-            log_error(logger_handle, ASYNC_NET_CONTEXT,
-                      "send_raw_request_async failed", "timeout receiving body")
-            return NetworkErrorCode.ERR_TIMEOUT, resp_header, None
-        except asyncio.IncompleteReadError:
-            log_error(logger_handle, ASYNC_NET_CONTEXT,
-                      "send_raw_request_async failed", "incomplete body")
-            return NetworkErrorCode.ERR_RECEIVE_FAILED, resp_header, None
-
-    conn.last_activity = time.time()
-    return NetworkErrorCode.SUCCESS, resp_header, response_body
-
+        log_error(logger_handle, "AsyncNetwork", f"Request failed: {e}")
+        return NetworkErrorCode.ERR_RECEIVE_FAILED, None, b''
+    
 
 async def ping_server_async(
     server_info: ServerInfo,

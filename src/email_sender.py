@@ -603,28 +603,24 @@ def upload_stripe_to_server(
     logger_handle: Optional[object] = None
 ) -> UploadResult:
     """
-    Upload a single stripe with Adaptive Idempotency.
-    
-    Decision Flow :
-    1. Attempt with REAL code. 
-    2. If Timeout: Attempt with ZERO code (Free Write-over).
-       - If SUCCESS: First attempt actually worked; we are done.
-       - If PAYMENT_REQUIRED: Server never saw first attempt; try REAL again.
+    Upload a single stripe with Adaptive Idempotency and Plaintext Support.
+    FIXED: Uses build_complete_upload_request + send_raw_request to avoid Double Header bug.
     """
-    from network import connect_to_server, send_stripe, disconnect, ServerInfo, NetworkErrorCode, StatusCode
+    from .network import connect_to_server, send_raw_request, disconnect, ServerInfo, NetworkErrorCode, StatusCode
+    from .protocol import build_complete_upload_request
     
     result = UploadResult()
     result.server_id = str(server_id)
     result.stripe_index = stripe_index
-    start_time = time.time()
 
-    # AN Slicing (Same as before)
+    # 1. AN Slicing (Ensure the server gets its specific 16-byte slice)
     hex_an = getattr(identity, 'authenticity_number', '')
     if len(hex_an) == 800:
         start_hex = server_id * 32
         target_hex = hex_an[start_hex : start_hex + 32]
         _, target_an, _ = _safe_hex_to_bytes(target_hex, 16, f"an_raida{server_id}", logger_handle)
     else:
+        # Fallback for single key
         _, target_an, _ = _safe_hex_to_bytes(hex_an, 16, "authenticity_number", logger_handle)
 
     # --- ADAPTIVE RETRY STATE ---
@@ -633,61 +629,66 @@ def upload_stripe_to_server(
 
     for attempt in range(MAX_RETRIES):
         try:
-            s_info = ServerInfo(host=server_address, port=server_port, raida_id=server_id)
-            err_conn, conn = connect_to_server(
-                s_info, encryption_key=target_an, 
-                denomination=identity.denomination, 
-                serial_number=identity.serial_number,
-                logger_handle=logger_handle
+            
+            # 2. Build the request manually (Forcing Type 0 for Plaintext testing)
+            # This solves the Double Header bug by creating the binary packet here.
+            err_proto, request_bytes, challenge, nonce = build_complete_upload_request(
+            raida_id=server_id,
+            denomination=identity.denomination,
+            serial_number=identity.serial_number,
+            device_id=identity.device_id,
+            an=target_an,
+            file_group_guid=file_group_guid,
+            locker_code=current_locker_code,  # FIXED
+            storage_duration=storage_duration,
+            stripe_data=stripe_data,  # FIXED: moved after storage_duration
+            encryption_type=0,
+            logger_handle=logger_handle
             )
+           
+            if err_proto != 0:
+                result.error_message = "Protocol Build Error"
+                return result
+
+            # 3. Connect and Send Raw
+            s_info = ServerInfo(host=server_address, port=server_port, raida_id=server_id)
+            err_conn, conn = connect_to_server(s_info, logger_handle=logger_handle)
 
             if err_conn != NetworkErrorCode.SUCCESS or not conn:
                 continue # Retry connection
 
-            # Execute CMD_UPLOAD
-            err_send, status_code = send_stripe(
-                connection=conn,
-                stripe_data=stripe_data,
-                file_guid=file_group_guid,
-                locker_code=current_locker_code,
-                storage_duration=storage_duration,
-                denomination=identity.denomination,
-                serial_number=identity.serial_number,
-                device_id=identity.device_id,
-                logger_handle=logger_handle
-            )
+            # FIXED: Using send_raw_request ensures we don't add a second header
+            net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
+            status_code = resp.status if resp else 0
             disconnect(conn)
 
             # --- SUCCESS CASE ---
-            if err_send == NetworkErrorCode.SUCCESS and status_code == StatusCode.STATUS_SUCCESS:
+            if net_err == NetworkErrorCode.SUCCESS and status_code == 250:
                 result.success = True
                 result.status_code = status_code
                 return result
 
-            # --- THE AMBIGUITY RESOLVER ---
-            if err_send in [NetworkErrorCode.ERR_TIMEOUT, NetworkErrorCode.ERR_SEND_FAILED]:
-                # Step 1: We timed out. Next attempt, try the Zero-Code logic.
+            # --- AMBIGUITY RESOLVER (Idempotency) ---
+            if net_err in [NetworkErrorCode.ERR_TIMEOUT, NetworkErrorCode.ERR_SEND_FAILED]:
                 log_warning(logger_handle, SENDER_CONTEXT, 
-                            f"Timeout on RAIDA {server_id}. Testing if server already has file via Zero-Code.")
+                            f"Timeout on RAIDA {server_id}. Testing if server has file via Zero-Code.")
+                # Next attempt will use 8 null bytes for locker_code
                 current_locker_code = bytes(8)
                 last_was_timeout = True
                 continue
 
-            # Step 2: Handle results of the Zero-Code check
-            if last_was_timeout and status_code == StatusCode.ERROR_PAYMENT_REQUIRED:
-                # If zeros failed with payment error, it means file doesn't exist on server.
-                # We revert to REAL code to try the first upload properly.
+            if last_was_timeout and status_code == 166: # 166 = Payment Required
                 log_info(logger_handle, SENDER_CONTEXT, 
-                         f"Zero-Code test for {server_id} failed. File doesn't exist. Re-uploading with real code.")
+                         f"Zero-Code check failed on {server_id}. Re-uploading with real code.")
                 current_locker_code = locker_code
                 last_was_timeout = False
                 continue
 
         except Exception as e:
-            log_error(logger_handle, SENDER_CONTEXT, f"RAIDA {server_id} Attempt {attempt} crashed", str(e))
+            log_error(logger_handle, SENDER_CONTEXT, f"RAIDA {server_id} crash", str(e))
 
     result.success = False
-    result.error_message = "Max retries reached: Adaptive idempotency check failed."
+    result.error_message = "Max retries reached."
     return result
 
 def upload_file_to_servers(
@@ -728,9 +729,10 @@ def upload_file_to_servers(
     def upload_single(args):
         stripe_idx, stripe_data, server = args
         return upload_stripe_to_server(
-            server_address=server.get('address', server.get('host', 'localhost')),
-            server_port=server.get('port', 443),
-            server_id=server.get('index', server.get('server_id', stripe_idx)),
+            # FIXED: Use getattr instead of .get() for ServerConfig compatibility
+            server_address=getattr(server, 'address', getattr(server, 'host', 'localhost')),
+            server_port=getattr(server, 'port', 50000 + stripe_idx),
+            server_id=getattr(server, 'index', getattr(server, 'server_id', stripe_idx)),
             stripe_data=stripe_data,
             stripe_index=stripe_idx,
             identity=identity,
@@ -1137,6 +1139,7 @@ def send_tell_notifications(
 
     return ErrorCode.SUCCESS
 
+
 def _send_single_tell(
     raida_id: int,
     beacon_id: str,
@@ -1149,61 +1152,54 @@ def _send_single_tell(
     logger_handle: Optional[object] = None
 ) -> ErrorCode:
     """
-    Send a single Tell request to a beacon server.
-    FIXED: Unpacks 4 values (err, request, challenge, nonce) to match protocol.py.
+    Deliver Tell notification with TCP-to-UDP fallback.
+    FIXED: Uses send_raw_request (TCP) or _send_udp_request (UDP).
     """
-    try:
-        # Build Tell request - UPDATED UNPACKING
-        err, request_bytes, challenge, nonce = build_complete_tell_request(
-            raida_id=raida_id,
-            denomination=identity.denomination if hasattr(identity, 'denomination') else 1,
-            serial_number=identity.serial_number if hasattr(identity, 'serial_number') else 0,
-            device_id=0,
-            an=identity.an if hasattr(identity, 'an') else bytes(16),
-            file_group_guid=file_group_guid,
-            locker_code=locker_code,
-            timestamp=timestamp,
-            tell_type=TELL_TYPE_QMAIL,
-            recipients=[recipient],
-            servers=servers,
-            logger_handle=logger_handle
-        )
+    from .network import ServerInfo, connect_to_server, send_raw_request, disconnect, NetworkErrorCode
+    from .protocol import build_complete_tell_request, TELL_TYPE_QMAIL, validate_tell_response
+    
+    # 1. Build the request
+    # Unpacks 4 values to match your latest protocol.py structure.
+    err, request_bytes, challenge, nonce = build_complete_tell_request(
+        raida_id=raida_id,
+        denomination=getattr(identity, 'denomination', 1),
+        serial_number=getattr(identity, 'serial_number', 0),
+        device_id=0,
+        an=getattr(identity, 'an', bytes(16)),
+        file_group_guid=file_group_guid,
+        locker_code=locker_code,
+        timestamp=timestamp,
+        tell_type=TELL_TYPE_QMAIL,
+        recipients=[recipient],
+        servers=servers,
+        logger_handle=logger_handle
+    )
 
-        if err != ProtocolErrorCode.SUCCESS:
-            log_error(logger_handle, SENDER_CONTEXT,
-                      f"Failed to build Tell request", f"error={err}")
-            return ErrorCode.ERR_INVALID_PARAM
+    # 2. Try TCP Port 50000+
+    host = f"{beacon_id}.cloudcoin.global"
+    s_info = ServerInfo(host=host, port=50000 + raida_id, raida_id=raida_id)
+    err_conn, conn = connect_to_server(s_info, logger_handle=logger_handle)
+    
+    if err_conn == NetworkErrorCode.SUCCESS and conn:
+        try:
+            # net_err 0 = SUCCESS
+            net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
+            if net_err == NetworkErrorCode.SUCCESS and resp.status == 250:
+                return ErrorCode.SUCCESS
+        finally:
+            disconnect(conn)
 
-        # Get beacon server address
-        beacon_ip, beacon_port = _get_beacon_address(beacon_id)
-        if not beacon_ip:
-            log_error(logger_handle, SENDER_CONTEXT,
-                      f"Unknown beacon server: {beacon_id}")
-            return ErrorCode.ERR_NOT_FOUND
+    # 3. FALLBACK: UDP Port 19000
+    # If TCP times out, the beacon likely only accepts UDP notifications.
+    log_info(logger_handle, "EmailSender", f"TCP failed, trying UDP for {beacon_id}")
+    response = _send_udp_request(host, 19000, request_bytes, logger_handle)
+    if response:
+        # validate_tell_response checks the echo and status
+        _, status, _ = validate_tell_response(response, challenge, logger_handle)
+        if status == 250:
+            return ErrorCode.SUCCESS
 
-        # Send request
-        response = _send_udp_request(beacon_ip, beacon_port, request_bytes, logger_handle)
-        if response is None:
-            return ErrorCode.ERR_NETWORK
-
-        # Validate response
-        err, status_code, error_msg = validate_tell_response(response, challenge, logger_handle)
-        if err != ProtocolErrorCode.SUCCESS:
-            log_warning(logger_handle, SENDER_CONTEXT,
-                        f"Tell response validation failed: {error_msg}")
-            return ErrorCode.ERR_NETWORK
-
-        if status_code != 250:  # Not success
-            log_warning(logger_handle, SENDER_CONTEXT,
-                        f"Tell returned status {status_code}: {error_msg}")
-            return ErrorCode.ERR_NETWORK
-
-        return ErrorCode.SUCCESS
-
-    except Exception as e:
-        log_error(logger_handle, SENDER_CONTEXT,
-                  f"Exception in _send_single_tell", str(e))
-        return ErrorCode.ERR_NETWORK
+    return ErrorCode.ERR_NETWORK
 
 def _send_udp_request(
     ip: str,
