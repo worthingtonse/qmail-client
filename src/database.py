@@ -319,6 +319,19 @@ CREATE TABLE IF NOT EXISTS PendingTells (
     Status TEXT DEFAULT 'pending'
 );
 
+CREATE TABLE IF NOT EXISTS sent_emails (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_guid TEXT UNIQUE,
+    subject TEXT,
+    recipients TEXT,
+    body_preview TEXT,
+    timestamp INTEGER,
+    stripe_count INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sent_timestamp ON sent_emails(timestamp);
+
 -- Table for incoming email metadata (from .tell files)
 CREATE TABLE IF NOT EXISTS received_tells (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2061,36 +2074,59 @@ def list_emails(
     try:
         cursor = handle.connection.cursor()
 
-        query = """
-            SELECT EmailID, Subject, ReceivedTimestamp, SentTimestamp,
-                   is_read, is_starred, is_trashed, folder
-            FROM Emails
-            WHERE folder = ? AND (is_trashed = 0 OR is_trashed = ?)
-            ORDER BY ReceivedTimestamp DESC
-            LIMIT ? OFFSET ?
-        """
-
-        cursor.execute(query, (folder, int(include_trashed), limit, offset))
-        rows = cursor.fetchall()
-
-        # Convert to list of dicts
-        columns = ['EmailID', 'Subject', 'ReceivedTimestamp', 'SentTimestamp',
-                   'is_read', 'is_starred', 'is_trashed', 'folder']
-        emails = []
-        for row in rows:
-            email = dict(zip(columns, row))
-            # Convert boolean flags
-            email['is_read'] = bool(email['is_read'])
-            email['is_starred'] = bool(email['is_starred'])
-            email['is_trashed'] = bool(email['is_trashed'])
-            emails.append(email)
+        # Query received_tells table for inbox
+        if folder == 'inbox':
+            query = """
+                SELECT file_guid, tell_type, created_at, download_status
+                FROM received_tells
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            """
+            cursor.execute(query, (limit, offset))
+            rows = cursor.fetchall()
+            
+            emails = []
+            for row in rows:
+                file_guid, tell_type, created_at, download_status = row
+                emails.append({
+                    'EmailID': file_guid,
+                    'Subject': f'Email {file_guid[:8]}...',
+                    'ReceivedTimestamp': created_at,
+                    'SentTimestamp': created_at,
+                    'is_read': download_status == 1,
+                    'is_starred': False,
+                    'is_trashed': False,
+                    'folder': 'inbox'
+                })
+        else:
+            # For other folders (sent/drafts/trash), query Emails table
+            query = """
+                SELECT EmailID, Subject, ReceivedTimestamp, SentTimestamp,
+                       is_read, is_starred, is_trashed, folder
+                FROM Emails
+                WHERE folder = ? AND (is_trashed = 0 OR is_trashed = ?)
+                ORDER BY ReceivedTimestamp DESC
+                LIMIT ? OFFSET ?
+            """
+            cursor.execute(query, (folder, int(include_trashed), limit, offset))
+            rows = cursor.fetchall()
+            
+            columns = ['EmailID', 'Subject', 'ReceivedTimestamp', 'SentTimestamp',
+                       'is_read', 'is_starred', 'is_trashed', 'folder']
+            emails = []
+            for row in rows:
+                email = dict(zip(columns, row))
+                email['is_read'] = bool(email['is_read'])
+                email['is_starred'] = bool(email['is_starred'])
+                email['is_trashed'] = bool(email['is_trashed'])
+                emails.append(email)
 
         log_debug(handle.logger, DB_CONTEXT, f"Listed {len(emails)} emails from folder '{folder}'")
         return DatabaseErrorCode.SUCCESS, emails
 
-    except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to list emails", str(e))
-        return DatabaseErrorCode.ERR_QUERY_FAILED, []
+    except Exception as e:
+        log_debug(handle.logger, DB_CONTEXT, f"Error listing emails: {e}")
+        return DatabaseErrorCode.ERR_INTERNAL, []
 
 
 def list_drafts(
@@ -3186,82 +3222,46 @@ def get_pending_download_count(handle: DatabaseHandle) -> Tuple[DatabaseErrorCod
 # SENT EMAIL FUNCTIONS (for email_sender module)
 # ============================================================================
 
-def store_sent_email(
-    handle: DatabaseHandle,
-    file_group_guid: bytes,
+def store_sent_email_metadata(
+    db_handle,
+    file_guid: str,
     subject: str,
+    recipients: str,
     body: str,
-    raw_content: bytes,
-    searchable_text: str,
-    sender_id: int = None,
-    recipient_ids: List[Tuple[int, str]] = None,
-    storage_duration: int = 2
+    timestamp: int,
+    stripe_count: int
 ) -> DatabaseErrorCode:
     """
-    Store a sent email in the database.
-
-    Args:
-        handle: Database handle
-        file_group_guid: 16-byte file group GUID (used as EmailID)
-        subject: Email subject
-        body: Email body text
-        raw_content: Raw CBDF content
-        searchable_text: Plain text for FTS indexing
-        sender_id: Sender's user ID (optional)
-        recipient_ids: List of (user_id, type) tuples where type is 'TO', 'CC', or 'BC'
-        storage_duration: Storage duration code (0-5 or 255)
-
-    Returns:
-        DatabaseErrorCode
-
-    C signature: DatabaseErrorCode store_sent_email(DatabaseHandle* handle, const uint8_t* guid,
-                                                      const char* subject, const char* body, ...);
+    Store sent email metadata in Mailbox/Sent folder (file-based, not DB).
     """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM
-
-    if file_group_guid is None or len(file_group_guid) != 16:
-        return DatabaseErrorCode.ERR_INVALID_PARAM
-
+    import json
+    
     try:
-        cursor = handle.connection.cursor()
-        now = datetime.now().isoformat()
-
-        # Insert into Emails table
-        cursor.execute("""
-            INSERT OR REPLACE INTO Emails
-            (EmailID, Subject, Body, SentTimestamp, folder, is_read, is_starred, is_trashed)
-            VALUES (?, ?, ?, ?, 'sent', 1, 0, 0)
-        """, (file_group_guid, subject, body, now))
-
-        # Update FTS index
-        cursor.execute("""
-            INSERT OR REPLACE INTO Emails_FTS(rowid, Subject, Body)
-            SELECT rowid, Subject, Body FROM Emails WHERE EmailID = ?
-        """, (file_group_guid,))
-
-        # Link sender
-        if sender_id:
-            cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, UserID, user_type)
-                VALUES (?, ?, 'FROM')
-            """, (file_group_guid, sender_id))
-
-        # Link recipients
-        for user_id, user_type in (recipient_ids or []):
-            cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, UserID, user_type)
-                VALUES (?, ?, ?)
-            """, (file_group_guid, user_id, user_type))
-
-        handle.connection.commit()
-        log_info(handle.logger, DB_CONTEXT, f"Stored sent email: {file_group_guid.hex()}")
+        # Create Sent folder
+        sent_folder = "Data/Wallets/Mailbox/Sent"
+        os.makedirs(sent_folder, exist_ok=True)
+        
+        # Create metadata
+        metadata = {
+            "file_guid": file_guid,
+            "subject": subject,
+            "recipients": recipients.split(',') if recipients else [],
+            "body_preview": body[:200] if body else "",
+            "timestamp": timestamp,
+            "stripe_count": stripe_count
+        }
+        
+        # Save as JSON file
+        metadata_file = os.path.join(sent_folder, f"{file_guid}.json")
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
         return DatabaseErrorCode.SUCCESS
+        
+    except Exception as e:
+        print(f"[ERROR] [DatabaseMod] Failed to store sent email: {e}")
+        return DatabaseErrorCode.ERR_IO_ERROR
 
-    except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to store sent email", str(e))
-        handle.connection.rollback()
-        return DatabaseErrorCode.ERR_QUERY_FAILED
 
 
 def store_stripe_locations(
@@ -3842,6 +3842,33 @@ def delete_email_locally(handle, file_guid):
     cursor.execute("DELETE FROM received_tells WHERE file_guid = ?", (file_guid,))
     handle.connection.commit()
     return DatabaseErrorCode.SUCCESS
+
+def store_sent_email_metadata(
+    db_handle,
+    file_guid: str,
+    subject: str,
+    recipients: str,
+    body: str,
+    timestamp: int,
+    stripe_count: int
+) -> DatabaseErrorCode:
+    """Store sent email metadata."""
+    try:
+        cursor = db_handle.cursor()
+        
+        cursor.execute("""
+            INSERT INTO sent_emails 
+            (file_guid, subject, recipients, body_preview, timestamp, stripe_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (file_guid, subject, recipients, body, timestamp, stripe_count))
+        
+        db_handle.commit()
+        return DatabaseErrorCode.SUCCESS
+        
+    except sqlite3.Error as e:
+        logger_log_error(None, "DatabaseMod",
+                        f"Failed to store sent email: {e}")
+        return DatabaseErrorCode.ERR_QUERY_FAILED
 
 
 # ============================================================================

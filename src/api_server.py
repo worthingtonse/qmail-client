@@ -178,6 +178,68 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         
         # Fallback
         return 'http://localhost:5173'
+    
+
+    def _parse_multipart(self, body, content_type):
+     """Parse multipart/form-data without cgi module."""
+     import re
+    
+    # Extract boundary from content-type
+     boundary_match = re.search(r'boundary=([^;]+)', content_type)
+     if not boundary_match:
+        return {}, {}
+    
+     boundary = boundary_match.group(1).strip('"')
+     boundary_bytes = ('--' + boundary).encode()
+    
+     files = {}
+     data = {}
+    
+    # Split by boundary
+     parts = body.split(boundary_bytes)
+    
+     for part in parts[1:-1]:  # Skip first empty and last closing boundary
+        if not part.strip():
+            continue
+        
+        # Split headers and content
+        header_end = part.find(b'\r\n\r\n')
+        if header_end == -1:
+            continue
+        
+        headers = part[:header_end].decode('utf-8', errors='ignore')
+        content = part[header_end + 4:]
+        
+        # Remove trailing \r\n
+        if content.endswith(b'\r\n'):
+            content = content[:-2]
+        
+        # Parse Content-Disposition header
+        disp_match = re.search(r'Content-Disposition: form-data; name="([^"]+)"', headers)
+        if not disp_match:
+            continue
+        
+        field_name = disp_match.group(1)
+        
+        # Check if it's a file
+        filename_match = re.search(r'filename="([^"]+)"', headers)
+        
+        if filename_match:
+            # It's a file
+            filename = filename_match.group(1)
+            content_type_match = re.search(r'Content-Type: ([^\r\n]+)', headers)
+            file_content_type = content_type_match.group(1) if content_type_match else 'application/octet-stream'
+            
+            files[field_name] = {
+                'filename': filename,
+                'content_type': file_content_type,
+                'data': content
+            }
+        else:
+            # It's regular form data
+            data[field_name] = content.decode('utf-8', errors='ignore')
+    
+     return files, data
         
     def _dispatch(self):
         """
@@ -220,7 +282,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     client_address=self.client_address
                 )
                 if 'application/json' in self.headers.get('Content-Type', ''):
-                    context.json = json.loads(body) if body else None
+                     context.json = json.loads(body) if body else None
+                elif 'multipart/form-data' in self.headers.get('Content-Type', ''):
+                      context.files, context.form_data = self._parse_multipart(body, self.headers.get('Content-Type'))
 
                 # Call the handler with the context
                 matched_route["handler"](self, context)

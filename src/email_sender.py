@@ -25,6 +25,8 @@ Functions:
 import os
 import uuid
 import time
+import struct
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple ,Any
 from dataclasses import dataclass, field
@@ -43,6 +45,212 @@ from database import store_sent_email
 from payment import calculate_storage_cost, request_locker_code
 from logger import log_info, log_error, log_warning, log_debug
 from config import get_raida_server_config
+
+
+from typing import Optional, List, Tuple
+import os
+import struct
+
+
+def load_coin_from_file(file_path: str) -> Optional[object]:
+    """Load a CloudCoin from .bin file."""
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+
+        # Minimum size for format type 9
+        if len(data) < 407:
+            return None
+
+        # Parse header
+        format_type = data[0]
+        if format_type != 0x09:
+            return None
+
+        coin_id = struct.unpack('>H', data[2:4])[0]
+
+        # Parse body (starts at byte 32)
+        body = data[32:]
+        denomination = body[2]
+        serial_number = struct.unpack('>I', body[3:7])[0]
+
+        # Parse 25 ANs (16 bytes each)
+        ans = []
+        for i in range(25):
+            offset = 7 + (i * 16)
+            an = body[offset:offset + 16]
+            ans.append(an)
+
+        # Create coin object
+        coin = type(
+            'Coin',
+            (),
+            {
+                'denomination': denomination,
+                'sn': serial_number,
+                'ans': ans,
+                'file_path': file_path
+            }
+        )()
+
+        return coin
+
+    except Exception:
+        return None
+
+
+def get_coins_by_value(wallet_path: str, target_value: float) -> List:
+    """
+    Get coins from wallet that total the target value.
+    Returns list of coin objects.
+    """
+    from coin_scanner import parse_denomination_code
+
+    bank_path = os.path.join(wallet_path, "Bank")
+
+    if not os.path.exists(bank_path):
+        return []
+
+    exact_match_coins = []
+    all_coins = []
+
+    for filename in os.listdir(bank_path):
+        if not filename.endswith('.bin'):
+            continue
+
+        file_path = os.path.join(bank_path, filename)
+        coin = load_coin_from_file(file_path)
+
+        if coin is None:
+            continue
+
+        coin_value = parse_denomination_code(coin.denomination)
+        all_coins.append((coin, coin_value))
+
+        if abs(coin_value - target_value) < 0.0001:
+            exact_match_coins.append(coin)
+
+    # If exact match exists, return one
+    if exact_match_coins:
+        return [exact_match_coins[0]]
+
+    # Otherwise, find smallest coin larger than target
+    larger_coins = [(c, v) for c, v in all_coins if v > target_value]
+
+    if larger_coins:
+        larger_coins.sort(key=lambda x: x[1])
+        return [larger_coins[0][0]]
+
+    return []
+
+
+async def create_recipient_locker(
+    wallet_path: str,
+    amount: float,
+    logger_handle
+) -> Tuple[int, Optional[str]]:
+    """
+    Create a locker with coins for recipient payment.
+
+    Returns:
+        (error_code, locker_code_hex_16bytes)
+        error_code: 0=success, 1=insufficient funds, 2=network error
+    """
+    from locker_put import put_to_locker, CoinForPut, PutResult
+    from key_manager import get_keys_from_locker_code
+    from coin_break import break_coin
+    from coin_scanner import parse_denomination_code
+    import secrets
+    import string
+
+    try:
+        # 1. Get coins from wallet
+        coins = get_coins_by_value(wallet_path, amount)
+
+        if not coins:
+            log_warning(
+                logger_handle,
+                "LockerCreate",
+                f"No coins available for amount {amount}"
+            )
+            return 1, None
+
+        coin = coins[0]
+        coin_value = parse_denomination_code(coin.denomination)
+
+        # 2. Break coin if needed
+        if abs(coin_value - amount) < 0.0001:
+            final_coins = [coin]
+        else:
+            log_info(
+                logger_handle,
+                "LockerCreate",
+                f"Breaking coin {coin_value} to get {amount}"
+            )
+
+            broken_coins = await break_coin(coin, amount)
+
+            if not broken_coins:
+                log_error(
+                    logger_handle,
+                    "LockerCreate",
+                    "Failed to break coin"
+                )
+                return 2, None
+
+            final_coins = [broken_coins[0]]
+
+            # Remaining coins should already be returned to bank by coin_break
+            # (no-op here)
+
+        # 3. Generate random 8-char locker code
+        locker_code = ''.join(
+            secrets.choice(string.ascii_uppercase + string.digits)
+            for _ in range(8)
+        )
+
+        # 4. Get 25 locker keys from code
+        locker_keys_25 = get_keys_from_locker_code(locker_code)
+
+        # 5. Prepare coins for PUT
+        coins_for_put = [
+            CoinForPut(
+                denomination=c.denomination,
+                serial_number=c.sn,
+                ans=c.ans
+            )
+            for c in final_coins
+        ]
+
+        # 6. Lock coins on RAIDA
+        result, details = await put_to_locker(coins_for_put, locker_keys_25)
+
+        if result != PutResult.SUCCESS:
+            log_error(
+                logger_handle,
+                "LockerCreate",
+                f"PUT failed: {result}"
+            )
+            return 2, None
+
+        # 7. Delete original coin from bank
+        try:
+            os.remove(coin.file_path)
+        except Exception:
+            pass
+
+        # 8. Return locker code as 16-byte hex
+        locker_key_16 = locker_code.encode('ascii').ljust(16, b'\x00')
+        return 0, locker_key_16.hex()
+
+    except Exception as e:
+        log_error(
+            logger_handle,
+            "LockerCreate",
+            f"Exception creating locker: {e}"
+        )
+        return 2, None
+
 
 import json
 import socket
@@ -790,7 +998,8 @@ def send_email_async(
     servers: List[Dict],
     thread_pool: Optional[ThreadPoolExecutor] = None,
     task_callback: Optional[callable] = None,
-    logger_handle: Optional[object] = None
+    logger_handle: Optional[object] = None,
+    cc_handle: object = None 
 ) -> Tuple[SendEmailErrorCode, SendEmailResult]:
     """
     Send an email asynchronously.
@@ -948,7 +1157,7 @@ def send_email_async(
         send_tell_notifications(
             request=request, file_group_guid=state.file_group_guid,
             servers=servers, identity=identity, logger_handle=logger_handle,
-            db_handle=db_handle, locker_code=state.locker_code,
+            db_handle=db_handle, cc_handle=cc_handle, locker_code=state.locker_code,
             upload_results=result.upload_results
         )
 
@@ -1062,21 +1271,39 @@ def send_tell_notifications(
             recipient_beacons[address] = (user['beacon_id'], r_type, recipient)
 
     # Get locker keys for all recipients
+   # Get locker keys for all recipients (per-recipient fees)
+    # Get locker keys for all recipients (create actual lockers)
     locker_keys = []
-    if cc_handle:
-        # Use 0.1 denomination for Tell keys (small value)
-        err, keys = get_locker_keys(cc_handle, 0.1, recipient_count)
-        if err == CloudCoinErrorCode.SUCCESS or err == CloudCoinErrorCode.WARN_PARTIAL_SUCCESS:
-            locker_keys = keys
+    
+    wallet_path = "Data/Wallets/Default"
+    
+    for address, (beacon_id, r_type, recipient) in recipient_beacons.items():
+        # Look up recipient's sending fee
+        err, user = get_user_by_address(db_handle, address)
+        if err == DatabaseErrorCode.SUCCESS and user and user.get('sending_fee'):
+            try:
+                fee = float(user['sending_fee'])
+            except (ValueError, TypeError):
+                fee = 0.1
         else:
+            fee = 0.1
+        
+        # Create locker with actual coins
+        import asyncio
+        err_code, locker_hex = asyncio.run(create_recipient_locker(
+            wallet_path, fee, logger_handle
+        ))
+        
+        if err_code == 0 and locker_hex:
+            locker_keys.append(locker_hex)
+            log_info(logger_handle, SENDER_CONTEXT,
+                    f"Created locker for {address} with fee {fee}")
+        else:
+            # Failed - use placeholder
+            locker_keys.append(os.urandom(16).hex())
             log_warning(logger_handle, SENDER_CONTEXT,
-                        f"Could not get locker keys: {err}")
-
-    # Pad locker_keys if we didn't get enough
-    while len(locker_keys) < recipient_count:
-        # Generate random placeholder key (will fail payment but Tell still sent)
-        locker_keys.append(os.urandom(16).hex())
-
+                       f"Failed to create locker for {address}, using placeholder")
+            
     # Build server list from upload results with locker_code for decryption
     tell_servers = _build_tell_servers(upload_results, servers, locker_code, logger_handle)
 
@@ -1547,33 +1774,47 @@ def store_sent_email(
     logger_handle: Optional[object] = None
 ) -> ErrorCode:
     """
-    Store sent email in local database.
-
-    STUB: This function stores email metadata and stripe locations
-    in the local database for tracking sent emails.
-
-    Args:
-        request: SendEmailRequest with email data
-        file_group_guid: The file group GUID for this email
-        upload_results: List of upload results with server locations
-        db_handle: Database handle
-        logger_handle: Optional logger handle
-
-    Returns:
-        ErrorCode
+    Store sent email metadata in Mailbox/Sent folder.
     """
-    log_warning(logger_handle, SENDER_CONTEXT,
-                f"store_sent_email: STUB - Would store email with "
-                f"file_group_guid={file_group_guid.hex()}, "
-                f"{len(upload_results)} stripe locations")
+    import json
+    import time
+    
+    try:
+        # Create Sent folder if doesn't exist
+        sent_folder = "Data/Wallets/Mailbox/Sent"
+        os.makedirs(sent_folder, exist_ok=True)
+        
+        # Extract recipients
+        recipients = []
+        for r in request.to_recipients:
+            recipients.append(r.address if hasattr(r, 'address') else str(r))
+        
+        # Create metadata
+        metadata = {
+            "file_guid": file_group_guid.hex(),
+            "subject": request.subject,
+            "to": recipients,
+            "body_preview": request.searchable_text[:200] if request.searchable_text else "",
+            "timestamp": int(time.time()),
+            "stripe_count": len(upload_results) if upload_results else 0
+        }
+        
+        # Save as JSON file
+        metadata_file = os.path.join(sent_folder, f"{file_group_guid.hex()}.json")
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        log_info(logger_handle, SENDER_CONTEXT,
+                f"Stored sent email metadata: {metadata_file}")
+        
+        return ErrorCode.SUCCESS
+        
+    except Exception as e:
+        log_error(logger_handle, SENDER_CONTEXT,
+                 f"Failed to store sent email: {e}")
+        return ErrorCode.ERR_IO
 
-    # TODO: Implement actual database storage
-    # 1. Insert into Emails table with file_group_guid as key
-    # 2. Store raw email content
-    # 3. Insert into SentAttachments table for each attachment
-    # 4. Store stripe locations for each file
 
-    return ErrorCode.SUCCESS
 
 def process_email_package(
     package: EmailPackage,

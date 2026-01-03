@@ -175,6 +175,9 @@ class ParallelResult:
 
 async def connect_async(
     server_info: ServerInfo,
+    encryption_key: bytes = None,
+    denomination: int = 1,
+    serial_number: int = 0,
     config: Optional[Any] = None,
     logger_handle: Optional[object] = None
 ) -> Tuple[NetworkErrorCode, Optional[AsyncConnection]]:

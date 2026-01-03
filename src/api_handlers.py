@@ -24,6 +24,8 @@ from src.task_manager import create_task, start_task, TaskErrorCode
 import os
 import threading
 import time
+import re
+import asyncio
 
 # Database imports for real implementations
 from src.database import (
@@ -234,10 +236,11 @@ def handle_mail_send(request_handler, context):
     def process_send():
         try:
             err, result = send_email_async(
-                request_obj, identity, app_ctx.db_handle, app_ctx.config.qmail_servers,
-                app_ctx.thread_pool.executor, 
-                lambda s: update_task_progress(app_ctx.task_manager, task_id, s.progress, s.message), 
-                app_ctx.logger
+            request_obj, identity, app_ctx.db_handle, app_ctx.config.qmail_servers,
+            app_ctx.thread_pool.executor, 
+            lambda s: update_task_progress(app_ctx.task_manager, task_id, s.progress, s.message), 
+            app_ctx.logger,
+            cc_handle=app_ctx.cc_handle  # ADD THIS LINE
             )
             
             if result.success:
@@ -358,6 +361,39 @@ def handle_mail_download(request_handler, context):
 
 #     raise ValueError("Authenticity Number (AN) not found in beacon, config, or key file")
 
+def handle_mail_payment_download(request_handler, context, file_guid):
+    """
+    GET /api/mail/payment/{file_guid}
+    Download locker payment coins for a received email.
+    """
+    from download_handler import download_locker_payment
+    import asyncio
+    
+    app_ctx = request_handler.server_instance.app_context
+    
+    # Download locker coins
+    err_code, coins = asyncio.run(download_locker_payment(
+        app_ctx.db_handle,
+        file_guid,
+        app_ctx.logger
+    ))
+    
+    if err_code == 0:
+        request_handler.send_json_response(200, {
+            "status": "success",
+            "message": f"Downloaded {len(coins)} coins",
+            "coin_count": len(coins)
+        })
+    elif err_code == 1:
+        request_handler.send_json_response(404, {
+            "error": "Email not found",
+            "status": "error"
+        })
+    else:
+        request_handler.send_json_response(500, {
+            "error": "Payment download failed",
+            "status": "error"
+        })
 
 def _get_an_for_download(app_ctx):
     """
@@ -487,58 +523,160 @@ from src.task_manager import create_task, start_task, complete_task, fail_task #
 
 def handle_create_mailbox(request_handler, request_context):
     """
-    POST /api/mail/create-mailbox - Create new mailbox
-    FIXED: Corrected method call to send_json_response.
+    POST /api/mail/create-mailbox - Stake mailbox with coins from locker
+    
+    Accepts PNG file upload via multipart/form-data.
+    Extracts locker code from filename (e.g., "FG9-YUE3.png" → "FG9YUE3")
+    Downloads coins from RAIDA locker and stakes mailbox.
+    
+    File upload:
+        multipart/form-data with PNG file named "{LOCKER_CODE}.png"
+        Field name: "mailbox_image"
+    
+    Process:
+    1. Extract locker code from PNG filename
+    2. Download coins from RAIDA locker
+    3. Save coins to default/Bank folder
+    4. Create email address from coin serial number
+    5. Return email address to user
     """
-    # Stall-Proof body reading logic
-    request_handler.connection.settimeout(2.0)
-    data = {}
-    try:
-        content_length = int(request_handler.headers.get('Content-Length', 0))
-        if content_length > 0:
-            post_data = request_handler.rfile.read(content_length)
-            data = json.loads(post_data.decode('utf-8'))
-        else:
-            # Fallback for missing Content-Length
-            request_handler.connection.setblocking(False)
-            post_data = request_handler.connection.recv(4096)
-            if b'\r\n\r\n' in post_data:
-                post_data = post_data.split(b'\r\n\r\n')[1]
-            if post_data:
-                data = json.loads(post_data.decode('utf-8'))
-    except Exception as e:
-        print(f"[DEBUG] API Read Error: {e}")
-    finally:
-        request_handler.connection.settimeout(None)
-        request_handler.connection.setblocking(True)
-
-    locker_code = data.get("locker_code")
-    if not locker_code:
-        return request_handler.send_error(400, "Request Body Missing (No locker_code found)")
-
-    # Context Lookup
+    from locker_download import download_locker
+    from coin_scanner import parse_denomination_code
+    from logger import log_info, log_error
+    import asyncio
+    import re
+    import os
+    
     app_ctx = request_handler.server_instance.app_context
-    if not app_ctx: return request_handler.send_error(500, "AppContext Missing")
-
-    # Start work (Command 91)
-    _, task_id = create_task(app_ctx.task_manager, "stake_locker", params={"locker": locker_code})
-
-    def run_staking():
-        from src.task_manager import stake_locker_identity
-        start_task(app_ctx.task_manager, task_id, "Broadcasting Command 91...")
-        clean_code = locker_code.replace('-', '').strip().upper().encode('ascii').ljust(8, b'\x00')
+    logger = app_ctx.logger
+    
+    # Parse multipart form data
+    content_type = request_context.headers.get('Content-Type', '')
+    if 'multipart/form-data' not in content_type:
+        request_handler.send_json_response(400, {
+            "error": "Content-Type must be multipart/form-data",
+            "status": "error"
+        })
+        return
+    
+    # Get uploaded file
+    files = getattr(request_context, 'files', {})
+    
+    if 'mailbox_image' not in files:
+        request_handler.send_json_response(400, {
+            "error": "Missing mailbox_image file",
+            "details": "Upload PNG file with field name 'mailbox_image'",
+            "status": "error"
+        })
+        return
+    
+    file_info = files['mailbox_image']
+    filename = file_info.get('filename', '')
+    
+    # Validate PNG extension
+    if not filename.lower().endswith('.png'):
+        request_handler.send_json_response(400, {
+            "error": "File must be a PNG image",
+            "filename": filename,
+            "status": "error"
+        })
+        return
+    
+    # Extract locker code from filename
+    # Format: "FG9-YUE3.png" or "FG9YUE3.png" → "FG9YUE3"
+    base_name = filename[:-4]  # Remove .png
+    locker_code = base_name.replace('-', '').replace('_', '').upper()
+    
+    if len(locker_code) != 8:
+        request_handler.send_json_response(400, {
+            "error": "Invalid locker code in filename",
+            "details": f"Expected 8-character code, got '{locker_code}' ({len(locker_code)} chars)",
+            "filename": filename,
+            "status": "error"
+        })
+        return
+    
+    # Validate locker code format (alphanumeric only)
+    if not re.match(r'^[A-Z0-9]{8}$', locker_code):
+        request_handler.send_json_response(400, {
+            "error": "Invalid locker code format",
+            "details": "Locker code must be 8 alphanumeric characters",
+            "locker_code": locker_code,
+            "status": "error"
+        })
+        return
+    
+    try:
+        # Download coins from RAIDA locker
+        log_info(logger, "CreateMailbox", 
+                f"Downloading coins from locker: {locker_code}")
         
-        if stake_locker_identity(clean_code, app_ctx, logger=app_ctx.logger):
-            complete_task(app_ctx.task_manager, task_id, message="Identity Created")
-        else:
-            fail_task(app_ctx.task_manager, task_id, error="Consensus Failed")
-
-    threading.Thread(target=run_staking, name=f"Stake-{task_id[:4]}", daemon=True).start()
-
-    # Use corrected method name
-    return request_handler.send_json_response(202, {"status": "started", "task_id": task_id})
-    # 4. INSTANT RESPONSE
-    return request_handler.send_json_response(202, {"status": "started", "task_id": task_id})
+        coins = asyncio.run(download_locker(locker_code))
+        
+        if not coins or len(coins) == 0:
+            request_handler.send_json_response(404, {
+                "error": "Locker is empty or invalid",
+                "locker_code": locker_code,
+                "status": "error"
+            })
+            return
+        
+        # Create Mailbox/Bank folder
+        mailbox_folder = "Data/Wallets/Mailbox/Bank"
+        os.makedirs(mailbox_folder, exist_ok=True)
+        
+        # Save coins to Mailbox
+        saved_coins = []
+        total_value = 0.0
+        
+        for coin in coins:
+            # Generate filename: 0006{DN}{SN}.bin
+            filename = f"0006{coin.denomination:02X}{coin.sn:08X}.bin"
+            filepath = os.path.join(mailbox_folder, filename)
+            
+            # Save coin binary data
+            with open(filepath, 'wb') as f:
+                coin_data = coin.to_binary()
+                f.write(coin_data)
+            
+            coin_value = parse_denomination_code(coin.denomination)
+            total_value += coin_value
+            
+            saved_coins.append({
+                "denomination": coin.denomination,
+                "serial_number": coin.sn,
+                "value": coin_value,
+                "filename": filename
+            })
+            
+            log_info(logger, "CreateMailbox",
+                    f"Saved coin: DN={coin.denomination}, SN={coin.sn}, Value={coin_value}")
+        
+        # Generate email address from first coin
+        # Format: 0006.{denomination}.{serial_number}
+        first_coin = coins[0]
+        email_address = f"0006.{first_coin.denomination}.{first_coin.sn}"
+        
+        log_info(logger, "CreateMailbox",
+                f"Mailbox created successfully: {email_address}")
+        
+        request_handler.send_json_response(200, {
+            "status": "success",
+            "message": "Mailbox staked successfully",
+            "email_address": email_address,
+            "coins_staked": len(saved_coins),
+            "total_value": total_value,
+            "coins": saved_coins
+        })
+        
+    except Exception as e:
+        log_error(logger, "CreateMailbox", 
+                 f"Mailbox creation failed: {e}")
+        request_handler.send_json_response(500, {
+            "error": "Mailbox creation failed",
+            "details": str(e),
+            "status": "error"
+        })
 # ============================================================================
 # DATA ENDPOINTS
 # ============================================================================
@@ -2799,6 +2937,7 @@ def register_all_routes(server):
     # Mail operations
     server.register_route('POST', '/api/mail/send', handle_mail_send)
     server.register_route('GET', '/api/mail/download/{id}', handle_mail_download)
+    server.register_route('GET', '/api/mail/payment/{id}', handle_mail_payment_download)
     server.register_route('GET', '/api/mail/list', handle_mail_list)
     server.register_route('POST', '/api/mail/create-mailbox', handle_create_mailbox)
 

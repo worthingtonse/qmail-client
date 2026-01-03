@@ -1367,6 +1367,12 @@ def build_download_payload(
     """
     Build the download command payload (before encryption).
     STRICT VERSION: Includes CRC-32 preamble and AN at Offset 32.
+    
+    Matches qmail_download_req_t structure:
+    - Preamble (48 bytes): Challenge + Identity
+    - Download Request (20 bytes): GUID + file_type + version + bytes_per_page + page_number
+    - Terminator (2 bytes)
+    Total: 70 bytes
     """
     # Validate inputs
     if an is None or len(an) < 16:
@@ -1379,8 +1385,8 @@ def build_download_payload(
                   "file_group_guid must be 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
-    # Preamble (48) + Header (33) + Terminator (2) = 83 bytes
-    payload_size = 83
+    # Preamble (48) + Download Request (20) + Terminator (2) = 70 bytes
+    payload_size = 70
     payload = bytearray(payload_size)
 
     # 1. Challenge/CRC (0-15): Uses _generate_challenge for protocol.c compatibility
@@ -1389,32 +1395,26 @@ def build_download_payload(
 
     # 2. Identity Block (16-47)
     payload[16:24] = bytes(8)  # Session ID
-    struct.pack_into('>H', payload, 24, COIN_TYPE) # 0x0006
+    struct.pack_into('>H', payload, 24, COIN_TYPE)  # 0x0006
     payload[26] = denomination
     struct.pack_into('>I', payload, 27, serial_number)
     payload[31] = device_id & 0xFF
     payload[32:48] = an[:16]  # AN Proof: Offset 32 for server check
 
-    # 3. Download Header (48-80)
-    payload[48:64] = file_group_guid[:16]
-    payload[64:72] = locker_code[:8] if locker_code else bytes(8)
-    payload[72] = file_type & 0xFF
-    struct.pack_into('>I', payload, 73, page_number)
+    # 3. Download Request (48-67) - matches qmail_download_req_t
+    payload[48:64] = file_group_guid[:16]  # File GUID (48-63): 16 bytes
+    payload[64] = file_type & 0xFF          # File Type (64): 1 byte
+    payload[65] = 0x00                      # Version (65): 1 byte (always 0)
+    payload[66] = 0x00                      # Bytes Per Page (66): 1 byte (0 = use max size)
+    payload[67] = page_number & 0xFF        # Page Number (67): 1 byte
 
-    # Page Size Indicator (Offset 77-78)
-    payload[77] = 0xFF
-    payload[78] = 0xFF
-    # Reserved (79-80)
-    payload[79:81] = bytes(2)
-
-    # 4. Terminator (81-82)
-    payload[81:83] = TERMINATOR
+    # 4. Terminator (68-69)
+    payload[68:70] = TERMINATOR
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built download payload: file_type={file_type}, page={page_number}")
+              f"Built download payload: file_type={file_type}, page={page_number}, size={payload_size}")
 
     return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
-
 def decrypt_payload(
     encrypted_data: bytes,
     locker_code: bytes,

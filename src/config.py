@@ -167,8 +167,8 @@ def load_config(config_path: str) -> Optional[QMailConfig]:
     if "beacon" in data:
         b = data["beacon"]
         config.beacon = BeaconConfig(
-            url=b.get("url", "tcp://168.220.219.199:50014"),
-            server_index=b.get("server_index", 14),
+            url=b.get("url", "tcp://168.220.219.199:50011"),
+            server_index=b.get("server_index", 11),
             interval_sec=b.get("interval_sec", 600),
             timeout_sec=b.get("timeout_sec", 600),
         )

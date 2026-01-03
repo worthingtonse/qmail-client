@@ -84,6 +84,7 @@ class AppContext:
     _notifications_lock: threading.Lock = None
     # Server IP cache for beacon callback (refreshable)
     _server_cache: dict = None
+    cc_handle: Any = None
 
     def __post_init__(self):
         """Initialize thread-safe notification storage and server cache."""
@@ -281,7 +282,8 @@ def initialize_application(args):
         log_error(logger, "App", "Failed to initialize database", f"Error code: {db_err}")
         close_logger(logger)
         return None, None
-
+    
+         
     # Initialize thread pool
     thread_pool = create_pool(config.threading.pool_size, logger)
     if thread_pool is None:
