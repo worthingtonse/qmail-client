@@ -2349,7 +2349,8 @@ def get_folder_counts(
     try:
         cursor = handle.connection.cursor()
 
-        # Initialize counts for all folders
+        
+     # Initialize counts for all folders
         counts = {
             'inbox': {'total': 0, 'unread': 0},
             'sent': {'total': 0, 'unread': 0},
@@ -2357,7 +2358,7 @@ def get_folder_counts(
             'trash': {'total': 0, 'unread': 0}
         }
 
-        # Query 1: Standard folders (inbox, sent, drafts) - exclude trashed
+        # Query 1: Downloaded emails (standard folders) - exclude trashed
         cursor.execute("""
             SELECT folder,
                    COUNT(*) as total,
@@ -2373,7 +2374,20 @@ def get_folder_counts(
                 counts[folder]['total'] = row['total']
                 counts[folder]['unread'] = row['unread'] or 0
 
-        # Query 2: Trash folder - count all trashed emails regardless of original folder
+        # Query 2: Pending tells (not yet downloaded) - count as inbox
+        cursor.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN read_status = 0 THEN 1 ELSE 0 END) as unread
+            FROM received_tells
+            WHERE download_status = 0
+        """)
+
+        tells_row = cursor.fetchone()
+        if tells_row:
+            counts['inbox']['total'] += tells_row['total'] or 0
+            counts['inbox']['unread'] += tells_row['unread'] or 0
+
+        # Query 3: Trash folder - count all trashed emails regardless of original folder
         cursor.execute("""
             SELECT COUNT(*) as total,
                    SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) as unread

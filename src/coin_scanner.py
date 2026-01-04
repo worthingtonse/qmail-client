@@ -340,6 +340,82 @@ def scan_wallet_folders(bank_path: str, fracked_path: str, limbo_path: Optional[
     return result
 
 
+def load_coin_metadata(file_path: str) -> Optional[Dict]:
+    """
+    Load coin metadata from binary file by reading internal structure.
+    Resilient to file renaming.
+    
+    Args:
+        file_path: Path to .bin file
+        
+    Returns:
+        Dict with coin metadata or None if invalid
+        {
+            'file_path': str,
+            'coin_id': int,
+            'denomination': int,
+            'serial_number': int,
+            'ans': List[bytes]  # 25 x 16-byte ANs
+        }
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        
+        if len(data) < 439:
+            return None
+        
+        # Read from binary structure
+        coin_id = struct.unpack('>H', data[32:34])[0]
+        denomination = data[34]
+        serial_number = struct.unpack('>I', data[35:39])[0]
+        
+        # Extract 25 ANs (16 bytes each)
+        ans = []
+        for i in range(25):
+            offset = 39 + (i * 16)
+            an = data[offset:offset + 16]
+            ans.append(an)
+        
+        return {
+            'file_path': file_path,
+            'coin_id': coin_id,
+            'denomination': denomination,
+            'serial_number': serial_number,
+            'ans': ans
+        }
+    except Exception:
+        return None
+
+
+def find_identity_coin(bank_path: str, target_sn: int) -> Optional[Dict]:
+    """
+    Find identity coin by serial number via content scanning.
+    Resilient to file renaming - scans all .bin files and reads their metadata.
+    
+    Args:
+        bank_path: Path to Bank folder
+        target_sn: Target serial number to find
+        
+    Returns:
+        Coin metadata dict or None if not found
+    """
+    if not os.path.exists(bank_path):
+        return None
+    
+    for filename in os.listdir(bank_path):
+        if not filename.endswith('.bin'):
+            continue
+        
+        filepath = os.path.join(bank_path, filename)
+        coin = load_coin_metadata(filepath)
+        
+        if coin and coin['serial_number'] == target_sn:
+            return coin
+    
+    return None
+
+
 # ============================================================================
 # TESTING / MAIN
 # ============================================================================

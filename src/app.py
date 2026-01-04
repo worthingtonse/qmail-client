@@ -306,25 +306,93 @@ def initialize_application(args):
     state_file_path = "Data/beacon_state.json"
     
     # 1. Define search patterns (Hex: 00002564 and Decimal: 9572)
-    sn_hex = f"{config.identity.serial_number:08X}"
-    sn_dec = str(config.identity.serial_number)
-    bank_dir = "Data/Wallets/Default/Bank"
+    from coin_scanner import find_identity_coin, load_coin_metadata
     
+    bank_dir = "Data/Wallets/Default/Bank"
     key_file_to_use = None
+    identity_coin = None
 
     if os.path.exists(bank_dir):
-        # Scan Bank folder for any file containing the SN pattern
-        for f_name in os.listdir(bank_dir):
-            upper_name = f_name.upper()
-            # Match if file has .BIN/.KEY extension AND contains the SN (Hex or Dec)
-            if upper_name.endswith(('.BIN', '.KEY')) and (sn_hex in upper_name or sn_dec in upper_name):
-                # Skip hidden files (starting with dot)
-                if f_name.startswith('.'):
-                    continue
+        # Scan all coins in Bank folder
+        all_coins = []
+        for filename in os.listdir(bank_dir):
+            if not filename.endswith('.bin'):
+                continue
+            filepath = os.path.join(bank_dir, filename)
+            coin = load_coin_metadata(filepath)
+            if coin:
+                all_coins.append(coin)
+        
+        if len(all_coins) == 0:
+            log_warning(logger, "App", "No coins found in Bank folder")
+        elif len(all_coins) == 1:
+            # Only one coin - use it as identity and update config
+            identity_coin = all_coins[0]
+            log_info(logger, "App", 
+                    f"Single coin found - auto-selecting as identity: SN={identity_coin['serial_number']}")
+            
+            # Update config file
+            try:
+                import toml
+                config_path = "config/qmail.toml"
+                with open(config_path, 'r') as f:
+                    config_data = toml.load(f)
+                
+                if 'identity' not in config_data:
+                    config_data['identity'] = {}
+                
+                config_data['identity']['serial_number'] = identity_coin['serial_number']
+                config_data['identity']['denomination'] = identity_coin['denomination']
+                
+                with open(config_path, 'w') as f:
+                    toml.dump(config_data, f)
+                
+                log_info(logger, "App", 
+                        f"Auto-updated config: SN={identity_coin['serial_number']}, DN={identity_coin['denomination']}")
+            except Exception as e:
+                log_error(logger, "App", f"Failed to update config: {e}")
+        else:
+            # Multiple coins - try to find the one from config
+            config_sn = config.identity.serial_number
+            identity_coin = find_identity_coin(bank_dir, config_sn)
+            
+            if identity_coin:
+                log_info(logger, "App", 
+                        f"Found identity coin from config: SN={config_sn}")
+            else:
+                # Config SN not found - use first coin and update config
+                identity_coin = all_coins[0]
+                log_warning(logger, "App", 
+                           f"Config SN {config_sn} not found - auto-selecting first coin: SN={identity_coin['serial_number']}")
+                
+                # Update config file
+                try:
+                    import toml
+                    config_path = "config/qmail.toml"
+                    with open(config_path, 'r') as f:
+                        config_data = toml.load(f)
                     
-                key_file_to_use = os.path.join(bank_dir, f_name)
-                log_info(logger, "App", f"Identity coin discovered: {f_name}")
-                break
+                    if 'identity' not in config_data:
+                        config_data['identity'] = {}
+                    
+                    config_data['identity']['serial_number'] = identity_coin['serial_number']
+                    config_data['identity']['denomination'] = identity_coin['denomination']
+                    
+                    with open(config_path, 'w') as f:
+                        toml.dump(config_data, f)
+                    
+                    log_info(logger, "App", 
+                            f"Auto-updated config: SN={identity_coin['serial_number']}, DN={identity_coin['denomination']}")
+                except Exception as e:
+                    log_error(logger, "App", f"Failed to update config: {e}")
+        
+        if identity_coin:
+            key_file_to_use = identity_coin['file_path']
+            log_info(logger, "App", 
+                    f"Identity coin discovered: SN={identity_coin['serial_number']}, "
+                    f"DN={identity_coin['denomination']}, file={os.path.basename(key_file_to_use)}")
+    else:
+        log_warning(logger, "App", f"Bank directory does not exist: {bank_dir}")
 
     # Fallback to legacy keys.txt if no .bin/.key file was found
     if not key_file_to_use:
@@ -375,8 +443,11 @@ def initialize_application(args):
 
 def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     """
-    Moves all identity files (.bin/.key) belonging to this SN to Fracked for repair.
+    Move identity coin to Fracked folder for healing.
+    Uses content-based identification - resilient to file renaming.
+    Stops beacon monitor and triggers background healing.
     """
+    from coin_scanner import find_identity_coin
     import shutil
     import os
     import threading
@@ -386,46 +457,42 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     # 1. STOP THE MONITOR IMMEDIATELY
     # Prevents the connection flood while files are in transit.
     if beacon_handle and beacon_handle.is_running:
-        if logger: log_info(logger, "App", f"Stopping beacon SN {identity_config.serial_number} for repair.")
+        if logger:
+            log_info(logger, "App", f"Stopping beacon SN {identity_config.serial_number} for repair.")
         stop_beacon_monitor(beacon_handle)
 
     bank_dir = "Data/Wallets/Default/Bank"
     fracked_dir = "Data/Wallets/Default/Fracked"
     os.makedirs(fracked_dir, exist_ok=True)
     
-    # Target pattern: Hex SN (e.g., '00001AEB')
-    sn_hex_pattern = f"{identity_config.serial_number:08X}"
-    files_moved = 0
-
-    # 2. SCAN BANK FOLDER BY EXTENSION AND SN PATTERN
-    if os.path.exists(bank_dir):
-        for f_name in os.listdir(bank_dir):
-            # Only process relevant extensions
-            if not f_name.lower().endswith(('.bin', '.key')):
-                continue
-                
-            # Match strictly if the Hex Serial Number is in the filename
-            if sn_hex_pattern in f_name.upper():
-                src = os.path.join(bank_dir, f_name)
-                dst = os.path.join(fracked_dir, f_name)
-                try:
-                    shutil.move(src, dst)
-                    if logger: log_info(logger, "App", f"Moved identity file {f_name} to Fracked.")
-                    files_moved += 1
-                except Exception as e:
-                    if logger: log_error(logger, "App", f"Failed to move {f_name}: {e}")
-
-    # 3. TRIGGER BACKGROUND HEAL
-    if files_moved > 0:
-        threading.Thread(
-            target=heal_wallet, 
-            args=("Data/Wallets/Default",), 
-            name="AutoHealTrigger", 
-            daemon=True
-        ).start()
+    # 2. Find identity coin by content scanning (resilient to renaming)
+    identity_coin = find_identity_coin(bank_dir, identity_config.serial_number)
+    
+    if identity_coin:
+        src = identity_coin['file_path']
+        dst = os.path.join(fracked_dir, os.path.basename(src))
+        
+        try:
+            shutil.move(src, dst)
+            if logger:
+                log_info(logger, "App", 
+                        f"Moved identity file {os.path.basename(src)} to Fracked")
+            
+            # 3. TRIGGER BACKGROUND HEAL
+            threading.Thread(
+                target=heal_wallet, 
+                args=("Data/Wallets/Default",), 
+                name="AutoHealTrigger", 
+                daemon=True
+            ).start()
+            
+        except Exception as e:
+            if logger:
+                log_error(logger, "App", f"Failed to move identity coin: {e}")
     else:
-        if logger: log_warning(logger, "App", f"No identity files found for SN {sn_hex_pattern} in Bank.")
-
+        if logger:
+            log_warning(logger, "App", 
+                       f"No identity coin found for SN {identity_config.serial_number}")
 
 
 def start_periodic_healer(wallet_path: str, logger: Any, interval_hours: int = 1):

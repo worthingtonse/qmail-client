@@ -41,7 +41,6 @@ from protocol import (
     weeks_to_duration_code
 )
 from network import connect_to_server, send_request, disconnect
-from database import store_sent_email
 from payment import calculate_storage_cost, request_locker_code
 from logger import log_info, log_error, log_warning, log_debug
 from config import get_raida_server_config
@@ -99,59 +98,82 @@ def load_coin_from_file(file_path: str) -> Optional[object]:
         return None
 
 
-def get_coins_by_value(wallet_path: str, target_value: float) -> List:
+def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int = None) -> List:
     """
     Get coins from wallet that total the target value.
-    Returns list of coin objects.
+    
+    IMPORTANT: Excludes identity coin to prevent accidental spending.
+    
+    Args:
+        wallet_path: Path to wallet (e.g., "Data/Wallets/Default")
+        target_value: Amount needed (e.g., 0.1)
+        identity_sn: Serial number of identity coin to exclude (optional)
+        
+    Returns:
+        List of coin objects
     """
-    from coin_scanner import parse_denomination_code
-
+    from coin_scanner import parse_denomination_code, load_coin_metadata
+    
     bank_path = os.path.join(wallet_path, "Bank")
-
+    
     if not os.path.exists(bank_path):
         return []
-
+    
+    # Scan for coins matching target value
     exact_match_coins = []
     all_coins = []
-
+    
     for filename in os.listdir(bank_path):
         if not filename.endswith('.bin'):
             continue
-
+            
         file_path = os.path.join(bank_path, filename)
         coin = load_coin_from_file(file_path)
-
+        
         if coin is None:
             continue
-
+        
+        # CRITICAL: Skip identity coin
+        if identity_sn and coin.sn == identity_sn:
+            continue
+        
         coin_value = parse_denomination_code(coin.denomination)
         all_coins.append((coin, coin_value))
-
+        
         if abs(coin_value - target_value) < 0.0001:
             exact_match_coins.append(coin)
-
-    # If exact match exists, return one
+    
+    # If we have exact match, return one
     if exact_match_coins:
         return [exact_match_coins[0]]
-
+    
     # Otherwise, find smallest coin larger than target
     larger_coins = [(c, v) for c, v in all_coins if v > target_value]
-
+    
     if larger_coins:
+        # Sort by value, take smallest
         larger_coins.sort(key=lambda x: x[1])
         return [larger_coins[0][0]]
-
+    
     return []
-
 
 async def create_recipient_locker(
     wallet_path: str,
     amount: float,
+    identity_sn: int,
     logger_handle
 ) -> Tuple[int, Optional[str]]:
     """
     Create a locker with coins for recipient payment.
-
+    
+    IMPORTANT: Never uses identity coin - it's protected.
+    
+    Args:
+        wallet_path: Path to wallet
+        amount: Amount to lock
+        identity_sn: Identity coin serial number to exclude
+        logger_handle: Logger
+        
     Returns:
         (error_code, locker_code_hex_16bytes)
         error_code: 0=success, 1=insufficient funds, 2=network error
@@ -162,93 +184,79 @@ async def create_recipient_locker(
     from coin_scanner import parse_denomination_code
     import secrets
     import string
-
+    
     try:
-        # 1. Get coins from wallet
-        coins = get_coins_by_value(wallet_path, amount)
-
+        # 1. Get coins from wallet (EXCLUDING identity coin)
+        coins = get_coins_by_value(wallet_path, amount, identity_sn=identity_sn)
+        
         if not coins:
-            log_warning(
-                logger_handle,
-                "LockerCreate",
-                f"No coins available for amount {amount}"
-            )
+            log_warning(logger_handle, "LockerCreate", 
+                       f"No spendable coins available for amount {amount}")
             return 1, None
-
+        
         coin = coins[0]
         coin_value = parse_denomination_code(coin.denomination)
-
+        
         # 2. Break coin if needed
+        final_coins = []
+        
         if abs(coin_value - amount) < 0.0001:
+            # Exact match - use as is
             final_coins = [coin]
         else:
-            log_info(
-                logger_handle,
-                "LockerCreate",
-                f"Breaking coin {coin_value} to get {amount}"
-            )
-
+            # Need to break
+            log_info(logger_handle, "LockerCreate",
+                    f"Breaking coin {coin_value} to get {amount}")
+            
             broken_coins = await break_coin(coin, amount)
-
-            if not broken_coins:
-                log_error(
-                    logger_handle,
-                    "LockerCreate",
-                    "Failed to break coin"
-                )
+            
+            if not broken_coins or len(broken_coins) == 0:
+                log_error(logger_handle, "LockerCreate", 
+                         "Failed to break coin")
                 return 2, None
-
+            
+            # Take first coin (should equal amount)
             final_coins = [broken_coins[0]]
-
-            # Remaining coins should already be returned to bank by coin_break
-            # (no-op here)
-
+            
+            # Remaining coins automatically saved by coin_break.py
+        
         # 3. Generate random 8-char locker code
-        locker_code = ''.join(
-            secrets.choice(string.ascii_uppercase + string.digits)
-            for _ in range(8)
-        )
-
+        locker_code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) 
+                             for _ in range(8))
+        
         # 4. Get 25 locker keys from code
         locker_keys_25 = get_keys_from_locker_code(locker_code)
-
+        
         # 5. Prepare coins for PUT
-        coins_for_put = [
-            CoinForPut(
+        coins_for_put = []
+        for c in final_coins:
+            coins_for_put.append(CoinForPut(
                 denomination=c.denomination,
                 serial_number=c.sn,
                 ans=c.ans
-            )
-            for c in final_coins
-        ]
-
+            ))
+        
         # 6. Lock coins on RAIDA
         result, details = await put_to_locker(coins_for_put, locker_keys_25)
-
+        
         if result != PutResult.SUCCESS:
-            log_error(
-                logger_handle,
-                "LockerCreate",
-                f"PUT failed: {result}"
-            )
+            log_error(logger_handle, "LockerCreate",
+                     f"PUT failed: {result}")
             return 2, None
-
-        # 7. Delete original coin from bank
+        
+        # 7. Delete coin from bank (now in locker)
         try:
             os.remove(coin.file_path)
-        except Exception:
+        except:
             pass
-
+        
         # 8. Return locker code as 16-byte hex
         locker_key_16 = locker_code.encode('ascii').ljust(16, b'\x00')
         return 0, locker_key_16.hex()
-
+        
     except Exception as e:
-        log_error(
-            logger_handle,
-            "LockerCreate",
-            f"Exception creating locker: {e}"
-        )
+        log_error(logger_handle, "LockerCreate",
+                 f"Exception creating locker: {e}")
         return 2, None
 
 
@@ -1028,29 +1036,26 @@ def send_email_async(
             return err, result
         
 
-        base_name = f"0006{identity.denomination:02X}{identity.serial_number:08X}"
-        path_bin = f"Data/Wallets/Default/Bank/{base_name}.BIN"
-        path_key = f"Data/Wallets/Default/Bank/{base_name}.KEY" 
-
-        key_path = path_bin if os.path.exists(path_bin) else path_key
-        success_load, hex_an_list, load_err = verify_an_loading(key_path, logger_handle)
-
-        # Step 2: Load Full Identity Key (400 bytes / 800 hex chars)
-        # We must load all 25 ANs to ensure each server gets its correct slice.
-        # key_path = f"Data/Wallets/Default/Bank/0006{identity.denomination:02x}{identity.serial_number:08x}.key".upper()
+       # Load identity coin using content-based search (resilient to renaming)
+        from coin_scanner import find_identity_coin
         
-        # Use the verify_an_loading function you added to email_sender.py
-        # success_load, hex_an_list, load_err = verify_an_loading(key_path, logger_handle)
+        bank_dir = "Data/Wallets/Default/Bank"
+        identity_coin = find_identity_coin(bank_dir, identity.serial_number)
         
-        if not success_load:
-            log_error(logger_handle, SENDER_CONTEXT, "Identity load failed", load_err)
+        if not identity_coin:
+            log_error(logger_handle, SENDER_CONTEXT, 
+                     f"Identity coin not found: SN={identity.serial_number}")
             result.error_code = SendEmailErrorCode.ERR_ENCRYPTION_FAILED
-            result.error_message = f"Failed to load identity key: {load_err}"
+            result.error_message = f"Identity coin file not found for SN {identity.serial_number}"
             update_state("FAILED", 0, result.error_message)
             return result.error_code, result
-
-        # Join the list into a single 800-character string for the identity object
+        
+        # Convert 25 ANs to hex string (800 hex chars = 25 * 16 bytes * 2)
+        hex_an_list = [an.hex() for an in identity_coin['ans']]
         identity.authenticity_number = "".join(hex_an_list)
+        
+        log_info(logger_handle, SENDER_CONTEXT,
+                f"Loaded identity from: {os.path.basename(identity_coin['file_path'])}")
 
         # Step 3: Generate file group GUID
         state.file_group_guid = uuid.uuid4().bytes
@@ -1273,6 +1278,7 @@ def send_tell_notifications(
     # Get locker keys for all recipients
    # Get locker keys for all recipients (per-recipient fees)
     # Get locker keys for all recipients (create actual lockers)
+    # Get locker keys for all recipients (create actual lockers)
     locker_keys = []
     
     wallet_path = "Data/Wallets/Default"
@@ -1288,10 +1294,10 @@ def send_tell_notifications(
         else:
             fee = 0.1
         
-        # Create locker with actual coins
+        # Create locker with actual coins (EXCLUDING identity coin)
         import asyncio
         err_code, locker_hex = asyncio.run(create_recipient_locker(
-            wallet_path, fee, logger_handle
+            wallet_path, fee, identity.serial_number, logger_handle
         ))
         
         if err_code == 0 and locker_hex:
