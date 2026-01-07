@@ -43,7 +43,7 @@ PYTHON_39_PLUS = sys.version_info >= (3, 9)
 
 # Import logger
 try:
-    from .logger import log_error, log_info, log_debug, log_warning
+    from logger import log_error, log_info, log_debug, log_warning
 except ImportError:
     def log_error(handle, context, msg, reason=None):
         if reason:

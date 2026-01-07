@@ -45,7 +45,7 @@ except ImportError:
 
 # Import error codes from qmail_types
 try:
-    from .qmail_types import CryptoErrorCode
+    from qmail_types import CryptoErrorCode
 except ImportError:
     # Fallback for standalone testing
     from enum import IntEnum
@@ -61,7 +61,7 @@ except ImportError:
 
 # Import logger (optional - for error reporting)
 try:
-    from .logger import log_error, log_info, log_debug, log_warning, LoggerHandle
+    from logger import log_error, log_info, log_debug, log_warning, LoggerHandle
 except ImportError:
     # Fallback for standalone testing
     LoggerHandle = None

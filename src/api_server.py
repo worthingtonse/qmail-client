@@ -10,7 +10,7 @@ from typing import Dict, List, Any, Tuple, Callable
 
 # Try to import from package, fall back to direct import for standalone testing
 try:
-    from .logger import log_info, log_error, log_warning, log_debug
+    from logger import log_info, log_error, log_warning, log_debug
 except ImportError:
     # Fallback for standalone testing (uses new 3-parameter API with context)
     def log_info(handle, context, msg): print(f"[INFO] [{context}] {msg}")
@@ -351,8 +351,8 @@ if __name__ == '__main__':
     import time
     # Import logger functions for standalone testing
     try:
-        from .logger import init_logger, close_logger
-        from .wallet_structure import initialize_wallet_structure
+        from logger import init_logger, close_logger
+        from wallet_structure import initialize_wallet_structure
     except ImportError:
         # For standalone execution, try direct import
         import sys

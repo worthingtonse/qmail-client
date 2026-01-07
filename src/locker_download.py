@@ -42,23 +42,23 @@ from enum import IntEnum
 
 # Import protocol functions for locker commands
 try:
-    from .protocol import (
+    from protocol import (
         ProtocolErrorCode,
         build_complete_locker_download_request,
         parse_locker_download_response,
         decrypt_locker_response,
     )
-    from .key_manager import get_keys_from_locker_code
-    from .cloudcoin import (
+    from key_manager import get_keys_from_locker_code
+    from cloudcoin import (
         LockerCoin, CloudCoinErrorCode,
         write_coin_file, generate_coin_filename,
         CC_RAIDA_COUNT, CC_AN_LENGTH,
     )
-    from .network_async import (
+    from network_async import (
         connect_async, disconnect_async, send_raw_request_async,
         NetworkErrorCode, ServerInfo, AsyncConnection,
     )
-    from .wallet_structure import initialize_wallet_structure
+    from wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     from protocol import (
@@ -81,7 +81,7 @@ except ImportError:
 
 # Import logger
 try:
-    from .logger import log_error, log_info, log_debug, log_warning
+    from logger import log_error, log_info, log_debug, log_warning
 except ImportError:
     def log_error(handle, context, msg, reason=None):
         if reason:
@@ -659,24 +659,21 @@ async def download_from_locker(
     return LockerDownloadResult.SUCCESS, saved_coins
 
 
-def derive_locker_keys(locker_code_str: str) -> list:
+def derive_locker_keys(locker_code: bytes) -> list:
     """
-    Derives 25 access keys for RAIDA.
-    Formula: MD5(str(raida_id) + locker_code) + 0xFFFFFFFF padding
+    Derive 25 locker IDs (one per RAIDA) from an 8-byte locker code.
+    Formula: MD5(str(raida_id) + locker_code)
     """
-    keys = []
+    # Normalize to 8 bytes
+    code = locker_code[:8] if len(locker_code) >= 8 else locker_code.ljust(8, b'\x00')
+    
+    locker_ids = []
     for raida_id in range(25):
-        # 1. Create the input string (e.g., "0VA9-7UEF")
-        input_str = f"{raida_id}{locker_code_str.strip().upper()}"
-        
-        # 2. Get the MD5 hash
-        hasher = hashlib.md5(input_str.encode('ascii'))
-        digest = bytearray(hasher.digest())
-        
-        # 3. CRUCIAL: Set the last 4 bytes to 0xFF
-        digest[12:16] = b'\xff\xff\xff\xff'
-        keys.append(bytes(digest))
-    return keys
+        # Derive unique locker ID for this specific RAIDA shard
+        key_material = str(raida_id).encode() + code
+        locker_ids.append(hashlib.md5(key_material).digest())
+    
+    return locker_ids
 
 
 # ============================================================================

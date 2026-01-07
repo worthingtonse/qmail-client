@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 
 # Import from synchronous network module (reuse data structures and helpers)
 try:
-    from .network import (
+    from network import (
         # Data structures
         ServerInfo, Connection, ServerStatus, ResponseHeader,
         NetworkErrorCode, StatusCode, NetworkConfig,
@@ -47,8 +47,8 @@ try:
         _parse_response_header, _calculate_challenge,
         build_common_preamble,
     )
-    from .crypto import encrypt_data, decrypt_data, CryptoErrorCode, AES_KEY_SIZE
-    from .task_manager import (
+    from crypto import encrypt_data, decrypt_data, CryptoErrorCode, AES_KEY_SIZE
+    from task_manager import (
         TaskManagerHandle, TaskErrorCode,
         create_task, start_task, update_task_progress,
         complete_task, fail_task
@@ -88,7 +88,7 @@ except ImportError:
 
 # Import logger
 try:
-    from .logger import log_error, log_info, log_debug, log_warning
+    from logger import log_error, log_info, log_debug, log_warning
 except ImportError:
     def log_error(handle, context, msg, reason=None):
         if reason:

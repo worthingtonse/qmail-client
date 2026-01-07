@@ -49,7 +49,7 @@ from typing import List, Optional, Tuple
 
 # Import types from qmail_types
 try:
-    from .qmail_types import Stripe, ParityStripe, StripeSet, ErrorCode
+    from qmail_types import Stripe, ParityStripe, StripeSet, ErrorCode
 except ImportError:
     # Fallback for standalone testing
     from dataclasses import dataclass, field
@@ -83,7 +83,7 @@ except ImportError:
 
 # Import logger (optional - for error reporting)
 try:
-    from .logger import log_error, log_info, log_debug, log_warning
+    from logger import log_error, log_info, log_debug, log_warning
 except ImportError:
     # Fallback for standalone testing
     def log_error(handle, context, msg, reason=None):
@@ -97,7 +97,7 @@ except ImportError:
 
 # Import striping module for validation
 try:
-    from .striping import validate_stripe, _calculate_checksum
+    from striping import validate_stripe, _calculate_checksum
 except ImportError:
     import zlib
     def _calculate_checksum(data: bytes) -> int:

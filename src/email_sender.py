@@ -286,9 +286,9 @@ try:
         update_pending_tell_status, delete_pending_tell, fix_null_beacon_ids,
         DatabaseErrorCode
     )
-    from .cloudcoin import get_locker_keys, CloudCoinErrorCode
-    from .logger import log_error, log_info, log_debug, log_warning
-    from .wallet_structure import initialize_wallet_structure
+    from cloudcoin import get_locker_keys, CloudCoinErrorCode
+    from logger import log_error, log_info, log_debug, log_warning
+    from wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     from enum import IntEnum
@@ -1039,8 +1039,14 @@ def send_email_async(
        # Load identity coin using content-based search (resilient to renaming)
         from coin_scanner import find_identity_coin
         
-        bank_dir = "Data/Wallets/Default/Bank"
-        identity_coin = find_identity_coin(bank_dir, identity.serial_number)
+       # Check Mailbox/Bank first, fallback to Default/Bank
+        mailbox_bank = "Data/Wallets/Mailbox/Bank"
+        default_bank = "Data/Wallets/Default/Bank"
+
+        identity_coin = find_identity_coin(mailbox_bank, identity.serial_number)
+        #just a fallback // should never reach here
+        if not identity_coin:
+            identity_coin = find_identity_coin(default_bank, identity.serial_number)
         
         if not identity_coin:
             log_error(logger_handle, SENDER_CONTEXT, 

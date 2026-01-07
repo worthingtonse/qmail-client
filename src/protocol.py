@@ -388,6 +388,105 @@ def build_ping_header(
 
     return ProtocolErrorCode.SUCCESS, bytes(header)
 
+
+def build_peek_locker_request(
+    raida_id: int,
+    locker_id: bytes
+) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
+    """
+    Build PEEK LOCKER command (0x53) to verify locker contents.
+    
+    Based on cmd_peek in cmd_locker.c line 395.
+    
+    Request format:
+    - Header (32 bytes): Standard RAIDA header with command 0x53
+    - Body (16 bytes): Locker ID (AN)
+    - EOF marker (2 bytes): 0xFF 0xFF
+    
+    Total: 50 bytes
+    
+    Args:
+        raida_id: RAIDA server index (0-24)
+        locker_id: 16-byte locker ID for this RAIDA
+        
+    Returns:
+        Tuple of (error_code, request_packet, challenge, nonce)
+    """
+    if len(locker_id) != 16:
+        return ProtocolErrorCode.ERR_INVALID_PARAM, b'', b'', b''
+    
+    # Build header (32 bytes)
+    header = bytearray(32)
+    header[0] = 0x53  # PEEK command
+    header[1] = raida_id
+    # Bytes 2-31: Reserved/zeros
+    
+    # Build body (16 bytes locker ID + 2 bytes EOF)
+    body = bytearray(18)
+    body[0:16] = locker_id
+    body[16] = 0xFF  # EOF marker
+    body[17] = 0xFF
+    
+    # Combine
+    request = bytes(header + body)
+    
+    # Challenge and nonce (not used for PEEK)
+    challenge = bytes(16)
+    nonce = bytes(16)
+    
+    return ProtocolErrorCode.SUCCESS, request, challenge, nonce
+
+
+def parse_peek_locker_response(response_body: bytes) -> Tuple[int, List[Dict]]:
+    """
+    Parse PEEK LOCKER response.
+    
+    Based on cmd_peek in cmd_locker.c line 426-439.
+    
+    Response format:
+    - Array of coins, each coin is 5 bytes:
+      - Byte 0: Denomination (int8)
+      - Bytes 1-4: Serial number (big-endian uint32)
+    
+    Args:
+        response_body: Response body from RAIDA
+        
+    Returns:
+        Tuple of (coin_count, coin_list)
+        coin_list is list of dicts with 'denomination', 'serial_number', 'value'
+    """
+    import struct
+    
+    if len(response_body) % 5 != 0:
+        return 0, []
+    
+    coin_count = len(response_body) // 5
+    coins = []
+    
+    for i in range(coin_count):
+        offset = i * 5
+        denomination = struct.unpack('b', response_body[offset:offset+1])[0]  # Signed byte
+        serial_number = struct.unpack('>I', response_body[offset+1:offset+5])[0]  # Big-endian
+        
+        # Calculate coin value
+    if denomination == 11:
+        coin_value = 0.0  # Key coins have no monetary value
+    else:
+    # Standard denominations: value = 10^code
+    # Examples: 0→1CC, 1→10CC, 2→100CC, -1→0.1CC
+      try:
+        coin_value = float(10 ** denomination)
+      except (OverflowError, ValueError):
+        coin_value = 0.0
+        
+        coins.append({
+            'denomination': denomination,
+            'serial_number': serial_number,
+            'value': coin_value
+        })
+    
+    return coin_count, coins
+
 def encrypt_payload_with_an(
     payload: bytes,
     an: bytes,

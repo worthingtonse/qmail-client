@@ -22,9 +22,9 @@ from enum import IntEnum
 
 # Import error codes from cloudcoin module
 try:
-    from .cloudcoin import CloudCoinErrorCode
-    from .logger import log_error, log_warning, log_debug, log_info
-    from .wallet_structure import initialize_wallet_structure
+    from cloudcoin import CloudCoinErrorCode
+    from logger import log_error, log_warning, log_debug, log_info
+    from wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback definitions for standalone usage
     class CloudCoinErrorCode(IntEnum):

@@ -13,13 +13,15 @@ Date: 2025-12-16
 Updated: 2025-12-16 - Added database integration for contacts, list, search
 """
 
+from task_manager import create_task, start_task, complete_task, fail_task
+import socket
 import time
 import json
 import re
 import socket
 from math import ceil
 from typing import Any, Dict, Optional, Tuple
-from src.task_manager import create_task, start_task, TaskErrorCode
+from task_manager import create_task, start_task, TaskErrorCode
 # from aiohttp import web
 import os
 import threading
@@ -28,7 +30,7 @@ import re
 import asyncio
 
 # Database imports for real implementations
-from src.database import (
+from database import (
     get_popular_contacts,
     list_emails,
     search_emails,
@@ -60,24 +62,24 @@ from src.database import (
 )
 
 # Data sync imports
-from src.data_sync import sync_all, SyncErrorCode
+from data_sync import sync_all, SyncErrorCode
 
 # Wallet structure imports
-from src.wallet_structure import initialize_wallet_structure
+from wallet_structure import initialize_wallet_structure
 
 # Beacon imports
-from src.beacon import do_peek
-from src.network import NetworkErrorCode
+from beacon import do_peek
+from network import NetworkErrorCode
 
 # Download imports
-from src.download_handler import download_file_sync
-from src.database import get_received_tell_by_guid
-from src.logger import log_info, log_error
+from download_handler import download_file_sync
+from database import get_received_tell_by_guid
+from logger import log_info, log_error
 import os
 
 # Task manager imports
-from src.task_manager import get_task_status, cancel_task, TaskErrorCode
-from src.task_manager import create_task, start_task, complete_task, fail_task , stake_locker_identity
+from task_manager import get_task_status, cancel_task, TaskErrorCode
+from task_manager import create_task, start_task, complete_task, fail_task, stake_locker_identity
 
 # Note: These handlers receive:
 #   - request_handler: Has send_json_response(), send_text_response(), send_error()
@@ -108,13 +110,14 @@ def handle_health(request_handler, context):
 def handle_ping(request_handler, context):
     """
     GET /api/qmail/ping - Beacon check for new mail.
-    FIXED: Uses _get_an_for_download to solve 'identity_an_missing'.
+    FIXED: Uses correct AN slice for RAIDA 11 and triggers healing on failure.
     """
     import asyncio
-    from .protocol import build_complete_ping_request, parse_tell_response
-    from .network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
-    from .network import ServerInfo
-    
+    from protocol import build_complete_ping_request, parse_tell_response
+    from network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
+    from network import ServerInfo
+    from logger import log_error
+
     app_ctx = getattr(request_handler.server_instance, 'app_context', None)
     if not app_ctx:
         return request_handler.send_json_response(500, {"error": "context_not_found"})
@@ -123,45 +126,68 @@ def handle_ping(request_handler, context):
     if not identity:
         return request_handler.send_json_response(401, {"error": "no_identity_found"})
 
-    # Use the existing helper that knows how to find the AN in Wallets or Config
+    # Target RAIDA 11 as the beacon server
+    target_raida_index = 11
+
     try:
         an_block = _get_an_for_download(app_ctx)
-        # Use the first 16 bytes for RAIDA 11
-        an_bytes = an_block[:16] 
+        
+        # FIXED: Slice the correct 16 bytes for the targeted RAIDA (index 11)
+        if len(an_block) >= 400:
+            start = target_raida_index * 16
+            an_bytes = an_block[start : start + 16]
+        else:
+            # If we only have 16 bytes (fallback from beacon handle), use them directly
+            an_bytes = an_block[:16]
+            
     except Exception as e:
-        return request_handler.send_json_response(401, {"status": "error", "message": "identity_an_missing"})
+        # Trigger Reactive Healing if discovery fails locally
+        from src.app import move_identity_to_fracked
+        log_error(app_ctx.logger, "API", f"Identity AN load failure: {e}. Moving to Fracked.")
+        move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
+        
+        return request_handler.send_json_response(401, {
+            "status": "healing", 
+            "message": "identity_an_missing",
+            "details": f"Identity coin AN could not be loaded: {str(e)}"
+        })
 
     async def perform_ping_task():
         # 1. Resolve RAIDA 11 Info
         raida_servers = getattr(app_ctx.config, 'raida_servers', [])
-        server_entry = next((s for s in raida_servers if getattr(s, 'index', -1) == 11), None)
-        if not server_entry: return {"status": "error", "message": "raida_11_not_found"}
+        server_entry = next(
+            (s for s in raida_servers if getattr(s, 'index', -1) == target_raida_index), None)
+        if not server_entry:
+            return {"status": "error", "message": "raida_11_not_found"}
 
-        server_info = ServerInfo(host=getattr(server_entry, 'address', ''), 
-                                 port=getattr(server_entry, 'port', 50011), raida_id=11)
+        server_info = ServerInfo(host=getattr(server_entry, 'address', ''),
+                                 port=getattr(server_entry, 'port', 50011), raida_id=target_raida_index)
 
         err_conn, conn = await connect_async(server_info, config=app_ctx.config)
-        if err_conn != NetworkErrorCode.SUCCESS: return {"status": "error", "message": "offline"}
+        if err_conn != NetworkErrorCode.SUCCESS:
+            return {"status": "error", "message": "offline"}
 
         try:
             # 2. Command 62 PING
-            err_proto, req, _, _ = build_complete_ping_request(11, identity.denomination, identity.serial_number, 0, an_bytes, 0)
-            
-            # send_raw_request_async will handle the trailer stripping
+            err_proto, req, _, _ = build_complete_ping_request(
+                target_raida_index, identity.denomination, identity.serial_number, 0, an_bytes, 0)
+
             net_err, resp_h, resp_b = await send_raw_request_async(conn, req)
-            
-            if net_err != NetworkErrorCode.SUCCESS: return {"status": "error", "message": "net_failure"}
-            
-            # Handle Fracked status
+
+            if net_err != NetworkErrorCode.SUCCESS:
+                return {"status": "error", "message": "net_failure"}
+
+            # Handle Fracked status (RAIDA reports invalid AN with Status 200)
             if resp_h.status == 200:
                 from src.app import move_identity_to_fracked
+                log_error(app_ctx.logger, "API", "RAIDA reported Invalid AN (200). Initiating healing.")
                 move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
                 return {"status": "healing", "message": "coin_fracked"}
 
             # 3. Parse and Return
             err_parse, notifications = parse_tell_response(resp_b, app_ctx.logger)
             return {
-                "status": "ok", 
+                "status": "ok",
                 "has_mail": len(notifications) > 0,
                 "message_count": len(notifications),
                 "messages": [n.to_dict() if hasattr(n, 'to_dict') else str(n) for n in notifications]
@@ -170,12 +196,12 @@ def handle_ping(request_handler, context):
             await disconnect_async(conn)
 
     try:
-        # Use existing asyncio loop if possible
         result = asyncio.run(perform_ping_task())
         request_handler.send_json_response(200, result if result else {"status": "error"})
     except Exception as e:
         request_handler.send_json_response(500, {"error": str(e)})
 # ============================================================================
+
 
 def handle_mail_send(request_handler, context):
     """
@@ -194,7 +220,7 @@ def handle_mail_send(request_handler, context):
 
     # --- Full Parsing Logic ---
     if 'multipart/form-data' in content_type.lower():
-        form_data = email_data  
+        form_data = email_data
         request_obj.email_file = form_data.get('email_file', b'')
         request_obj.searchable_text = form_data.get('searchable_text', '')
         request_obj.subject = form_data.get('subject', '')
@@ -203,20 +229,24 @@ def handle_mail_send(request_handler, context):
         request_obj.storage_weeks = int(form_data.get('storage_weeks', 8))
     else:
         if not email_data.get("to") or not email_data.get("subject"):
-            request_handler.send_json_response(400, {"error": "Missing 'to' or 'subject'", "status": "error"})
+            request_handler.send_json_response(
+                400, {"error": "Missing 'to' or 'subject'", "status": "error"})
             return
         body_text = email_data.get('body', '')
-        request_obj.email_file = body_text.encode('utf-8') if body_text else b''
+        request_obj.email_file = body_text.encode(
+            'utf-8') if body_text else b''
         request_obj.searchable_text = body_text
         request_obj.subject = email_data.get('subject', '')
         to_list = email_data.get('to', [])
-        request_obj.to_recipients = to_list if isinstance(to_list, list) else [to_list]
+        request_obj.to_recipients = to_list if isinstance(to_list, list) else [
+            to_list]
         request_obj.storage_weeks = int(email_data.get('storage_weeks', 8))
 
     # --- Validation ---
     err, err_msg = validate_request(request=request_obj)
     if err != SendEmailErrorCode.SUCCESS:
-        request_handler.send_json_response(400, {"error": err_msg, "error_code": int(err), "status": "error"})
+        request_handler.send_json_response(
+            400, {"error": err_msg, "error_code": int(err), "status": "error"})
         return
 
     # --- Standardized Identity Borrowing ---
@@ -226,61 +256,73 @@ def handle_mail_send(request_handler, context):
         identity.authenticity_number = _get_an_for_download(app_ctx)
     except Exception as e:
         log_error(app_ctx.logger, "API", f"Failed to borrow identity AN: {e}")
-        request_handler.send_json_response(403, {"error": "Identity coin missing or inaccessible", "status": "error"})
+        request_handler.send_json_response(
+            403, {"error": "Identity coin missing or inaccessible", "status": "error"})
         return
 
     # Task Registration
-    _, task_id = create_task(app_ctx.task_manager, "send", {"subject": request_obj.subject})
+    _, task_id = create_task(app_ctx.task_manager, "send", {
+                             "subject": request_obj.subject})
     start_task(app_ctx.task_manager, task_id, "Initializing send process")
 
     def process_send():
         try:
             from database import get_stripe_servers, get_parity_server, DatabaseErrorCode
-            
+
             err_stripe, stripe_servers = get_stripe_servers(app_ctx.db_handle)
             err_parity, parity_server = get_parity_server(app_ctx.db_handle)
-            
+
             if err_stripe != DatabaseErrorCode.SUCCESS or not stripe_servers:
-                fail_task(app_ctx.task_manager, task_id, "No stripe servers available", "Server configuration error")
+                fail_task(app_ctx.task_manager, task_id,
+                          "No stripe servers available", "Server configuration error")
                 return
-            
+
             # Combine stripe servers + parity server
             all_servers = stripe_servers.copy()
             if parity_server:
                 all_servers.append(parity_server)
-            
-            log_info(app_ctx.logger, "API", f"Using {len(all_servers)} servers from database")
-            
+
+            log_info(app_ctx.logger, "API",
+                     f"Using {len(all_servers)} servers from database")
+
             err, result = send_email_async(
                 request_obj, identity, app_ctx.db_handle, all_servers,  # ← Use database servers!
-                app_ctx.thread_pool.executor, 
-                lambda s: update_task_progress(app_ctx.task_manager, task_id, s.progress, s.message), 
+                app_ctx.thread_pool.executor,
+                lambda s: update_task_progress(
+                    app_ctx.task_manager, task_id, s.progress, s.message),
                 app_ctx.logger,
                 cc_handle=app_ctx.cc_handle
             )
-            
+
             if result.success:
-                complete_task(app_ctx.task_manager, task_id, {"success": True}, "Email sent successfully")
+                complete_task(app_ctx.task_manager, task_id, {
+                              "success": True}, "Email sent successfully")
             else:
                 # --- REACTIVE HEALING INTEGRATION ---
-                is_fracked = any(getattr(r, 'status', 0) == 200 for r in (result.upload_results or []))
+                is_fracked = any(getattr(r, 'status', 0) ==
+                                 200 for r in (result.upload_results or []))
                 if is_fracked:
                     from src.app import move_identity_to_fracked
-                    log_error(app_ctx.logger, "API", f"Reactive Healing triggered for SN {identity.serial_number}")
-                    move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
-                
-                fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
+                    log_error(
+                        app_ctx.logger, "API", f"Reactive Healing triggered for SN {identity.serial_number}")
+                    move_identity_to_fracked(
+                        identity, app_ctx.beacon_handle, app_ctx.logger)
+
+                fail_task(app_ctx.task_manager, task_id,
+                          result.error_message, "Email sending failed")
         except Exception as e:
             log_error(app_ctx.logger, "API", f"Background send crash: {e}")
-            fail_task(app_ctx.task_manager, task_id, str(e), "Internal thread crash")
+            fail_task(app_ctx.task_manager, task_id,
+                      str(e), "Internal thread crash")
 
     app_ctx.thread_pool.executor.submit(process_send)
-    
+
     request_handler.send_json_response(202, {
         "status": "accepted",
         "task_id": task_id,
         "message": "Email queued for sending"
     })
+
 
 def handle_mail_download(request_handler, context):
     """
@@ -293,7 +335,8 @@ def handle_mail_download(request_handler, context):
 
     file_guid = context.path_params.get('id', '').replace('-', '').strip()
     if len(file_guid) != 32:
-        request_handler.send_json_response(400, {"error": "Invalid file_guid format"})
+        request_handler.send_json_response(
+            400, {"error": "Invalid file_guid format"})
         return
 
     # Get credentials
@@ -301,7 +344,8 @@ def handle_mail_download(request_handler, context):
         identity = app_ctx.config.identity
         an = _get_an_for_download(app_ctx)
     except Exception as e:
-        request_handler.send_json_response(500, {"error": "Configuration error", "details": str(e)})
+        request_handler.send_json_response(
+            500, {"error": "Configuration error", "details": str(e)})
         return
 
     # Download file
@@ -318,24 +362,28 @@ def handle_mail_download(request_handler, context):
         # --- REACTIVE HEALING INTEGRATION ---
         if status == 200:
             from src.app import move_identity_to_fracked
-            log_error(logger, "API", "Download failed (200). Initiating healing.")
+            log_error(logger, "API",
+                      "Download failed (200). Initiating healing.")
             move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
-            request_handler.send_json_response(401, {"error": "Authentication failed - Coin fracked"})
+            request_handler.send_json_response(
+                401, {"error": "Authentication failed - Coin fracked"})
             return
 
         # Success: Return raw bytes
         request_handler.send_response(200)
         request_handler.send_header('Content-Type', 'application/octet-stream')
         request_handler.send_header('Content-Length', str(len(file_bytes)))
-        request_handler.send_header('Content-Disposition', f'attachment; filename="{file_guid}.bin"')
+        request_handler.send_header(
+            'Content-Disposition', f'attachment; filename="{file_guid}.bin"')
         request_handler.end_headers()
         request_handler.wfile.write(file_bytes)
 
     except Exception as e:
         log_error(logger, "API", f"Download failed: {e}")
-        request_handler.send_json_response(500, {"error": "Download failed", "details": str(e)})
+        request_handler.send_json_response(
+            500, {"error": "Download failed", "details": str(e)})
 
-## DONT DELETE
+# DONT DELETE
 
 # def _get_an_for_download(app_ctx):
 #     """
@@ -377,6 +425,7 @@ def handle_mail_download(request_handler, context):
 
 #     raise ValueError("Authenticity Number (AN) not found in beacon, config, or key file")
 
+
 def handle_mail_payment_download(request_handler, context):
     """
     GET /api/mail/payment/{id}
@@ -384,13 +433,13 @@ def handle_mail_payment_download(request_handler, context):
     Returns both ASCII and hex formats for user convenience.
     """
     from src.logger import log_error
-    
+
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
-    
+
     # Get file_guid from path parameter
     file_guid = context.path_params.get('id', '').replace('-', '').strip()
-    
+
     if len(file_guid) != 32:
         request_handler.send_json_response(400, {
             "error": "Invalid file_guid format",
@@ -398,7 +447,7 @@ def handle_mail_payment_download(request_handler, context):
             "status": "error"
         })
         return
-    
+
     # Query database for locker code
     try:
         cursor = db_handle.connection.cursor()
@@ -407,9 +456,9 @@ def handle_mail_payment_download(request_handler, context):
             FROM received_tells 
             WHERE file_guid = ?
         """, (file_guid,))
-        
+
         row = cursor.fetchone()
-        
+
         if not row:
             request_handler.send_json_response(404, {
                 "error": "Email not found",
@@ -417,9 +466,9 @@ def handle_mail_payment_download(request_handler, context):
                 "status": "error"
             })
             return
-        
+
         locker_code = row['locker_code']
-        
+
         if not locker_code:
             request_handler.send_json_response(404, {
                 "error": "No payment attached to this email",
@@ -428,7 +477,7 @@ def handle_mail_payment_download(request_handler, context):
                 "status": "error"
             })
             return
-        
+
         # Convert to bytes if stored as string
         if isinstance(locker_code, str):
             try:
@@ -437,7 +486,7 @@ def handle_mail_payment_download(request_handler, context):
                 locker_bytes = locker_code.encode('ascii')
         else:
             locker_bytes = locker_code
-        
+
         # Check if it's all zeros (no payment)
         if locker_bytes == b'\x00' * len(locker_bytes):
             request_handler.send_json_response(200, {
@@ -448,12 +497,12 @@ def handle_mail_payment_download(request_handler, context):
                 "note": "The sender paid for storage but did not include a recipient payment. You can still download and read this email."
             })
             return
-        
+
         # Convert to hex (remove trailing nulls)
         locker_hex = locker_bytes.hex().rstrip('0')
         if len(locker_hex) % 2 != 0:
             locker_hex += '0'  # Ensure even number of hex chars
-        
+
         # Convert to ASCII if printable
         try:
             # Try to decode as ASCII (strip null padding)
@@ -465,7 +514,7 @@ def handle_mail_payment_download(request_handler, context):
                 locker_code_display = locker_hex
         except (UnicodeDecodeError, AttributeError):
             locker_code_display = locker_hex
-        
+
         request_handler.send_json_response(200, {
             "status": "success",
             "locker_code": locker_code_display,
@@ -473,7 +522,7 @@ def handle_mail_payment_download(request_handler, context):
             "message": "Use this code to download payment coins from RAIDA",
             "note": "You can use either the locker_code or locker_code_hex format"
         })
-        
+
     except Exception as e:
         log_error(app_ctx.logger, "API", f"Error getting payment locker: {e}")
         request_handler.send_json_response(500, {
@@ -482,50 +531,47 @@ def handle_mail_payment_download(request_handler, context):
             "status": "error"
         })
 
+
 def _get_an_for_download(app_ctx):
     """
-    Get the full 400-byte Authenticity Number (AN) block for download operations.
-    Uses content-based coin discovery - resilient to file renaming.
-    REQUIRED: Must return 400 bytes so the downloader can slice for multiple RAIDAs.
+    Get the full 400-byte Authenticity Number (AN) block.
+    FIXED: Corrected indentation to fix variable access error.
     """
     from src.logger import log_error, log_debug, log_warning
     from coin_scanner import find_identity_coin
     import os
 
     identity = app_ctx.config.identity
-    
-    # 1. Try if it's already loaded in the identity object (from app.py initialization)
+
+    # 1. Try loaded identity object
     if hasattr(identity, 'authenticity_number') and identity.authenticity_number:
-        # Convert from hex string if necessary (app.py stores it as hex)
         an_data = identity.authenticity_number
-        if isinstance(an_data, str):
-            an_bytes = bytes.fromhex(an_data)
-        else:
-            an_bytes = an_data
-            
+        an_bytes = bytes.fromhex(an_data) if isinstance(an_data, str) else an_data
         if len(an_bytes) >= 400:
             return an_bytes[:400]
 
-    # 2. Content-based search for identity coin (resilient to renaming)
-    bank_dir = "Data/Wallets/Default/Bank"
-    identity_coin = find_identity_coin(bank_dir, identity.serial_number)
+    # 2. FIXED: Content-based search (indented correctly now)
+    mailbox_bank = "Data/Wallets/Mailbox/Bank"
+    default_bank = "Data/Wallets/Default/Bank"
     
+    identity_coin = find_identity_coin(mailbox_bank, identity.serial_number)
+    if not identity_coin:
+        identity_coin = find_identity_coin(default_bank, identity.serial_number)
+        
     if identity_coin:
         # Convert 25 ANs to 400-byte block
         an_block = b''.join(identity_coin['ans'][:25])
-        
         if len(an_block) == 400:
-            log_debug(app_ctx.logger, "API", 
-                     f"Successfully loaded 400-byte AN from {os.path.basename(identity_coin['file_path'])}")
+            log_debug(app_ctx.logger, "API",
+                      f"Successfully loaded AN from {os.path.basename(identity_coin['file_path'])}")
             return an_block
 
-    # 3. Fallback: Beacon handle (Only if we are only downloading from ONE specific server)
+    # 3. Fallback: Beacon handle
     if app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
-        # WARNING: This is only 16 bytes!
-        log_warning(app_ctx.logger, "API", "Using single-RAIDA AN for multi-stripe download. This may fail.")
+        log_warning(app_ctx.logger, "API", "Using single-RAIDA AN for multi-stripe download.")
         return app_ctx.beacon_handle.encryption_key
 
-    raise ValueError(f"Full 400-byte AN block not found for identity coin SN {identity.serial_number}")
+    raise ValueError(f"Full 400-byte AN not found for SN {identity.serial_number}")
 
 def handle_mail_list(request_handler, context):
     """
@@ -563,7 +609,8 @@ def handle_mail_list(request_handler, context):
         offset = 0
 
     # Get emails from database
-    err, emails = list_emails(db_handle, folder=folder, limit=limit, offset=offset)
+    err, emails = list_emails(db_handle, folder=folder,
+                              limit=limit, offset=offset)
 
     if err != DatabaseErrorCode.SUCCESS:
         request_handler.send_json_response(500, {
@@ -589,196 +636,111 @@ def handle_mail_list(request_handler, context):
         "offset": offset
     }
     request_handler.send_json_response(200, response)
+
 # src/api_handlers.py
-import json
-import threading
-import socket #
-from src.task_manager import create_task, start_task, complete_task, fail_task #
 
 def handle_create_mailbox(request_handler, request_context):
     """
-    POST /api/mail/create-mailbox - Stake mailbox with coins from locker
-    
-    Accepts PNG file upload via multipart/form-data.
-    Extracts locker code from filename (e.g., "FG9-YUE3.png" → "FG9YUE3")
-    Downloads coins from RAIDA locker and stakes mailbox.
-    
-    File upload:
-        multipart/form-data with PNG file named "{LOCKER_CODE}.png"
-        Field name: "mailbox_image"
-    
-    Process:
-    1. Extract locker code from PNG filename
-    2. Download coins from RAIDA locker
-    3. Save coins to Default/Bank folder
-    4. Create email address from coin serial number
-    5. Auto-update config with identity info
-    6. Return email address to user
+    POST /api/mail/create-mailbox - Establish identity by staking a PNG image.
+    FIXED: Now uses stake_locker_identity targeting the 'Mailbox' wallet.
     """
-    from locker_download import download_locker
-    from coin_scanner import parse_denomination_code
-    from logger import log_info, log_error
-    import asyncio
+    from src.task_manager import stake_locker_identity
+    from src.coin_scanner import find_identity_coin
+    from src.logger import log_info, log_error
     import re
     import os
     import toml
-    
+
     app_ctx = request_handler.server_instance.app_context
     logger = app_ctx.logger
-    
-    # Parse multipart form data
+
+    # 1. PARSE MULTIPART FORM DATA
     content_type = request_context.headers.get('Content-Type', '')
     if 'multipart/form-data' not in content_type:
-        request_handler.send_json_response(400, {
-            "error": "Content-Type must be multipart/form-data",
-            "status": "error"
-        })
-        return
-    
-    # Get uploaded file
+        return request_handler.send_json_response(400, {"error": "Content-Type must be multipart/form-data"})
+
     files = getattr(request_context, 'files', {})
-    
     if 'mailbox_image' not in files:
-        request_handler.send_json_response(400, {
-            "error": "Missing mailbox_image file",
-            "details": "Upload PNG file with field name 'mailbox_image'",
-            "status": "error"
-        })
-        return
-    
+        return request_handler.send_json_response(400, {"error": "Missing mailbox_image file"})
+
     file_info = files['mailbox_image']
     filename = file_info.get('filename', '')
-    
-    # Validate PNG extension
+
+    # 2. EXTRACT LOCKER CODE FROM FILENAME
     if not filename.lower().endswith('.png'):
-        request_handler.send_json_response(400, {
-            "error": "File must be a PNG image",
-            "filename": filename,
-            "status": "error"
-        })
-        return
-    
-    # Extract locker code from filename
-    # Format: "FG9-YUE3.png" or "FG9YUE3.png" → "FG9YUE3"
-    base_name = filename[:-4]  # Remove .png
+        return request_handler.send_json_response(400, {"error": "File must be a PNG image"})
+
+    base_name = filename[:-4]
     locker_code = base_name.replace('-', '').replace('_', '').upper()
-    
-    if len(locker_code) != 8:
-        request_handler.send_json_response(400, {
-            "error": "Invalid locker code in filename",
-            "details": f"Expected 8-character code, got '{locker_code}' ({len(locker_code)} chars)",
-            "filename": filename,
-            "status": "error"
-        })
-        return
-    
-    # Validate locker code format (alphanumeric only)
-    if not re.match(r'^[A-Z0-9]{8}$', locker_code):
-        request_handler.send_json_response(400, {
-            "error": "Invalid locker code format",
-            "details": "Locker code must be 8 alphanumeric characters",
-            "locker_code": locker_code,
-            "status": "error"
-        })
-        return
-    
+
+    if len(locker_code) != 8 or not re.match(r'^[A-Z0-9]{8}$', locker_code):
+        return request_handler.send_json_response(400, {"error": "Invalid 8-character locker code in filename"})
+
     try:
-        # Download coins from RAIDA locker
-        log_info(logger, "CreateMailbox", 
-                f"Downloading coins from locker: {locker_code}")
+        # 3. EXECUTE STAKING (Targeting Mailbox Wallet)
+        log_info(logger, "CreateMailbox", f"Establishing identity from locker: {locker_code}")
         
-        coins = asyncio.run(download_locker(locker_code))
-        
-        if not coins or len(coins) == 0:
-            request_handler.send_json_response(404, {
-                "error": "Locker is empty or invalid",
-                "locker_code": locker_code,
-                "status": "error"
-            })
-            return
-        
-        # Create Default/Bank folder (identity coin goes here)
-        mailbox_folder = "Data/Wallets/Default/Bank"
-        os.makedirs(mailbox_folder, exist_ok=True)
-        
-        # Save coins to Bank
-        saved_coins = []
-        total_value = 0.0
-        
-        for coin in coins:
-            # Generate filename: 0006{DN}{SN}.bin
-            filename = f"0006{coin.denomination:02X}{coin.sn:08X}.bin"
-            filepath = os.path.join(mailbox_folder, filename)
-            
-            # Save coin binary data
-            with open(filepath, 'wb') as f:
-                coin_data = coin.to_binary()
-                f.write(coin_data)
-            
-            coin_value = parse_denomination_code(coin.denomination)
-            total_value += coin_value
-            
-            saved_coins.append({
-                "denomination": coin.denomination,
-                "serial_number": coin.sn,
-                "value": coin_value,
-                "filename": filename
-            })
-            
-            log_info(logger, "CreateMailbox",
-                    f"Saved coin: DN={coin.denomination}, SN={coin.sn}, Value={coin_value}")
-        
-        # Generate email address from first coin
-        # Format: 0006.{denomination}.{serial_number}
-        first_coin = coins[0]
-        email_address = f"0006.{first_coin.denomination}.{first_coin.sn}"
-        
-        log_info(logger, "CreateMailbox",
-                f"Mailbox created successfully: {email_address}")
-        
-        # CRITICAL: Update config file with identity info (auto-configure after staking)
+        # Convert string code to bytes and trigger the standardized logic
+        success = stake_locker_identity(
+            locker_code_bytes=locker_code.encode('ascii'),
+            app_context=app_ctx,
+            target_wallet="Mailbox",  # CRITICAL: This goes to Mailbox folder
+            logger=logger
+        )
+
+        if not success:
+            return request_handler.send_json_response(404, {"error": "Locker is empty or consensus failed."})
+
+        # 4. DISCOVER THE NEW IDENTITY COIN
+        # Scan the Mailbox/Bank to find the coin that was just saved
+        mailbox_bank = "Data/Wallets/Mailbox/Bank"
+        identity_coin = find_identity_coin(mailbox_bank, None) # None finds the first available coin
+
+        if not identity_coin:
+            return request_handler.send_json_response(500, {"error": "Staking reported success but coin file not found."})
+
+        sn = identity_coin['sn']
+        dn = identity_coin['dn']
+        email_address = f"0006.{dn}.{sn}"
+
+        # 5. AUTO-UPDATE CONFIG FILE
         config_path = "config/qmail.toml"
-        
         try:
             with open(config_path, 'r') as f:
                 config_data = toml.load(f)
-            
-            # Update identity section
+
             if 'identity' not in config_data:
                 config_data['identity'] = {}
-            
-            config_data['identity']['serial_number'] = first_coin.sn
-            config_data['identity']['denomination'] = first_coin.denomination
-            
-            # Write back
+
+            config_data['identity']['serial_number'] = sn
+            config_data['identity']['denomination'] = dn
+
             with open(config_path, 'w') as f:
                 toml.dump(config_data, f)
             
-            log_info(logger, "CreateMailbox",
-                    f"Updated config with identity: SN={first_coin.sn}, DN={first_coin.denomination}")
+            # Update memory context so user doesn't have to restart
+            app_ctx.config.identity.serial_number = sn
+            app_ctx.config.identity.denomination = dn
+            
+            log_info(logger, "CreateMailbox", f"✓ Config updated for identity {email_address}")
         except Exception as e:
-            log_error(logger, "CreateMailbox", f"Failed to update config: {e}")
-        
-        request_handler.send_json_response(200, {
+            log_error(logger, "CreateMailbox", f"Failed to auto-update config: {e}")
+
+        # 6. RETURN SUCCESS
+        return request_handler.send_json_response(200, {
             "status": "success",
-            "message": "Mailbox staked successfully",
+            "message": "Mailbox established successfully.",
             "email_address": email_address,
-            "coins_staked": len(saved_coins),
-            "total_value": total_value,
-            "coins": saved_coins
+            "serial_number": sn
         })
-        
+
     except Exception as e:
-        log_error(logger, "CreateMailbox", 
-                 f"Mailbox creation failed: {e}")
-        request_handler.send_json_response(500, {
-            "error": "Mailbox creation failed",
-            "details": str(e),
-            "status": "error"
-        })
+        log_error(logger, "CreateMailbox", f"Staking crash: {e}")
+        return request_handler.send_json_response(500, {"error": str(e)})
 # ============================================================================
 # DATA ENDPOINTS
 # ============================================================================
+
 
 def handle_get_contacts(request_handler, context):
     """
@@ -857,7 +819,8 @@ def handle_search_emails(request_handler, context):
         offset = 0
 
     # Search database using FTS5
-    err, results = search_emails(db_handle, query.strip(), limit=limit, offset=offset)
+    err, results = search_emails(
+        db_handle, query.strip(), limit=limit, offset=offset)
 
     if err != DatabaseErrorCode.SUCCESS:
         request_handler.send_json_response(500, {
@@ -947,7 +910,8 @@ def handle_get_servers(request_handler, context):
 
     # Parse query parameters
     # include_unavailable=true means available_only=false
-    include_unavailable = context.query_params.get('include_unavailable', ['false'])[0].lower() == 'true'
+    include_unavailable = context.query_params.get(
+        'include_unavailable', ['false'])[0].lower() == 'true'
     available_only = not include_unavailable
 
     # Get servers from database
@@ -1167,7 +1131,7 @@ def handle_set_parity_server(request_handler, context):
 #             "status": "error"
 #         })
 #         return
-    
+
 
 #     res_data = status.result
 #     if isinstance(res_data, dict):
@@ -1198,13 +1162,15 @@ def handle_task_status(request_handler, context):
     err, status = get_task_status(app_ctx.task_manager, task_id)
 
     if err != TaskErrorCode.SUCCESS:
-        request_handler.send_json_response(404, {"error": "Task not found", "status": "error"})
+        request_handler.send_json_response(
+            404, {"error": "Task not found", "status": "error"})
         return
 
     # FIX: Ensure result data is JSON-serializable (converts hex if dict has bytes)
     res_data = res_data = status.result
     if isinstance(res_data, dict):
-        res_data = {k: (v.hex() if isinstance(v, bytes) else v) for k, v in res_data.items()}
+        res_data = {k: (v.hex() if isinstance(v, bytes) else v)
+                    for k, v in res_data.items()}
 
     response = {
         "task_id": status.task_id,
@@ -1340,7 +1306,7 @@ def _validate_email_id(email_id_str):
 def handle_mail_get(request_handler, context):
     """
     GET /api/mail/{id} - Get email metadata (without body by default)
-    
+
     UPDATED: Checks both downloaded emails (Emails table) and pending notifications (received_tells table)
 
     Path parameter:
@@ -1353,7 +1319,7 @@ def handle_mail_get(request_handler, context):
         - 500 for database errors
     """
     from src.logger import log_error
-    
+
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
@@ -1385,7 +1351,7 @@ def handle_mail_get(request_handler, context):
                 FROM received_tells 
                 WHERE file_guid = ?
             """, (clean_id,))
-            
+
             row = cursor.fetchone()
             if row:
                 # Convert locker_code to hex string safely
@@ -1397,7 +1363,7 @@ def handle_mail_get(request_handler, context):
                         locker_hex = str(locker_code)
                 else:
                     locker_hex = None
-                
+
                 # Found in pending tells - return limited metadata
                 request_handler.send_json_response(200, {
                     "EmailID": row['file_guid'],
@@ -1413,7 +1379,7 @@ def handle_mail_get(request_handler, context):
                     "note": "This email has not been downloaded yet. Call /api/mail/download/{id} to retrieve content."
                 })
                 return
-            
+
             # Not found in either table
             request_handler.send_json_response(404, {
                 "error": "Email not found",
@@ -1421,9 +1387,10 @@ def handle_mail_get(request_handler, context):
                 "status": "error"
             })
             return
-            
+
         except Exception as e:
-            log_error(app_ctx.logger, "API", f"Error checking received_tells: {e}")
+            log_error(app_ctx.logger, "API",
+                      f"Error checking received_tells: {e}")
             request_handler.send_json_response(500, {
                 "error": "Database error",
                 "details": str(e),
@@ -1437,6 +1404,7 @@ def handle_mail_get(request_handler, context):
         "code": int(err),
         "status": "error"
     })
+
 
 def handle_mail_delete(request_handler, context):
     """
@@ -1551,7 +1519,8 @@ def handle_mail_move(request_handler, context):
         })
         return
 
-    previous_folder = metadata.get('folder', 'unknown') if metadata else 'unknown'
+    previous_folder = metadata.get(
+        'folder', 'unknown') if metadata else 'unknown'
 
     # Build flags to update
     flags = {'folder': new_folder}
@@ -1917,7 +1886,8 @@ def handle_mail_attachment_download(request_handler, context):
     request_handler.send_response(200)
     request_handler.send_header('Content-Type', mime_type)
     request_handler.send_header('Content-Length', str(len(file_data)))
-    request_handler.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+    request_handler.send_header(
+        'Content-Disposition', f'attachment; filename="{filename}"')
     request_handler.send_header('X-Attachment-ID', str(attachment_id))
     request_handler.send_header('X-Email-ID', clean_id)
     request_handler.end_headers()
@@ -2130,7 +2100,8 @@ def handle_contacts_list(request_handler, context):
     search = query_params.get('q', None)
 
     # Call database function
-    err, contacts, total = get_all_contacts(db_handle, page=page, limit=limit, search=search)
+    err, contacts, total = get_all_contacts(
+        db_handle, page=page, limit=limit, search=search)
 
     if err != DatabaseErrorCode.SUCCESS:
         request_handler.send_json_response(500, {
@@ -2193,7 +2164,8 @@ def handle_contacts_add(request_handler, context):
         return
 
     # Validate first_name (required)
-    valid, err_msg = _validate_contact_name(body.get('first_name'), 'first_name', required=True)
+    valid, err_msg = _validate_contact_name(
+        body.get('first_name'), 'first_name', required=True)
     if not valid:
         request_handler.send_json_response(400, {
             "error": err_msg,
@@ -2202,7 +2174,8 @@ def handle_contacts_add(request_handler, context):
         return
 
     # Validate last_name (optional)
-    valid, err_msg = _validate_contact_name(body.get('last_name'), 'last_name', required=False)
+    valid, err_msg = _validate_contact_name(
+        body.get('last_name'), 'last_name', required=False)
     if not valid:
         request_handler.send_json_response(400, {
             "error": err_msg,
@@ -2688,7 +2661,8 @@ def handle_draft_update(request_handler, context):
 
     # Validate and add recipient_ids if present
     if 'recipient_ids' in body:
-        valid, err_msg = _validate_recipient_ids(body['recipient_ids'], 'recipient_ids')
+        valid, err_msg = _validate_recipient_ids(
+            body['recipient_ids'], 'recipient_ids')
         if not valid:
             request_handler.send_json_response(400, {
                 "error": err_msg,
@@ -2792,7 +2766,8 @@ def handle_wallet_balance(request_handler, context):
     from src.coin_scanner import scan_wallet_folders
 
     app_ctx = request_handler.server_instance.app_context
-    logger = app_ctx.logger_handle if hasattr(app_ctx, 'logger_handle') else None
+    logger = app_ctx.logger_handle if hasattr(
+        app_ctx, 'logger_handle') else None
 
     try:
         # Get wallet paths - QMail uses fixed "Default" wallet
@@ -2823,14 +2798,17 @@ def handle_wallet_balance(request_handler, context):
                 missing_folders.append(folder_name)
                 if logger:
                     from src.logger import log_warning
-                    log_warning(logger, "API", f"Missing wallet folder: {folder_name} at {folder_path}")
+                    log_warning(
+                        logger, "API", f"Missing wallet folder: {folder_name} at {folder_path}")
 
         # If critical folders are missing, warn but continue (will return 0 balance for those folders)
         if missing_folders:
-            warnings.append(f"Missing folders: {', '.join(missing_folders)}. Wallet may not be properly initialized.")
+            warnings.append(
+                f"Missing folders: {', '.join(missing_folders)}. Wallet may not be properly initialized.")
 
         # Scan all folders
-        balance_info = scan_wallet_folders(bank_path, fracked_path, limbo_path, logger)
+        balance_info = scan_wallet_folders(
+            bank_path, fracked_path, limbo_path, logger)
 
         # Build response matching C API format
         response = {
@@ -2862,6 +2840,7 @@ def handle_wallet_balance(request_handler, context):
             "details": str(e)
         })
 
+
 def handle_stake_mailbox(request_handler, context):
     """
     POST /api/mail/stake - Manual Staking Flow (First Login)
@@ -2874,16 +2853,16 @@ def handle_stake_mailbox(request_handler, context):
 
     app_ctx = request_handler.server_instance.app_context
     data = context.json or {}
-    
+
     # 1. Capture and Clean Locker Code (AS8D-HJL)
     raw_code = data.get('locker_code', '')
     if not raw_code:
         return request_handler.send_json_response(400, {"error": "Locker code required."})
-    
+
     clean_code = raw_code.replace('-', '').strip().upper()
     locker_bytes = clean_code.encode('ascii')[:8]
 
-    # 2. Call Command 91 (Download) 
+    # 2. Call Command 91 (Download)
     # NOTE: If this fails with insufficient responses, it confirms servers lack CCV3.
     wallet_path = get_wallet_path(DEFAULT_WALLET)
     try:
@@ -2905,13 +2884,13 @@ def handle_stake_mailbox(request_handler, context):
     if coins:
         target_path = os.path.join(wallet_path, "Bank")
         move_coin_file(coins[0], target_path)
-        
+
         # Immediate update so user doesn't have to restart to send mail
         app_ctx.config.identity.serial_number = coins[0].serial_number
         app_ctx.config.identity.denomination = coins[0].denomination
-        
+
         return request_handler.send_json_response(200, {
-            "status": "success", 
+            "status": "success",
             "serial_number": coins[0].serial_number,
             "message": "Mailbox successfully staked."
         })
@@ -2962,7 +2941,8 @@ def handle_locker_download(request_handler, context):
     from src.wallet_structure import get_wallet_path, DEFAULT_WALLET
 
     app_ctx = request_handler.server_instance.app_context
-    logger = app_ctx.logger_handle if hasattr(app_ctx, 'logger_handle') else None
+    logger = app_ctx.logger_handle if hasattr(
+        app_ctx, 'logger_handle') else None
     db_handle = app_ctx.db_handle if hasattr(app_ctx, 'db_handle') else None
 
     # Get request body
@@ -3087,39 +3067,49 @@ def register_all_routes(server):
 
     # Mail operations
     server.register_route('POST', '/api/mail/send', handle_mail_send)
-    server.register_route('GET', '/api/mail/download/{id}', handle_mail_download)
-    server.register_route('GET', '/api/mail/payment/{id}', handle_mail_payment_download)
+    server.register_route(
+        'GET', '/api/mail/download/{id}', handle_mail_download)
+    server.register_route(
+        'GET', '/api/mail/payment/{id}', handle_mail_payment_download)
     server.register_route('GET', '/api/mail/list', handle_mail_list)
-    server.register_route('POST', '/api/mail/create-mailbox', handle_create_mailbox)
+    server.register_route(
+        'POST', '/api/mail/create-mailbox', handle_create_mailbox)
 
     # Email management endpoints
-    server.register_route('GET', '/api/mail/folders', handle_mail_folders)  
-    server.register_route('GET', '/api/mail/count', handle_mail_count)     
-    server.register_route('GET', '/api/mail/{id}', handle_mail_get)         
+    server.register_route('GET', '/api/mail/folders', handle_mail_folders)
+    server.register_route('GET', '/api/mail/count', handle_mail_count)
+    server.register_route('GET', '/api/mail/{id}', handle_mail_get)
     server.register_route('DELETE', '/api/mail/{id}', handle_mail_delete)
     server.register_route('PUT', '/api/mail/{id}/move', handle_mail_move)
     server.register_route('PUT', '/api/mail/{id}/read', handle_mail_read)
 
     # Attachment endpoints
-    server.register_route('GET', '/api/mail/{id}/attachments', handle_mail_attachments)
-    server.register_route('GET', '/api/mail/{id}/attachment/{n}', handle_mail_attachment_download)
+    server.register_route(
+        'GET', '/api/mail/{id}/attachments', handle_mail_attachments)
+    server.register_route(
+        'GET', '/api/mail/{id}/attachment/{n}', handle_mail_attachment_download)
 
     # Data operations
-    server.register_route('GET', '/api/data/contacts/popular', handle_get_contacts)
-    server.register_route('GET', '/api/data/emails/search', handle_search_emails)
+    server.register_route(
+        'GET', '/api/data/contacts/popular', handle_get_contacts)
+    server.register_route(
+        'GET', '/api/data/emails/search', handle_search_emails)
     server.register_route('GET', '/api/data/users/search', handle_search_users)
     server.register_route('GET', '/api/data/servers', handle_get_servers)
 
     # Admin operations
     server.register_route('POST', '/api/admin/sync', handle_sync)
-    server.register_route('GET', '/api/admin/servers/parity', handle_get_parity_server)
-    server.register_route('POST', '/api/admin/servers/parity', handle_set_parity_server)
+    server.register_route(
+        'GET', '/api/admin/servers/parity', handle_get_parity_server)
+    server.register_route(
+        'POST', '/api/admin/servers/parity', handle_set_parity_server)
 
     # Wallet operations
     server.register_route('GET', '/api/wallet/balance', handle_wallet_balance)
 
     # Locker operations
-    server.register_route('POST', '/api/locker/download', handle_locker_download)
+    server.register_route('POST', '/api/locker/download',
+                          handle_locker_download)
 
     # Task operations
     server.register_route('GET', '/api/task/status/{id}', handle_task_status)
@@ -3128,7 +3118,8 @@ def register_all_routes(server):
     # Contact management endpoints
     server.register_route('GET', '/api/contacts', handle_contacts_list)
     server.register_route('POST', '/api/contacts', handle_contacts_add)
-    server.register_route('DELETE', '/api/contacts/{id}', handle_contacts_delete)
+    server.register_route(
+        'DELETE', '/api/contacts/{id}', handle_contacts_delete)
 
     # Draft management endpoints
     server.register_route('GET', '/api/mail/drafts', handle_drafts_list)

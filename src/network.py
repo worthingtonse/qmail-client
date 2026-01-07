@@ -46,8 +46,8 @@ from enum import IntEnum
 
 # Import crypto module for encryption
 try:
-    from .crypto import encrypt_data, decrypt_data, CryptoErrorCode, AES_KEY_SIZE
-    from .qmail_types import NetworkConfig
+    from crypto import encrypt_data, decrypt_data, CryptoErrorCode, AES_KEY_SIZE
+    from qmail_types import NetworkConfig
 except ImportError:
     # Fallback for standalone testing
     try:
@@ -101,7 +101,7 @@ except ImportError:
 
 # Import logger
 try:
-    from .logger import log_error, log_info, log_debug, log_warning
+    from logger import log_error, log_info, log_debug, log_warning
 except ImportError:
     def log_error(handle, context, msg, reason=None):
         if reason:

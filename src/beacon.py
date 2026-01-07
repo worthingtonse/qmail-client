@@ -278,6 +278,7 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
     """
     Performs a single, non-blocking PEEK request.
     FIXED: Now handles Status 200 to trigger Reactive Healing.
+    FIXED: Removed internal timestamp update - let caller handle it.
     """
     if handle is None:
         return NetworkErrorCode.ERR_INVALID_PARAM, []
@@ -335,13 +336,10 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
         if parse_err != protocol.ProtocolErrorCode.SUCCESS:
             return NetworkErrorCode.ERR_INVALID_RESPONSE, []
 
-        if tells:
-            latest_ts = max(t.timestamp for t in tells)
-            if latest_ts > handle.last_tell_timestamp:
-                handle.last_tell_timestamp = latest_ts
-                _save_state(handle) 
-        
+        # DO NOT update timestamp here - let the monitoring loop handle it
+        # This prevents the catchup loop from getting stuck on the same notifications
         return NetworkErrorCode.SUCCESS, tells
+        
     finally:
         if conn:
             network.disconnect(conn, handle.logger_handle)
@@ -383,21 +381,57 @@ def _save_state(handle: BeaconHandle):
 def _monitor_loop(handle: BeaconHandle):
     """
     The main loop for the background thread.
-    Continuously polls the beacon server for new mail notifications.
-    FIXED: Uses shutdown_event.wait() to allow immediate termination on Ctrl+C.
+    FIXED: Prevents tight-loop spamming during Phase 2 when old mail persists on server.
     """
     log_info(handle.logger_handle, "BeaconLoop", "Monitoring loop started.")
     
     _load_state(handle)
-    if handle.last_tell_timestamp > 0:
-        log_info(handle.logger_handle, "BeaconLoop", "Performing initial PEEK...")
-        err, tells = do_peek(handle)
-        if err == NetworkErrorCode.SUCCESS and tells and handle.on_mail_received:
-            try:
-                handle.on_mail_received(tells)
-            except Exception as e:
-                log_error(handle.logger_handle, "BeaconLoop", f"Initial PEEK callback failed: {e}")
-
+    
+    # PHASE 1: Initial catchup using PEEK
+    log_info(handle.logger_handle, "BeaconLoop", "Phase 1: Catching up with new mail...")
+    catchup_complete = False
+    catchup_attempts = 0
+    max_catchup_attempts = 5
+    
+    while not catchup_complete and catchup_attempts < max_catchup_attempts:
+        catchup_attempts += 1
+        err, tells = do_peek(handle, since_timestamp=handle.last_tell_timestamp)
+        
+        if err == NetworkErrorCode.SUCCESS:
+            if tells:
+                log_info(handle.logger_handle, "BeaconLoop", 
+                        f"Catchup attempt {catchup_attempts}: {len(tells)} notifications")
+                
+                latest_ts = max(t.timestamp for t in tells)
+                
+                if latest_ts > handle.last_tell_timestamp:
+                    handle.last_tell_timestamp = latest_ts
+                    _save_state(handle)
+                else:
+                    import time
+                    current_time = int(time.time())
+                    log_warning(handle.logger_handle, "BeaconLoop",
+                               f"Catchup: Notifications are old. Forcing timestamp to {current_time}")
+                    handle.last_tell_timestamp = current_time
+                    _save_state(handle)
+                
+                if handle.on_mail_received:
+                    try:
+                        handle.on_mail_received(tells)
+                    except Exception as e:
+                        log_error(handle.logger_handle, "BeaconLoop", f"Catchup callback failed: {e}")
+                
+                continue
+            else:
+                log_info(handle.logger_handle, "BeaconLoop", "Catchup complete.")
+                catchup_complete = True
+        else:
+            log_warning(handle.logger_handle, "BeaconLoop", f"Catchup failed: {err.name}")
+            handle.shutdown_event.wait(timeout=2.0)
+    
+    # PHASE 2: Long-polling with PING
+    log_info(handle.logger_handle, "BeaconLoop", "Phase 2: Active long-poll monitoring...")
+    
     retry_delay_sec = 1.0
     max_retry_delay_sec = 60.0
 
@@ -405,43 +439,59 @@ def _monitor_loop(handle: BeaconHandle):
         try:
             err, tells = _do_one_ping_cycle(handle)
             
-            # Check shutdown immediately after a network call
             if handle.shutdown_event.is_set(): 
                 break
 
             if err == NetworkErrorCode.SUCCESS:
                 retry_delay_sec = 1.0  
                 
-                if tells and handle.on_mail_received:
-                    log_info(handle.logger_handle, "BeaconLoop", f"Received {len(tells)} new mail notifications.")
-                    try:
-                        latest_ts = max(t.timestamp for t in tells)
-                        if latest_ts > handle.last_tell_timestamp:
-                            handle.last_tell_timestamp = latest_ts
-                            _save_state(handle)
+                if tells:
+                    log_info(handle.logger_handle, "BeaconLoop", f"Received {len(tells)} notifications.")
+                    
+                    import time
+                    latest_ts = max(t.timestamp for t in tells)
+                    
+                    # Determine if we should wait (if mail is old)
+                    should_cooldown = latest_ts <= handle.last_tell_timestamp
+                    
+                    if not should_cooldown:
+                        # New mail - advance timestamp
+                        handle.last_tell_timestamp = latest_ts
+                        _save_state(handle)
+                    else:
+                        # Old mail - force skip
+                        current_time = int(time.time())
+                        log_warning(handle.logger_handle, "BeaconLoop",
+                                   f"Phase 2: Old mail detected. Forcing timestamp to {current_time}")
+                        handle.last_tell_timestamp = current_time
+                        _save_state(handle)
+                        
+                        # Cooldown pause to prevent spamming
+                        handle.shutdown_event.wait(timeout=5.0)
 
-                        # Callback logic
-                        cb_thread = threading.Thread(target=handle.on_mail_received, args=(tells,))
-                        cb_thread.start()
-                    except Exception as e:
-                        log_error(handle.logger_handle, "BeaconLoop", f"Mail callback failed: {e}")
+                    # FIXED: Call the callback synchronously. 
+                    # This ensures the monitor thread stays alive until processing is done,
+                    # preventing the "Closed Database" error during shutdown.
+                    if handle.on_mail_received and not handle.shutdown_event.is_set():
+                        try:
+                            handle.on_mail_received(tells)
+                        except Exception as e:
+                            log_error(handle.logger_handle, "BeaconLoop", f"Mail callback failed: {e}")
                 else:
-                    log_debug(handle.logger_handle, "BeaconLoop", "Ping successful, no new mail.")
+                    log_debug(handle.logger_handle, "BeaconLoop", "Long-poll timeout - no mail")
                 
-                # FIXED: Wait for the interval even on success to prevent spinning
-                handle.shutdown_event.wait(timeout=handle.beacon_config.interval_sec)
-
+            elif err == NetworkErrorCode.ERR_INVALID_AN:
+                log_error(handle.logger_handle, "BeaconLoop", "Stopping monitor - healing required")
+                break
+                
             else:
-                log_warning(handle.logger_handle, "BeaconLoop", f"Ping cycle failed with '{err.name}'. Retrying...")
+                log_warning(handle.logger_handle, "BeaconLoop", f"Long-poll failed: {err.name}")
                 handle.shutdown_event.wait(timeout=retry_delay_sec)
                 retry_delay_sec = min(retry_delay_sec * 2, max_retry_delay_sec)
                 
         except Exception as e:
             log_error(handle.logger_handle, "BeaconLoop", f"Unhandled exception: {e}")
             handle.shutdown_event.wait(timeout=retry_delay_sec)
-
-    log_info(handle.logger_handle, "BeaconLoop", "Monitoring loop has been shut down.")
-
 def _do_one_ping_cycle(handle: BeaconHandle) -> Tuple[NetworkErrorCode, List[TellNotification]]:
     """
     Executes a single, complete long-poll PING cycle.

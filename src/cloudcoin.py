@@ -54,7 +54,7 @@ except ImportError:
 
 # Import logger
 try:
-    from .logger import log_error, log_info, log_debug, log_warning
+    from logger import log_error, log_info, log_debug, log_warning
 except ImportError:
     def log_error(handle, context, msg, reason=None):
         if reason:
@@ -723,6 +723,8 @@ def store_locker_key(
             log_error(handle.logger_handle, CC_CONTEXT,
                      "store_locker_key failed", f"IO error: {e}")
             return CloudCoinErrorCode.ERR_IO_ERROR
+        
+        
 
 
 def store_locker_keys(
@@ -854,6 +856,25 @@ def store_locker_keys(
                      "store_locker_keys failed", f"IO error: {e}")
             return CloudCoinErrorCode.ERR_IO_ERROR, 0
 
+
+def get_int_name(denomination: int, sn: int, pown_string: str = "ppppppppppppppppppppppppp") -> str:
+    """
+    Generates a Go-style internal filename.
+    Format: {whole}.{sat}.BTC.{pown}.{sn}.extra.{price}.{group}.bin
+    """
+    # Denomination mapping from utils (3).go and cloudcoin (1).go
+    denom_map = {
+        0: ("1", "00_000_000"),      # 1 CloudCoin
+        1: ("10", "00_000_000"),     # 10 CloudCoin
+        2: ("100", "00_000_000"),    # 100 CloudCoin
+        -1: ("0", "10_000_000"),     # 0.1 CloudCoin
+        11: ("1", "00_000_000"),     # Key Coin (treated as 1 CC for naming)
+    }
+    
+    whole, sat = denom_map.get(denomination, ("0", "00_000_000"))
+    
+    # Matches Go: fmt.Sprintf("%s.%s.BTC.%s.%d.extra.%d.%s.bin", ...)
+    return f"{whole}.{sat}.BTC.{pown_string}.{sn}.extra.0.default.bin"
 
 def get_available_key_count(
     handle: CloudCoinHandle,
@@ -1297,110 +1318,97 @@ def generate_coin_filename(
 
 def write_coin_file(
     filepath: str,
-    coin: LockerCoin,
+    coin: Any,  # Accepts LockerCoin or CloudCoin objects
     logger_handle: Optional[object] = None
 ) -> CloudCoinErrorCode:
     """
-    Write a CloudCoin to .bin file format.
+    Write a CloudCoin to .bin file format (Format Type 9).
+    FIXED: Handles hex string to binary conversion for ANs to prevent file corruption.
 
     Binary format (439 bytes total):
     - File Header: 32 bytes
     - Coin Header: 7 bytes
     - Coin Body: 400 bytes (25 ANs x 16 bytes)
-
-    File Header (32 bytes):
-    - [0]: File format version (0x09)
-    - [1]: Reserved (0x01)
-    - [2-3]: Coin ID (0x00 0x06, big-endian)
-    - [4]: Experimental (0x00)
-    - [5]: Encryption type (0x00 = none)
-    - [6-7]: Token count (0x00 0x01, big-endian, 1 coin)
-    - [8-14]: Password hash (zeros)
-    - [15]: State flag (zeros)
-    - [16-28]: POWN bytes (13 bytes)
-    - [29-31]: Padding (0x99 0x99 0x99)
-
-    Coin Header (7 bytes):
-    - [0]: Split (0x00)
-    - [1]: Shard (0x00)
-    - [2]: Denomination (int8, signed)
-    - [3-6]: Serial number (uint32, big-endian)
-
-    Coin Body (400 bytes):
-    - [0-399]: 25 ANs, 16 bytes each
-
-    Args:
-        filepath: Path to write .bin file
-        coin: LockerCoin object with denomination, serial_number, ans[], pown_string
-        logger_handle: Optional logger handle
-
-    Returns:
-        CloudCoinErrorCode
     """
     import struct
+    import os
+    from src.logger import log_error, log_debug
 
     try:
-        # Build file header (32 bytes)
+        # =====================================================================
+        # SECTION 1: Build File Header (32 bytes)
+        # =====================================================================
         file_header = bytearray(32)
-        file_header[0] = CC_FILE_FORMAT_VERSION  # Version (0x09)
-        file_header[1] = 0x01  # Reserved
-        file_header[2] = (CC_COIN_ID >> 8) & 0xFF  # Coin ID high byte
-        file_header[3] = CC_COIN_ID & 0xFF  # Coin ID low byte
-        file_header[4] = 0x00  # Experimental
-        file_header[5] = CC_ENCRYPTION_NONE  # Encryption type
-        file_header[6] = 0x00  # Token count high byte
-        file_header[7] = 0x01  # Token count low byte (1 coin)
-        # [8-14] password hash, already zeros
-        # [15] state flag, already zero
-
+        file_header[0] = 0x09                   # File format version (0x09)
+        file_header[1] = 0x01                   # Reserved
+        file_header[2] = 0x00                   # Coin ID high byte (0x0006)
+        file_header[3] = 0x06                   # Coin ID low byte
+        file_header[4] = 0x00                   # Experimental
+        file_header[5] = 0x00                   # Encryption type (0x00 = none)
+        file_header[6] = 0x00                   # Token count high byte
+        file_header[7] = 0x01                   # Token count low byte (1 coin)
+        
         # POWN bytes (13 bytes at positions 16-28)
+        # These bytes represent the 25-character 'pown_string' status.
         pown_bytes = _encode_pown_bytes(coin.pown_string)
         file_header[16:29] = pown_bytes
 
         # Padding (0x99 0x99 0x99)
-        file_header[29] = 0x99
-        file_header[30] = 0x99
-        file_header[31] = 0x99
+        file_header[29:32] = b'\x99\x99\x99'
 
-        # Build coin header (7 bytes)
+        # =====================================================================
+        # SECTION 2: Build Coin Header (7 bytes)
+        # =====================================================================
         coin_header = bytearray(7)
-        coin_header[0] = 0x00  # Split
-        coin_header[1] = 0x00  # Shard
+        coin_header[0] = 0x00                   # Split
+        coin_header[1] = 0x00                   # Shard
         coin_header[2] = coin.denomination & 0xFF  # Denomination (signed int8)
         # Serial number (uint32, big-endian)
-        coin_header[3:7] = struct.pack('>I', coin.serial_number)
+        struct.pack_into('>I', coin_header, 3, coin.serial_number)
 
-        # Build coin body (400 bytes - 25 ANs)
+        # =====================================================================
+        # SECTION 3: Build Coin Body (400 bytes - 25 ANs)
+        # =====================================================================
         coin_body = bytearray(400)
-        for i in range(CC_RAIDA_COUNT):
+        # Ensure we use raw bytes, converting from hex strings if provided by task manager.
+        for i in range(25): # CC_RAIDA_COUNT = 25
             if i < len(coin.ans) and coin.ans[i]:
-                an = coin.ans[i]
-                if len(an) >= CC_AN_LENGTH:
-                    coin_body[i * CC_AN_LENGTH:(i + 1) * CC_AN_LENGTH] = an[:CC_AN_LENGTH]
+                an_item = coin.ans[i]
+                
+                # FIXED: Convert hex string (e.g., "A1B2...") to raw bytes
+                if isinstance(an_item, str):
+                    try:
+                        an_bytes = bytes.fromhex(an_item)
+                    except ValueError:
+                        # Fallback for non-hex strings
+                        an_bytes = an_item.encode('ascii')
                 else:
-                    # Pad short AN with zeros
-                    coin_body[i * CC_AN_LENGTH:i * CC_AN_LENGTH + len(an)] = an
+                    an_bytes = an_item
 
-        # Write to file
+                # Write exactly 16 bytes per RAIDA index
+                length = min(len(an_bytes), 16) # CC_AN_LENGTH = 16
+                start_offset = i * 16
+                coin_body[start_offset : start_offset + length] = an_bytes[:length]
+
+        # =====================================================================
+        # SECTION 4: Atomic Write to Disk
+        # =====================================================================
         with open(filepath, 'wb') as f:
-            f.write(file_header)
-            f.write(coin_header)
-            f.write(coin_body)
+            f.write(file_header) # Bytes 0-31
+            f.write(coin_header) # Bytes 32-38
+            f.write(coin_body)   # Bytes 39-438 (Total 439 bytes)
 
-        log_debug(logger_handle, CC_CONTEXT,
-                  f"Wrote coin file: SN={coin.serial_number}, DN={coin.denomination}")
+        log_debug(logger_handle, "CloudCoin",
+                  f"Successfully wrote Format 9 coin: SN={coin.serial_number} to {os.path.basename(filepath)}")
 
         return CloudCoinErrorCode.SUCCESS
 
     except IOError as e:
-        log_error(logger_handle, CC_CONTEXT,
-                  f"Failed to write coin file: {filepath}", str(e))
+        log_error(logger_handle, "CloudCoin", f"Disk I/O failure writing coin: {filepath}", str(e))
         return CloudCoinErrorCode.ERR_IO_ERROR
     except Exception as e:
-        log_error(logger_handle, CC_CONTEXT,
-                  f"Unexpected error writing coin file: {filepath}", str(e))
+        log_error(logger_handle, "CloudCoin", f"Internal error during coin construction: {filepath}", str(e))
         return CloudCoinErrorCode.ERR_IO_ERROR
-
 
 def read_coin_denomination(filepath: str) -> Tuple[CloudCoinErrorCode, int]:
     """

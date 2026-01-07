@@ -27,17 +27,8 @@ from typing import List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 
 # Import from heal modules
+# Import from heal modules
 try:
-    from .heal_protocol import (
-        RAIDA_COUNT, HealErrorCode, QUORUM_REQUIRED, AN_SIZE,
-        CMD_GROUP_KEY_EXCHANGE, CMD_GET_ENCRYPTION_TICKET, CMD_FIX_ENCRYPTION,
-        ENC_SHARED_SECRET, ENC_NONE,
-        build_request_header, parse_response_header,
-        generate_challenge, TERMINATOR,
-        EncryptedKeyPart, FixEncryptionResult, FixEncryptionError,
-        STATUS_KEY_ACCEPTED, STATUS_KEY_REJECTED
-    )
-except ImportError:
     from heal_protocol import (
         RAIDA_COUNT, HealErrorCode, QUORUM_REQUIRED, AN_SIZE,
         CMD_GROUP_KEY_EXCHANGE, CMD_GET_ENCRYPTION_TICKET, CMD_FIX_ENCRYPTION,
@@ -47,23 +38,23 @@ except ImportError:
         EncryptedKeyPart, FixEncryptionResult, FixEncryptionError,
         STATUS_KEY_ACCEPTED, STATUS_KEY_REJECTED
     )
+except ImportError as e:
+    print(f"Failed to import heal_protocol: {e}")
+    raise
 
 try:
-    from .heal_file_io import (
-        CloudCoinBin, load_coins_from_folder, write_coin_file,
-        FOLDER_BANK, FOLDER_FRACKED
-    )
-except ImportError:
     from heal_file_io import (
         CloudCoinBin, load_coins_from_folder, write_coin_file,
         FOLDER_BANK, FOLDER_FRACKED
     )
-
+except ImportError as e:
+    print(f"Failed to import heal_file_io: {e}")
+    raise
 try:
-    from .heal_network import send_request, get_raida_endpoint
-except ImportError:
     from heal_network import send_request, get_raida_endpoint
-
+except ImportError as e:
+    print(f"Failed to import heal_network: {e}")
+    raise
 # For encryption
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -80,9 +71,10 @@ import hashlib
 
 # Import wallet structure initialization
 try:
-    from .wallet_structure import initialize_wallet_structure
-except ImportError:
     from wallet_structure import initialize_wallet_structure
+except ImportError as e:
+    print(f"Failed to import wallet_structure: {e}")
+    raise
 
 
 # ============================================================================

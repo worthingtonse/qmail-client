@@ -35,10 +35,10 @@ try:
         build_complete_download_request, validate_download_response,
         decrypt_payload, DOWNLOAD_PAGE_SIZE, ProtocolErrorCode
     )
-    from .logger import log_error, log_info, log_debug, log_warning
-    from .network import ServerInfo
-    from .qmail_types import Stripe
-    from .wallet_structure import initialize_wallet_structure
+    from logger import log_error, log_info, log_debug, log_warning
+    from network import ServerInfo
+    from qmail_types import Stripe
+    from wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     import database
@@ -468,85 +468,61 @@ def clean_locker_code(locker_code_16bytes: bytes) -> str:
     # Decode to ASCII string
     return cleaned.decode('ascii', errors='ignore')
 
-
 async def download_locker_payment(
-    db_handle,
+    app_ctx,
     file_guid: str,
     logger_handle
 ) -> Tuple[int, Optional[List]]:
     """
     Download the locker payment for a received email.
-    
-    Args:
-        db_handle: Database handle
-        file_guid: Email GUID
-        logger_handle: Logger handle
-        
-    Returns:
-        (error_code, list_of_coins)
-        0 = success, 1 = not found, 2 = download failed
+    FIXED: Uses stake_locker_identity for Go-style naming and target wallet separation.
     """
-    from database import get_received_tell_by_guid
-    from locker_download import download_locker
+    from src.database import get_received_tell_by_guid
+    from src.task_manager import stake_locker_identity
+    from src.locker_download import clean_locker_code
+    import os
     
     try:
         # 1. Get tell from database
-        err, tell_info = get_received_tell_by_guid(db_handle, file_guid)
+        err, tell_info = get_received_tell_by_guid(app_ctx.db_handle, file_guid)
         
         if err != 0 or not tell_info:
-            log_error(logger_handle, "DownloadHandler",
-                     f"Tell not found for GUID: {file_guid}")
+            log_error(logger_handle, "DownloadHandler", f"Tell not found for GUID: {file_guid}")
             return 1, None
         
-        # 2. Extract locker code (16 bytes hex string)
+        # 2. Extract locker code (16 bytes hex string stored in DB)
         locker_code_hex = tell_info.get('locker_code')
-        
         if not locker_code_hex:
-            log_error(logger_handle, "DownloadHandler",
-                     "No locker code in tell")
+            log_error(logger_handle, "DownloadHandler", "No locker code in tell")
             return 1, None
         
-        # 3. Convert hex to bytes
+        # 3. Clean to get 8-byte human code
         locker_code_bytes = bytes.fromhex(locker_code_hex)
-        
-        # 4. Clean padding to get 8-char human code
+        # clean_locker_code should return the 8-byte code (e.g. FG9YUE3\0)
         locker_code_8char = clean_locker_code(locker_code_bytes)
         
-        log_info(logger_handle, "DownloadHandler",
-                f"Downloading locker: {locker_code_8char}")
+        log_info(logger_handle, "DownloadHandler", f"Receiving payment from locker: {locker_code_8char.decode('ascii', 'ignore')}")
         
-        # 5. Download the locker from RAIDA
-        coins = await download_locker(locker_code_8char)
+        # 4. EXECUTE STAKING (Targeting Default Wallet)
+        # We use stake_locker_identity because it handles the 439-byte Format 9 saving
+        # and Go-style naming automatically.
+        success = stake_locker_identity(
+            locker_code_bytes=locker_code_8char,
+            app_context=app_ctx,
+            target_wallet="Default",  # CRITICAL: Payments go to Default wallet
+            logger=logger_handle
+        )
         
-        if not coins or len(coins) == 0:
-            log_error(logger_handle, "DownloadHandler",
-                     "Locker download returned no coins")
+        if not success:
+            log_error(logger_handle, "DownloadHandler", "Consensus failed during payment download.")
             return 2, None
         
-        # 6. Save coins to Bank folder
-        bank_path = "Data/Wallets/Default/Bank"
-        os.makedirs(bank_path, exist_ok=True)
-        
-        for coin in coins:
-            # Generate filename
-            filename = f"0006{coin.denomination:02X}{coin.sn:08X}.bin"
-            filepath = os.path.join(bank_path, filename)
-            
-            # Save coin to file
-            with open(filepath, 'wb') as f:
-                coin_data = coin.to_binary()  # Assumes coin has to_binary() method
-                f.write(coin_data)
-        
-        log_info(logger_handle, "DownloadHandler",
-                f"Downloaded {len(coins)} coins to wallet")
-        
-        return 0, coins
+        log_info(logger_handle, "DownloadHandler", "✓ Payment coins downloaded and saved to Default/Bank")
+        return 0, [] # Return empty list as coins are handled internally by task_manager
         
     except Exception as e:
-        log_error(logger_handle, "DownloadHandler",
-                 f"Exception downloading locker: {e}")
+        log_error(logger_handle, "DownloadHandler", f"Exception downloading payment: {e}")
         return 2, None
-
 # ============================================================================
 # BACKGROUND INDEXING STUBS (for future implementation)
 # ============================================================================

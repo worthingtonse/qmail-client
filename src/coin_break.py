@@ -35,21 +35,21 @@ from typing import List, Tuple, Optional, Dict
 # Import project modules
 try:
     # Standard package imports
-    from .protocol import (
+    from protocol import (
         build_complete_make_change_request,
         ProtocolErrorCode,
         CMD_GROUP_CHANGE,
         CMD_MAKE_CHANGE,
     )
-    from .network_async import (
+    from network_async import (
         connect_async,        # FIXED: Was create_async_connection
         disconnect_async,     # FIXED: Was close_async_connection
         send_raw_request_async,
         NetworkErrorCode,
     )
-    from .network import NetworkConfig # FIXED: Usually resides in .network
-    from .wallet_structure import initialize_wallet_structure
-    from .cloudcoin import (
+    from network import NetworkConfig # FIXED: Usually resides in .network
+    from wallet_structure import initialize_wallet_structure
+    from cloudcoin import (
         LockerCoin,
         write_coin_file,
         generate_coin_filename,
@@ -57,7 +57,7 @@ try:
         CC_RAIDA_COUNT,
         CC_AN_LENGTH,
     )
-    from .logger import log_error, log_debug, log_info, log_warning
+    from logger import log_error, log_debug, log_info, log_warning
 except (ImportError, ValueError):
     # Fallback for standalone testing
     from protocol import (
@@ -337,7 +337,7 @@ async def _make_change_single_raida(
     Execute Make Change command on one RAIDA.
     FIXED: Uses exact 'address' and 'port' keys from qmail.toml.
     """
-    from .network import ServerInfo
+    from network import ServerInfo
     conn = None
     
     # 1. RESOLVE SERVER INFO FROM qmail.toml

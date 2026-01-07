@@ -38,7 +38,7 @@ from enum import IntEnum
 
 # Try to import from package, fall back to direct import for standalone testing
 try:
-    from .logger import log_info, log_error, log_warning, log_debug
+    from logger import log_info, log_error, log_warning, log_debug
 except ImportError:
     # Fallback for standalone testing (uses new 3-parameter API with context)
     def log_info(handle, context, msg): print(f"[INFO] [{context}] {msg}")
@@ -56,7 +56,7 @@ DB_CONTEXT = "DatabaseMod"
 # Try to import shared types from qmail_types.py
 # These dataclasses provide type safety and consistency across modules
 try:
-    from .qmail_types import Email, User, Attachment
+    from qmail_types import Email, User, Attachment
     TYPES_AVAILABLE = True
 except ImportError:
     # Fallback for standalone testing - types not available
@@ -2405,6 +2405,58 @@ def get_folder_counts(
     except sqlite3.Error as e:
         log_error(handle.logger, DB_CONTEXT, "Failed to get folder counts", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, {}
+    
+
+
+def get_user_payment_requirement(
+    handle: DatabaseHandle,
+    user_id: int
+) -> Tuple[DatabaseErrorCode, Optional[float]]:
+    """
+    Get recipient payment requirement for a user.
+    
+    Args:
+        handle: Database handle
+        user_id: User ID to query
+        
+    Returns:
+        Tuple of (error_code, minimum_payment_cc)
+        Returns None if user not found or no payment required
+    """
+    if handle is None or handle.connection is None:
+        return DatabaseErrorCode.ERR_INVALID_PARAM, None
+    
+    try:
+        cursor = handle.connection.cursor()
+        
+        cursor.execute("""
+            SELECT minimum_payment
+            FROM Users
+            WHERE UserID = ?
+        """, (user_id,))
+        
+        row = cursor.fetchone()
+        
+        if not row:
+            return DatabaseErrorCode.ERR_NOT_FOUND, None
+        
+        # minimum_payment might be stored as integer (satoshis) or float
+        min_payment = row.get('minimum_payment')
+        
+        if min_payment is None or min_payment == 0:
+            return DatabaseErrorCode.SUCCESS, None  # No payment required
+        
+        # Convert to CC if stored as satoshis
+        if isinstance(min_payment, int) and min_payment > 100:
+            min_payment_cc = min_payment / 100000000.0
+        else:
+            min_payment_cc = float(min_payment)
+        
+        return DatabaseErrorCode.SUCCESS, min_payment_cc
+        
+    except sqlite3.Error as e:
+        log_error(handle.logger, DB_CONTEXT, "Failed to get user payment requirement", str(e))
+        return DatabaseErrorCode.ERR_QUERY_FAILED, None
 
 
 # ============================================================================

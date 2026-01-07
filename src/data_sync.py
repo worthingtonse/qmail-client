@@ -17,7 +17,7 @@ from enum import IntEnum
 from datetime import datetime
 
 # Import database functions
-from src.database import (
+from database import (
     DatabaseHandle,
     DatabaseErrorCode,
     upsert_user,
@@ -29,7 +29,7 @@ from src.database import (
 )
 
 # Import logger functions
-from src.logger import log_info, log_error, log_warning, log_debug
+from logger import log_info, log_error, log_warning, log_debug
 
 # Module context for logging
 SYNC_CONTEXT = "DataSync"
@@ -91,20 +91,24 @@ def download_json(
             # Parse JSON
             try:
                 data = json.loads(body)
-                log_debug(logger_handle, SYNC_CONTEXT, f"Downloaded {len(body)} bytes from {url}")
+                log_debug(logger_handle, SYNC_CONTEXT,
+                          f"Downloaded {len(body)} bytes from {url}")
                 return SyncErrorCode.SUCCESS, data
             except json.JSONDecodeError as e:
-                log_error(logger_handle, SYNC_CONTEXT, f"JSON parse error from {url}", str(e))
+                log_error(logger_handle, SYNC_CONTEXT,
+                          f"JSON parse error from {url}", str(e))
                 return SyncErrorCode.ERR_PARSE, None
 
     except urllib.error.URLError as e:
-        log_error(logger_handle, SYNC_CONTEXT, f"Network error fetching {url}", str(e))
+        log_error(logger_handle, SYNC_CONTEXT,
+                  f"Network error fetching {url}", str(e))
         return SyncErrorCode.ERR_NETWORK, None
     except TimeoutError:
         log_error(logger_handle, SYNC_CONTEXT, f"Timeout fetching {url}")
         return SyncErrorCode.ERR_TIMEOUT, None
     except Exception as e:
-        log_error(logger_handle, SYNC_CONTEXT, f"Unexpected error fetching {url}", str(e))
+        log_error(logger_handle, SYNC_CONTEXT,
+                  f"Unexpected error fetching {url}", str(e))
         return SyncErrorCode.ERR_NETWORK, None
 
 
@@ -143,17 +147,20 @@ def download_text(
 
         with urllib.request.urlopen(request, timeout=timeout_sec) as response:
             body = response.read().decode('utf-8')
-            log_debug(logger_handle, SYNC_CONTEXT, f"Downloaded {len(body)} bytes from {url}")
+            log_debug(logger_handle, SYNC_CONTEXT,
+                      f"Downloaded {len(body)} bytes from {url}")
             return SyncErrorCode.SUCCESS, body
 
     except urllib.error.URLError as e:
-        log_error(logger_handle, SYNC_CONTEXT, f"Network error fetching {url}", str(e))
+        log_error(logger_handle, SYNC_CONTEXT,
+                  f"Network error fetching {url}", str(e))
         return SyncErrorCode.ERR_NETWORK, None
     except TimeoutError:
         log_error(logger_handle, SYNC_CONTEXT, f"Timeout fetching {url}")
         return SyncErrorCode.ERR_TIMEOUT, None
     except Exception as e:
-        log_error(logger_handle, SYNC_CONTEXT, f"Unexpected error fetching {url}", str(e))
+        log_error(logger_handle, SYNC_CONTEXT,
+                  f"Unexpected error fetching {url}", str(e))
         return SyncErrorCode.ERR_NETWORK, None
 
 
@@ -197,7 +204,7 @@ def parse_users_csv(
 
         if len(fields) < 4:
             log_warning(logger_handle, SYNC_CONTEXT,
-                       f"Line {line_num}: Not enough fields ({len(fields)}), skipping")
+                        f"Line {line_num}: Not enough fields ({len(fields)}), skipping")
             continue
 
         try:
@@ -230,10 +237,11 @@ def parse_users_csv(
 
         except (ValueError, IndexError) as e:
             log_warning(logger_handle, SYNC_CONTEXT,
-                       f"Line {line_num}: Parse error ({e}), skipping")
+                        f"Line {line_num}: Parse error ({e}), skipping")
             continue
 
-    log_debug(logger_handle, SYNC_CONTEXT, f"Parsed {len(users)} users from CSV")
+    log_debug(logger_handle, SYNC_CONTEXT,
+              f"Parsed {len(users)} users from CSV")
     return users
 
 
@@ -343,7 +351,8 @@ def sync_users(
         return err, 0
 
     if not csv_text:
-        log_warning(logger_handle, SYNC_CONTEXT, "Empty response from users URL")
+        log_warning(logger_handle, SYNC_CONTEXT,
+                    "Empty response from users URL")
         return SyncErrorCode.SUCCESS, 0
 
     # Parse CSV into user dictionaries
@@ -369,10 +378,11 @@ def sync_users(
             synced_count += 1
         else:
             log_warning(logger_handle, SYNC_CONTEXT,
-                       f"Failed to sync user {user.get('user_id')}: {db_err}")
+                        f"Failed to sync user {user.get('user_id')}: {db_err}")
 
     if invalid_count > 0:
-        log_warning(logger_handle, SYNC_CONTEXT, f"Skipped {invalid_count} invalid user records")
+        log_warning(logger_handle, SYNC_CONTEXT,
+                    f"Skipped {invalid_count} invalid user records")
 
     log_info(logger_handle, SYNC_CONTEXT, f"Synced {synced_count} users")
     return SyncErrorCode.SUCCESS, synced_count
@@ -420,7 +430,8 @@ def sync_servers(
         servers = data.get('servers', [])
 
     if not servers:
-        log_warning(logger_handle, SYNC_CONTEXT, "No servers found in response")
+        log_warning(logger_handle, SYNC_CONTEXT,
+                    "No servers found in response")
         return SyncErrorCode.SUCCESS, 0
 
     # Sync each server to database
@@ -441,17 +452,18 @@ def sync_servers(
             last_server_id = server.get('server_id')
         else:
             log_warning(logger_handle, SYNC_CONTEXT,
-                       f"Failed to sync server {server.get('server_id')}: {db_err}")
+                        f"Failed to sync server {server.get('server_id')}: {db_err}")
 
     if invalid_count > 0:
-        log_warning(logger_handle, SYNC_CONTEXT, f"Skipped {invalid_count} invalid server records")
+        log_warning(logger_handle, SYNC_CONTEXT,
+                    f"Skipped {invalid_count} invalid server records")
 
     # Auto-configure parity server if not set
     if synced_count > 0:
         _, parity_server = get_parity_server(db_handle)
         if parity_server is None and last_server_id:
             log_info(logger_handle, SYNC_CONTEXT,
-                    f"Auto-configuring parity server: {last_server_id}")
+                     f"Auto-configuring parity server: {last_server_id}")
             set_parity_server(db_handle, last_server_id)
 
     log_info(logger_handle, SYNC_CONTEXT, f"Synced {synced_count} servers")
@@ -494,17 +506,21 @@ def sync_all(
     overall_error = SyncErrorCode.SUCCESS
 
     # Sync users
-    users_err, users_count = sync_users(db_handle, users_url, timeout_sec, logger_handle)
+    users_err, users_count = sync_users(
+        db_handle, users_url, timeout_sec, logger_handle)
     result["users"] = users_count
     if users_err != SyncErrorCode.SUCCESS:
-        log_warning(logger_handle, SYNC_CONTEXT, f"User sync failed: {users_err}")
+        log_warning(logger_handle, SYNC_CONTEXT,
+                    f"User sync failed: {users_err}")
         overall_error = users_err
 
     # Sync servers
-    servers_err, servers_count = sync_servers(db_handle, servers_url, timeout_sec, logger_handle)
+    servers_err, servers_count = sync_servers(
+        db_handle, servers_url, timeout_sec, logger_handle)
     result["servers"] = servers_count
     if servers_err != SyncErrorCode.SUCCESS:
-        log_warning(logger_handle, SYNC_CONTEXT, f"Server sync failed: {servers_err}")
+        log_warning(logger_handle, SYNC_CONTEXT,
+                    f"Server sync failed: {servers_err}")
         # Only update overall error if users didn't fail
         if overall_error == SyncErrorCode.SUCCESS:
             overall_error = servers_err
@@ -514,7 +530,7 @@ def sync_all(
     _, total_servers = get_server_count(db_handle)
 
     log_info(logger_handle, SYNC_CONTEXT,
-            f"Sync complete. Database now has {total_users} users and {total_servers} servers")
+             f"Sync complete. Database now has {total_users} users and {total_servers} servers")
 
     return overall_error, result
 
@@ -566,7 +582,8 @@ if __name__ == "__main__":
         print(f"   ERROR: {err}")
 
     print(f"\n2. Testing sync_all()...")
-    err, result = sync_all(db_handle, USERS_URL, SERVERS_URL, timeout_sec=30, logger_handle=logger)
+    err, result = sync_all(db_handle, USERS_URL, SERVERS_URL,
+                           timeout_sec=30, logger_handle=logger)
     print(f"   Result: {err}")
     print(f"   Users synced: {result['users']}")
     print(f"   Servers synced: {result['servers']}")

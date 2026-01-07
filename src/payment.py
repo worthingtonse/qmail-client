@@ -19,10 +19,10 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 try:
-    from .qmail_types import ErrorCode, StorageDuration
-    from .logger import log_error, log_info, log_debug, log_warning
-    from .protocol import weeks_to_duration_code
-    from .wallet_structure import initialize_wallet_structure
+    from qmail_types import ErrorCode, StorageDuration
+    from logger import log_error, log_info, log_debug, log_warning
+    from protocol import weeks_to_duration_code
+    from wallet_structure import initialize_wallet_structure
 except ImportError:
     # Fallback for standalone testing
     from enum import IntEnum

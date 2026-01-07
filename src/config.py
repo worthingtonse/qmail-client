@@ -17,7 +17,7 @@ Functions:
 from __future__ import annotations
 import os
 import sys
-from typing import Any, Optional ,List, TYPE_CHECKING
+from typing import Any, Optional, List, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from qmail_types import QMailConfig, ServerConfig, ValidationResult, IdentityConfig
@@ -39,7 +39,7 @@ except ImportError:
 
 # Import from qmail_types module (renamed from 'types' to avoid Python built-in conflict)
 try:
-    from .qmail_types import (
+    from qmail_types import (
         QMailConfig,
         PathsConfig,
         IdentityConfig,
@@ -112,7 +112,8 @@ def load_config(config_path: str) -> Optional[QMailConfig]:
     C signature: QMailConfig* load_config(const char* config_path);
     """
     if tomllib is None:
-        print("Error: TOML parsing library not available. Install tomli or use Python 3.11+")
+        print(
+            "Error: TOML parsing library not available. Install tomli or use Python 3.11+")
         return None
 
     # Check file exists
@@ -160,7 +161,8 @@ def load_config(config_path: str) -> Optional[QMailConfig]:
         e = data["encryption"]
         config.encryption = EncryptionConfig(
             enabled=e.get("enabled", True),
-            mode=e.get("mode", 6),  # Default to Mode A (6) - more secure than Mode B (1)
+            # Default to Mode A (6) - more secure than Mode B (1)
+            mode=e.get("mode", 6),
         )
 
     # Parse beacon section
@@ -219,8 +221,10 @@ def load_config(config_path: str) -> Optional[QMailConfig]:
     if "sync" in data:
         s = data["sync"]
         config.sync = SyncConfig(
-            users_url=s.get("users_url", "https://raida11.cloudcoin.global/service/users"),
-            servers_url=s.get("servers_url", "https://raida11.cloudcoin.global/service/qmail_servers"),
+            users_url=s.get(
+                "users_url", "https://raida11.cloudcoin.global/service/users"),
+            servers_url=s.get(
+                "servers_url", "https://raida11.cloudcoin.global/service/qmail_servers"),
             timeout_sec=s.get("timeout_sec", 30),
         )
 
@@ -442,23 +446,29 @@ def validate_config(config: QMailConfig) -> ValidationResult:
 
     # --- Identity validation ---
     if config.identity.coin_type != 6:
-        result.add_warning(f"identity.coin_type is {config.identity.coin_type}, expected 6 (CloudCoin)")
+        result.add_warning(
+            f"identity.coin_type is {config.identity.coin_type}, expected 6 (CloudCoin)")
 
     if config.identity.denomination < 0 or config.identity.denomination > 250:
-        result.add_error(f"identity.denomination must be 1-250, got {config.identity.denomination}")
+        result.add_error(
+            f"identity.denomination must be 1-250, got {config.identity.denomination}")
 
     if config.identity.serial_number == 0:
-        result.add_warning("identity.serial_number is 0 - user must configure their mailbox ID")
+        result.add_warning(
+            "identity.serial_number is 0 - user must configure their mailbox ID")
 
     if config.identity.serial_number < 0 or config.identity.serial_number > 0xFFFFFFFF:
-        result.add_error("identity.serial_number must be a 4-byte unsigned integer (0-4294967295)")
+        result.add_error(
+            "identity.serial_number must be a 4-byte unsigned integer (0-4294967295)")
 
     if config.identity.device_id < 0 or config.identity.device_id > 0xFFFF:
-        result.add_error("identity.device_id must be a 16-bit unsigned integer (0-65535)")
+        result.add_error(
+            "identity.device_id must be a 16-bit unsigned integer (0-65535)")
 
     # --- Encryption validation ---
     if config.encryption.mode not in (1, 6):
-        result.add_error(f"encryption.mode must be 1 (Mode B) or 6 (Mode A), got {config.encryption.mode}")
+        result.add_error(
+            f"encryption.mode must be 1 (Mode B) or 6 (Mode A), got {config.encryption.mode}")
 
     # --- Beacon validation ---
     if not config.beacon.url:
@@ -481,7 +491,8 @@ def validate_config(config: QMailConfig) -> ValidationResult:
 
     total_stripes = config.raid.data_stripe_count + config.raid.parity_stripe_count
     if total_stripes != 5:
-        result.add_warning(f"Total stripe count is {total_stripes}, expected 5 (4 data + 1 parity)")
+        result.add_warning(
+            f"Total stripe count is {total_stripes}, expected 5 (4 data + 1 parity)")
 
     # --- Network validation ---
     if config.network.connect_timeout_ms < 1000:
@@ -492,7 +503,8 @@ def validate_config(config: QMailConfig) -> ValidationResult:
 
     # --- Threading validation ---
     if config.threading.pool_size < MIN_QMAIL_SERVERS:
-        result.add_error(f"threading.pool_size must be at least {MIN_QMAIL_SERVERS}")
+        result.add_error(
+            f"threading.pool_size must be at least {MIN_QMAIL_SERVERS}")
 
     # --- API validation ---
     if config.api.enabled:
@@ -513,10 +525,12 @@ def validate_config(config: QMailConfig) -> ValidationResult:
 
     # --- Server lists validation ---
     if len(config.qmail_servers) < MIN_QMAIL_SERVERS:
-        result.add_error(f"Need at least {MIN_QMAIL_SERVERS} QMail servers, got {len(config.qmail_servers)}")
+        result.add_error(
+            f"Need at least {MIN_QMAIL_SERVERS} QMail servers, got {len(config.qmail_servers)}")
 
     if len(config.raida_servers) < MIN_RAIDA_SERVERS:
-        result.add_warning(f"Expected {MIN_RAIDA_SERVERS} RAIDA servers, got {len(config.raida_servers)}")
+        result.add_warning(
+            f"Expected {MIN_RAIDA_SERVERS} RAIDA servers, got {len(config.raida_servers)}")
 
     # Validate each server entry
     for i, srv in enumerate(config.qmail_servers):
@@ -647,7 +661,8 @@ def print_config_summary(config: QMailConfig) -> None:
     print(f"Encryption:   {'Enabled' if config.encryption.enabled else 'Disabled'} "
           f"(Mode {'A' if config.encryption.mode == 6 else 'B'})")
     print(f"Beacon:       {config.beacon.url}")
-    print(f"RAID:         {config.raid.data_stripe_count}+{config.raid.parity_stripe_count} stripes")
+    print(
+        f"RAID:         {config.raid.data_stripe_count}+{config.raid.parity_stripe_count} stripes")
     print(f"Thread pool:  {config.threading.pool_size} workers")
     print(f"API:          {'Enabled' if config.api.enabled else 'Disabled'} "
           f"on {config.api.host}")
@@ -690,11 +705,11 @@ if __name__ == "__main__":
             print(f"  - {warn}")
 
     # Test get/set
-    print(f"\nTest get_config_value('beacon.url'): {get_config_value(config, 'beacon.url')}")
-    print(f"Test get_config_value('identity.serial_number'): {get_config_value(config, 'identity.serial_number')}")
+    print(
+        f"\nTest get_config_value('beacon.url'): {get_config_value(config, 'beacon.url')}")
+    print(
+        f"Test get_config_value('identity.serial_number'): {get_config_value(config, 'identity.serial_number')}")
 
     set_config_value(config, "identity.serial_number", 999)
-    print(f"After set_config_value('identity.serial_number', 999): {get_config_value(config, 'identity.serial_number')}")
-
-
-    
+    print(
+        f"After set_config_value('identity.serial_number', 999): {get_config_value(config, 'identity.serial_number')}")

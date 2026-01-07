@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 # RAIDA Network Configuration
 RAIDA_COUNT = 25
-RAIDA_TIMEOUT = 10  # seconds per request
+RAIDA_TIMEOUT = 20  # seconds per request
 
 # Coin identifier for CloudCoin
 COIN_ID = 0x0006
@@ -55,7 +55,8 @@ AN_SIZE = 16
 
 # Command Groups
 CMD_GROUP_HEALING = 2
-CMD_GROUP_KEY_EXCHANGE = 4  # For Get Encryption Ticket (44) and Fix Encryption (45)
+# For Get Encryption Ticket (44) and Fix Encryption (45)
+CMD_GROUP_KEY_EXCHANGE = 4
 
 # Command Codes (Healing Group)
 CMD_GET_TICKET = 40
@@ -167,7 +168,8 @@ class EncryptedKeyPart:
     encrypted_key_part: bytes = field(default_factory=lambda: bytes(16))
     original_key_part: bytes = field(default_factory=lambda: bytes(8))
     nonce: bytes = field(default_factory=lambda: bytes(8))
-    split_id: int = 0  # 0 for key_part_0 (AN bytes 0-7), 1 for key_part_1 (AN bytes 8-15)
+    # 0 for key_part_0 (AN bytes 0-7), 1 for key_part_1 (AN bytes 8-15)
+    split_id: int = 0
 
 
 @dataclass
@@ -219,7 +221,7 @@ def pown_char_to_nibble(char: str) -> int:
     elif char == 'p':
         return POWN_PASS      # 0xA
     elif char == 'b':
-        return POWN_BROKE_ENC # 0xB
+        return POWN_BROKE_ENC  # 0xB
     elif char == 'n':
         return POWN_NO_REPLY  # 0xC
     elif char == 'd':

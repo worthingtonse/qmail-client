@@ -73,6 +73,7 @@ def setup_logger(name: str = "heal", level: int = logging.DEBUG) -> logging.Logg
     logger.setLevel(level)
     return logger
 
+
 logger = setup_logger()
 
 
@@ -120,7 +121,7 @@ def find_limbo(wallet_path: str) -> Tuple[HealErrorCode, List[CloudCoinBin]]:
         return HealErrorCode.SUCCESS, []
 
     logger.info(f"  -> Executing Find on {len(all_coins)} coins...")
-    
+
     # Execute batch Find command (CMD 10)
     find_results = find_coins_batch(all_coins)
 
@@ -181,11 +182,13 @@ def grade_limbo(wallet_path: str, coins: List[CloudCoinBin]) -> HealErrorCode:
         elif status == 'fracked':
             coin.has_pans = False
             err = move_coin_file(coin, fracked_folder)
-            logger.info(f"  -> Coin {coin.serial_number}: FRACKED -> Fracked folder")
+            logger.info(
+                f"  -> Coin {coin.serial_number}: FRACKED -> Fracked folder")
         elif status == 'counterfeit':
             coin.has_pans = False
             err = move_coin_file(coin, fraud_folder)
-            logger.info(f"  -> Coin {coin.serial_number}: COUNTERFEIT -> Fraud folder")
+            logger.info(
+                f"  -> Coin {coin.serial_number}: COUNTERFEIT -> Fraud folder")
         else:
             # Still limbo - leave in place
             logger.info(f"  -> Coin {coin.serial_number}: Still in LIMBO")
@@ -228,7 +231,8 @@ def get_tickets(coins: List[CloudCoinBin]) -> Tuple[HealErrorCode, List[int], Di
     logger.info(f"  -> Received {valid_tickets}/{RAIDA_COUNT} valid tickets")
 
     if valid_tickets < QUORUM_REQUIRED:
-        logger.warning(f"  -> Insufficient tickets ({valid_tickets} < {QUORUM_REQUIRED})")
+        logger.warning(
+            f"  -> Insufficient tickets ({valid_tickets} < {QUORUM_REQUIRED})")
         return HealErrorCode.ERR_NO_TICKETS, tickets, coin_results
 
     return HealErrorCode.SUCCESS, tickets, coin_results
@@ -263,13 +267,15 @@ def fix_with_tickets(
         logger.info("  -> Nothing to fix")
         return HealErrorCode.SUCCESS, 0
 
-    logger.info(f"  -> Fixing {len(coins)} coins on RAIDA: {sorted(fracked_raida)}")
+    logger.info(
+        f"  -> Fixing {len(coins)} coins on RAIDA: {sorted(fracked_raida)}")
 
     # Generate PG for new passwords
     pg = generate_pg()
 
     # Fix on each fracked RAIDA in parallel (batch version)
-    result_dict = fix_coins_on_raida_set_batch(coins, fracked_raida, pg, tickets)
+    result_dict = fix_coins_on_raida_set_batch(
+        coins, fracked_raida, pg, tickets)
 
     # Process results and update coins
     total_fixes = 0
@@ -278,7 +284,8 @@ def fix_with_tickets(
         for raida_id in fracked_raida:
             if raida_id in result_dict and result_dict[raida_id][coin_idx]:
                 # Fix succeeded - update AN and POWN
-                new_an = calculate_new_an(raida_id, coin.denomination, coin.serial_number, pg)
+                new_an = calculate_new_an(
+                    raida_id, coin.denomination, coin.serial_number, pg)
                 coin.ans[raida_id] = new_an
                 coin.update_pown_char(raida_id, 'p')
                 total_fixes += 1
@@ -322,13 +329,16 @@ def grade_coins(wallet_path: str, coins: List[CloudCoinBin]) -> HealErrorCode:
         elif status == 'fracked':
             # Still fracked after fix attempt - might need another round
             err = move_coin_file(coin, fracked_folder)
-            logger.info(f"  -> Coin {coin.serial_number}: Still FRACKED -> Fracked folder")
+            logger.info(
+                f"  -> Coin {coin.serial_number}: Still FRACKED -> Fracked folder")
         elif status == 'counterfeit':
             err = move_coin_file(coin, fraud_folder)
-            logger.info(f"  -> Coin {coin.serial_number}: COUNTERFEIT -> Fraud folder")
+            logger.info(
+                f"  -> Coin {coin.serial_number}: COUNTERFEIT -> Fraud folder")
         else:
             err = move_coin_file(coin, suspect_folder)
-            logger.info(f"  -> Coin {coin.serial_number}: SUSPECT -> Suspect folder")
+            logger.info(
+                f"  -> Coin {coin.serial_number}: SUSPECT -> Suspect folder")
 
     return HealErrorCode.SUCCESS
 
@@ -383,19 +393,37 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
         result.errors.append(f"Missing wallet folders: {missing}")
         return result
 
-    logger.info(f"Wallet folders verified: Bank, Fracked, Limbo, Fraud, Suspect, Grade")
+    logger.info(
+        f"Wallet folders verified: Bank, Fracked, Limbo, Fraud, Suspect, Grade")
 
-    # STEP 1: Check encryption
+    # STEP 1-2: CHECK ENCRYPTION (DON'T FAIL IF ALL BROKEN - FIX AFTER HEALING)
     err, encryption_health = check_encryption(wallet_path)
     if err != HealErrorCode.SUCCESS:
         result.errors.append("Encryption check failed")
         return result
 
-    # STEP 2: Fix encryption if needed
-    err = fix_encryption(wallet_path, encryption_health)
-    if err != HealErrorCode.SUCCESS:
-        result.errors.append("Encryption fix failed")
-        # Continue anyway - some operations may work unencrypted
+    working_raida_count = len(encryption_health.get_working_raida())
+    broken_raida_count = len(encryption_health.get_broken_raida())
+
+    # Only attempt encryption fix if we have enough helpers (need 2+ working RAIDA)
+    if broken_raida_count > 0 and working_raida_count >= 2:
+        logger.info(
+            f"Attempting to fix encryption on {broken_raida_count} RAIDA...")
+        fix_result = fix_encryption(wallet_path, encryption_health)
+
+        if not fix_result.success:
+            logger.warning(
+                f"Encryption fix incomplete - fixed {fix_result.total_fixed}/{broken_raida_count}")
+            logger.warning(
+                "Will continue healing in UNENCRYPTED mode for broken RAIDA")
+            # DON'T FAIL HERE - healing can work without encryption
+    elif broken_raida_count > 0:
+        logger.warning(
+            f"⚠ Cannot fix encryption - only {working_raida_count} working RAIDA (need 2+)")
+        logger.warning("⚠ Will attempt healing in UNENCRYPTED mode")
+        logger.warning("⚠ RAIDA requests will be sent WITHOUT encryption!")
+    else:
+        logger.info("✓ All RAIDA have working encryption")
 
     # STEP 3: Find limbo coins
     err, limbo_coins = find_limbo(wallet_path)
@@ -445,11 +473,13 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
         err, tickets, coin_results = get_tickets(coins_to_fix)
         if err != HealErrorCode.SUCCESS:
             logger.warning("Failed to get sufficient tickets")
-            result.errors.append(f"Iteration {iteration}: Failed to get tickets")
+            result.errors.append(
+                f"Iteration {iteration}: Failed to get tickets")
             break
 
         # STEP 6: Fix with tickets
-        err, fixes_applied = fix_with_tickets(coins_to_fix, tickets, fracked_raida)
+        err, fixes_applied = fix_with_tickets(
+            coins_to_fix, tickets, fracked_raida)
 
         # Count fracked positions after fix
         fracked_after = sum(coin.count_fracked() for coin in coins_to_fix)
@@ -464,7 +494,8 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
             logger.info("No improvement - stopping iterations")
             break
         else:
-            logger.info(f"Reduced by {fracked_before - fracked_after} - continuing...")
+            logger.info(
+                f"Reduced by {fracked_before - fracked_after} - continuing...")
 
         # Filter to only still-fracked coins
         coins_to_fix = [c for c in coins_to_fix if c.count_fracked() > 0]
@@ -622,7 +653,8 @@ def run_integration_tests():
     # Test 4: Challenge generation
     print("\n4. Testing challenge generation...")
     challenge = generate_challenge()
-    assert len(challenge) == 16, f"Challenge should be 16 bytes, got {len(challenge)}"
+    assert len(
+        challenge) == 16, f"Challenge should be 16 bytes, got {len(challenge)}"
     print(f"   Challenge: {challenge.hex()}")
     print("   PASS")
 

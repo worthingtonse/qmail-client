@@ -46,7 +46,7 @@ logger = logging.getLogger("heal_file_io")
 
 # Import from heal_protocol
 try:
-    from .heal_protocol import (
+    from heal_protocol import (
         RAIDA_COUNT, AN_SIZE, COIN_ID, HealErrorCode,
         QUORUM_REQUIRED, ENC_NONE,
         encode_pown_bytes, decode_pown_bytes
@@ -60,7 +60,7 @@ except ImportError:
 
 # Import wallet structure initialization
 try:
-    from .wallet_structure import initialize_wallet_structure
+    from wallet_structure import initialize_wallet_structure
 except ImportError:
     from wallet_structure import initialize_wallet_structure
 
@@ -131,21 +131,28 @@ class CloudCoinBin:
         Determine coin status based on POWN string.
 
         Returns:
-            'authentic' - 13+ pass, 0 fail
-            'fracked' - 13+ pass, some fail
-            'counterfeit' - 13+ fail
-            'limbo' - too many unknowns
+            'authentic' - 13+ pass, 0 fail, 0 unknown (perfect coin)
+            'fracked' - 13+ pass, but some fail or unknown (needs healing)
+            'counterfeit' - < 13 pass (cannot be healed)
+            'limbo' - too many unknowns to determine
         """
         pass_count = self.pown.count('p')
         fail_count = self.pown.count('f')
+        unknown_count = self.pown.count('u')
 
         if pass_count >= QUORUM_REQUIRED:
-            if fail_count > 0:
+            # Has quorum (13+)
+            if fail_count > 0 or unknown_count > 0:
+                # Has fails or unknowns → fracked
                 return 'fracked'
-            return 'authentic'
+            else:
+                # All 25 are 'p' → authentic
+                return 'authentic'
         elif fail_count >= QUORUM_REQUIRED:
+            # More than 13 fails → counterfeit
             return 'counterfeit'
         else:
+            # Not enough passes or fails → limbo
             return 'limbo'
 
     def update_pown_char(self, raida_id: int, status: str) -> None:
@@ -509,6 +516,76 @@ def check_wallet_folders_exist(wallet_path: str) -> Tuple[bool, List[str]]:
             missing.append(folder_name)
 
     return len(missing) == 0, missing
+
+
+def move_coin_to_fracked(coin: CloudCoinBin, wallet_path: str = "Data/Wallets/Default") -> bool:
+    """
+    Move a coin from Bank to Fracked folder within specified wallet.
+    Works for both Default (payment) and Mailbox (identity) wallets.
+    
+    Args:
+        coin: CloudCoinBin object
+        wallet_path: Path to wallet (e.g., "Data/Wallets/Default" or "Data/Wallets/Mailbox")
+    
+    Returns:
+        bool: True if moved successfully
+    """
+    import shutil
+    import os
+    
+    bank_folder = os.path.join(wallet_path, "Bank")
+    fracked_folder = os.path.join(wallet_path, "Fracked")
+    
+    source_file = os.path.join(bank_folder, coin.filename)
+    dest_file = os.path.join(fracked_folder, coin.filename)
+    
+    if not os.path.exists(source_file):
+        print(f"[WARN] Coin not found in Bank: {source_file}")
+        return False
+    
+    try:
+        os.makedirs(fracked_folder, exist_ok=True)
+        shutil.move(source_file, dest_file)
+        print(f"[INFO] Moved coin to Fracked: {coin.filename}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to move coin to Fracked: {e}")
+        return False
+
+
+def move_coin_to_bank(coin: CloudCoinBin, wallet_path: str = "Data/Wallets/Default") -> bool:
+    """
+    Move a healed coin from Fracked back to Bank folder within specified wallet.
+    Works for both Default (payment) and Mailbox (identity) wallets.
+    
+    Args:
+        coin: CloudCoinBin object
+        wallet_path: Path to wallet
+    
+    Returns:
+        bool: True if moved successfully
+    """
+    import shutil
+    import os
+    
+    fracked_folder = os.path.join(wallet_path, "Fracked")
+    bank_folder = os.path.join(wallet_path, "Bank")
+    
+    source_file = os.path.join(fracked_folder, coin.filename)
+    dest_file = os.path.join(bank_folder, coin.filename)
+    
+    if not os.path.exists(source_file):
+        print(f"[WARN] Coin not found in Fracked: {source_file}")
+        return False
+    
+    try:
+        os.makedirs(bank_folder, exist_ok=True)
+        shutil.move(source_file, dest_file)
+        print(f"[INFO] Moved healed coin to Bank: {coin.filename}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to move coin to Bank: {e}")
+        return False
 
 
 # ============================================================================

@@ -27,7 +27,7 @@ from typing import List, Optional, Tuple
 
 # Import types from qmail_types
 try:
-    from .qmail_types import Stripe, ErrorCode
+    from qmail_types import Stripe, ErrorCode
 except ImportError:
     # Fallback for standalone testing
     from dataclasses import dataclass
@@ -46,7 +46,7 @@ except ImportError:
 
 # Import logger (optional - for error reporting)
 try:
-    from .logger import log_error, log_info, log_debug, log_warning
+    from logger import log_error, log_info, log_debug, log_warning
 except ImportError:
     # Fallback for standalone testing
     def log_error(handle, context, msg, reason=None):

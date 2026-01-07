@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 
 # Import from heal_protocol
 try:
-    from .heal_protocol import (
+    from heal_protocol import (
         RAIDA_COUNT, RAIDA_TIMEOUT, AN_SIZE,
         REQUEST_HEADER_SIZE, RESPONSE_HEADER_SIZE,
         CMD_GROUP_HEALING, CMD_GET_TICKET, CMD_FIND, CMD_FIX,
@@ -56,7 +56,7 @@ except ImportError:
 
 # Import CloudCoinBin for type hints
 try:
-    from .heal_file_io import CloudCoinBin
+    from heal_file_io import CloudCoinBin
 except ImportError:
     from heal_file_io import CloudCoinBin
 
@@ -523,6 +523,11 @@ def fix_on_raida(
 
     request = header + body
     err, response = send_request(raida_id, request)
+
+    if err != HealErrorCode.SUCCESS:
+        logger.warning(f"RAIDA{raida_id} FIX command failed: error={err}")
+        result_dict[raida_id] = [False] * len(coins)
+        return
 
     if err == HealErrorCode.SUCCESS:
         err, fix_results = parse_fix_response(response, len(coins))
