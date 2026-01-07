@@ -226,7 +226,6 @@ def handle_mail_send(request_handler, context):
         request_obj.subject = form_data.get('subject', '')
         request_obj.to_recipients = form_data.get('to', [])
         request_obj.attachment_paths = form_data.get('attachments', [])
-        request_obj.storage_weeks = int(form_data.get('storage_weeks', 8))
     else:
         if not email_data.get("to") or not email_data.get("subject"):
             request_handler.send_json_response(
@@ -641,8 +640,12 @@ def handle_mail_list(request_handler, context):
 
 def handle_create_mailbox(request_handler, request_context):
     """
-    POST /api/mail/create-mailbox - Establish identity by staking a PNG image.
-    FIXED: Now uses stake_locker_identity targeting the 'Mailbox' wallet.
+    POST /api/mail/create-mailbox - Establish identity by staking a locker code.
+    
+    JSON Payload: { "locker_code": "FG9YUE3X" }
+    
+    Role: Takes a human locker code, downloads identity coins from RAIDA, 
+    saves them to Mailbox/Bank, and auto-configures the user's email address.
     """
     from src.task_manager import stake_locker_identity
     from src.coin_scanner import find_identity_coin
@@ -650,64 +653,77 @@ def handle_create_mailbox(request_handler, request_context):
     import re
     import os
     import toml
+    import json
 
     app_ctx = request_handler.server_instance.app_context
     logger = app_ctx.logger
 
-    # 1. PARSE MULTIPART FORM DATA
-    content_type = request_context.headers.get('Content-Type', '')
-    if 'multipart/form-data' not in content_type:
-        return request_handler.send_json_response(400, {"error": "Content-Type must be multipart/form-data"})
+    # 1. PARSE JSON PAYLOAD
+    try:
+        # request_context.body contains the raw bytes from the POST request
+        data = json.loads(request_context.body.decode('utf-8'))
+        raw_code = data.get('locker_code', '').strip()
+    except Exception as e:
+        log_error(logger, "CreateMailbox", f"Failed to parse JSON body: {e}")
+        return request_handler.send_json_response(400, {
+            "error": "Invalid JSON payload",
+            "status": "error"
+        })
 
-    files = getattr(request_context, 'files', {})
-    if 'mailbox_image' not in files:
-        return request_handler.send_json_response(400, {"error": "Missing mailbox_image file"})
-
-    file_info = files['mailbox_image']
-    filename = file_info.get('filename', '')
-
-    # 2. EXTRACT LOCKER CODE FROM FILENAME
-    if not filename.lower().endswith('.png'):
-        return request_handler.send_json_response(400, {"error": "File must be a PNG image"})
-
-    base_name = filename[:-4]
-    locker_code = base_name.replace('-', '').replace('_', '').upper()
-
+    # 2. CLEAN AND VALIDATE LOCKER CODE
+    # Strip dashes or underscores and ensure it is 8 alphanumeric characters
+    locker_code = raw_code.replace('-', '').replace('_', '').upper()
+    
     if len(locker_code) != 8 or not re.match(r'^[A-Z0-9]{8}$', locker_code):
-        return request_handler.send_json_response(400, {"error": "Invalid 8-character locker code in filename"})
+        return request_handler.send_json_response(400, {
+            "error": "Invalid locker code format",
+            "details": f"Expected 8 alphanumeric characters, got '{locker_code}'",
+            "status": "error"
+        })
 
     try:
         # 3. EXECUTE STAKING (Targeting Mailbox Wallet)
-        log_info(logger, "CreateMailbox", f"Establishing identity from locker: {locker_code}")
+        log_info(logger, "CreateMailbox", f"Establishing identity from code: {locker_code}")
         
-        # Convert string code to bytes and trigger the standardized logic
+        # This function handles derived keys, Command 91, and saving to Data/Wallets/Mailbox/Bank
         success = stake_locker_identity(
             locker_code_bytes=locker_code.encode('ascii'),
             app_context=app_ctx,
-            target_wallet="Mailbox",  # CRITICAL: This goes to Mailbox folder
+            target_wallet="Mailbox",  # This ensures it goes to the Mailbox folder
             logger=logger
         )
 
         if not success:
-            return request_handler.send_json_response(404, {"error": "Locker is empty or consensus failed."})
+            return request_handler.send_json_response(404, {
+                "error": "Locker is empty or consensus failed",
+                "details": "RAIDA servers did not return any coins for this code.",
+                "status": "error"
+            })
 
         # 4. DISCOVER THE NEW IDENTITY COIN
-        # Scan the Mailbox/Bank to find the coin that was just saved
+        # Scan the Mailbox/Bank to find the coin that was just created/saved
         mailbox_bank = "Data/Wallets/Mailbox/Bank"
         identity_coin = find_identity_coin(mailbox_bank, None) # None finds the first available coin
 
         if not identity_coin:
-            return request_handler.send_json_response(500, {"error": "Staking reported success but coin file not found."})
+            return request_handler.send_json_response(500, {
+                "error": "Identity staked successfully but coin file not found on disk.",
+                "status": "error"
+            })
 
         sn = identity_coin['sn']
         dn = identity_coin['dn']
         email_address = f"0006.{dn}.{sn}"
 
-        # 5. AUTO-UPDATE CONFIG FILE
+        # 5. AUTO-UPDATE CONFIG FILE (qmail.toml)
+        # This allows the app to know which coin to use for the Beacon on next start
         config_path = "config/qmail.toml"
         try:
-            with open(config_path, 'r') as f:
-                config_data = toml.load(f)
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config_data = toml.load(f)
+            else:
+                config_data = {}
 
             if 'identity' not in config_data:
                 config_data['identity'] = {}
@@ -718,25 +734,31 @@ def handle_create_mailbox(request_handler, request_context):
             with open(config_path, 'w') as f:
                 toml.dump(config_data, f)
             
-            # Update memory context so user doesn't have to restart
+            # Update memory context immediately so the Beacon can find it without a restart
             app_ctx.config.identity.serial_number = sn
             app_ctx.config.identity.denomination = dn
             
             log_info(logger, "CreateMailbox", f"✓ Config updated for identity {email_address}")
         except Exception as e:
-            log_error(logger, "CreateMailbox", f"Failed to auto-update config: {e}")
+            log_error(logger, "CreateMailbox", f"Failed to auto-update qmail.toml: {e}")
 
         # 6. RETURN SUCCESS
+        # The frontend will receive the email address and serial number to show the user
         return request_handler.send_json_response(200, {
             "status": "success",
             "message": "Mailbox established successfully.",
             "email_address": email_address,
-            "serial_number": sn
+            "serial_number": sn,
+            "wallet": "Mailbox"
         })
 
     except Exception as e:
-        log_error(logger, "CreateMailbox", f"Staking crash: {e}")
-        return request_handler.send_json_response(500, {"error": str(e)})
+        log_error(logger, "CreateMailbox", f"Staking process crashed: {e}")
+        return request_handler.send_json_response(500, {
+            "error": "Internal server error during staking",
+            "details": str(e),
+            "status": "error"
+        })
 # ============================================================================
 # DATA ENDPOINTS
 # ============================================================================

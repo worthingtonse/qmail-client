@@ -209,6 +209,15 @@ def _get_locker_file_path(data_dir: str, amount: float) -> str:
     return os.path.join(data_dir, filename)
 
 
+def generate_stable_filename(denomination: int, serial_number: int) -> str:
+    """
+    Returns the supervisor-mandated stable name format: DN.SN.bin
+    Example: 1.9752.bin
+    Note: This name remains the same even if the POWN status changes.
+    """
+    return f"{denomination}.{serial_number}.bin"
+
+
 def _validate_locker_key(key: str) -> bool:
     """
     Validate locker key format.

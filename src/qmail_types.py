@@ -886,14 +886,12 @@ class SendEmailRequest:
 
 @dataclass
 class RecipientInfo:
-    """
-    Information about an email recipient.
-    C: typedef struct RecipientInfo { ... } RecipientInfo;
-    """
-    qmail_address: str = ""                 # "0006.1.12345678"
-    recipient_type: int = RecipientType.TO  # 0=TO, 1=CC, 2=BCC
-    beacon_server_id: str = ""              # From database lookup
-    receiving_fee: float = 0.0              # Fee to receive (currently 0)
+    qmail_address: str = ""
+    recipient_type: int = RecipientType.TO
+    beacon_server_id: str = ""
+    # CHANGED: serial_number must be str to accept "C23"
+    serial_number: str = "" 
+    receiving_fee: float = 0.0
 
 
 @dataclass

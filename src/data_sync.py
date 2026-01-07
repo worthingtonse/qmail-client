@@ -164,86 +164,67 @@ def download_text(
         return SyncErrorCode.ERR_NETWORK, None
 
 
-def parse_users_csv(
-    csv_text: str,
-    logger_handle=None
-) -> List[Dict]:
+def parse_users_csv(csv_text: str, logger_handle=None) -> List[Dict]:
     """
-    Parse users CSV into list of user dictionaries.
-
-    CSV Format (from users.php):
-        CoinID, Denom, DomainID, SerialNumber, FirstName, MiddleName, LastName,
-        Avatar, Streak, SendingFee, Description, BeaconID
-
-    Args:
-        csv_text: Raw CSV text content
-        logger_handle: Optional logger
-
-    Returns:
-        List of user dictionaries ready for upsert_user()
-
-    C signature: int parse_users_csv(const char* csv_text, SyncUser** out_users);
+    Parses the new Supervisor CSV format:
+    FirstName, LastName, CustomSerialNumber, Description, InboxFee, Class, Beacon
     """
+    import csv
+    import io
+    
     users = []
-    lines = csv_text.strip().split('\n')
-
-    if len(lines) < 2:
-        log_warning(logger_handle, SYNC_CONTEXT, "CSV has no data rows")
-        return users
-
-    # Skip header row (first line)
-    for line_num, line in enumerate(lines[1:], start=2):
-        line = line.strip()
-
-        # Skip empty lines and comments
-        if not line or line.startswith('#'):
+    # Use csv module to handle potential quotes or commas in descriptions
+    f = io.StringIO(csv_text.strip())
+    reader = csv.reader(f)
+    
+    header_skipped = False
+    line_num = 0
+    
+    for row in reader:
+        line_num += 1
+        if not row: continue
+        
+        # 1. Skip Header
+        if not header_skipped:
+            header_skipped = True
             continue
-
-        # Parse CSV fields (handle comma-separated with possible spaces)
-        fields = [f.strip() for f in line.split(',')]
-
-        if len(fields) < 4:
-            log_warning(logger_handle, SYNC_CONTEXT,
-                        f"Line {line_num}: Not enough fields ({len(fields)}), skipping")
-            continue
-
+            
         try:
-            # Parse identity fields (hex strings)
-            coin_id = int(fields[0], 16) if fields[0] else 0x0006
-            denom = int(fields[1], 16) if fields[1] else 1
-            domain_id = int(fields[2], 16) if fields[2] else 1
-            serial_num = int(fields[3], 16) if fields[3] else 0
-
-            # Combine DomainID (high byte) + SerialNumber (3 bytes) into user_id
-            # This creates a 4-byte serial number with domain in high byte
-            user_id = (domain_id << 24) | (serial_num & 0x00FFFFFF)
-
-            # Build user dict matching upsert_user() expectations
-            user = {
-                'user_id': user_id,
-                'coin_id': coin_id,
-                'denomination': denom,
-                'first_name': fields[4] if len(fields) > 4 else '',
-                'middle_name': fields[5] if len(fields) > 5 else '',
-                'last_name': fields[6] if len(fields) > 6 else '',
-                'avatar': fields[7] if len(fields) > 7 else None,
-                'streak': int(fields[8]) if len(fields) > 8 and fields[8] else 0,
-                'sending_fee': fields[9] if len(fields) > 9 else None,
-                'description': fields[10] if len(fields) > 10 else None,
-                'beacon_id': fields[11] if len(fields) > 11 else None,
+            # 2. Map indices to new Supervisor format
+            # row[0]: FirstName, row[1]: LastName, row[2]: CustomSerialNumber
+            # row[3]: Description, row[4]: InboxFee, row[5]: Class, row[6]: Beacon
+            
+            first_name = row[0].strip()
+            last_name = row[1].strip()
+            custom_sn = row[2].strip() # e.g., "C23"
+            description = row[3].strip()
+            
+            # InboxFee normalization (Flat fee per message)
+            try:
+                inbox_fee = float(row[4].strip())
+            except:
+                inbox_fee = 0.0
+                
+            user_class = row[5].strip()
+            beacon = row[6].strip()
+            
+            # 3. Create standardized user dictionary
+            user_dict = {
+                'custom_sn': custom_sn,
+                'first_name': first_name,
+                'last_name': last_name,
+                'description': description,
+                'inbox_fee': inbox_fee,
+                'class': user_class,
+                'beacon': beacon
             }
-
-            users.append(user)
-
-        except (ValueError, IndexError) as e:
-            log_warning(logger_handle, SYNC_CONTEXT,
-                        f"Line {line_num}: Parse error ({e}), skipping")
-            continue
-
-    log_debug(logger_handle, SYNC_CONTEXT,
-              f"Parsed {len(users)} users from CSV")
+            users.append(user_dict)
+            
+        except Exception as e:
+            from logger import log_warning
+            log_warning(logger_handle, "DataSync", f"Line {line_num}: Parse error ({e}), skipping")
+            
     return users
-
 
 # ============================================================================
 # DATA VALIDATION
@@ -317,74 +298,45 @@ def validate_server(server: Dict) -> bool:
 # ============================================================================
 
 def sync_users(
-    db_handle: DatabaseHandle,
+    db_handle,
     url: str,
     timeout_sec: int = 30,
     logger_handle=None
 ) -> Tuple[SyncErrorCode, int]:
     """
-    Download users CSV from server and sync to database.
-
-    Performs UPSERT: updates existing records, inserts new ones.
-
-    CSV Format:
-        CoinID, Denom, DomainID, SerialNumber, FirstName, MiddleName, LastName,
-        Avatar, Streak, SendingFee, Description, BeaconID
-
-    Args:
-        db_handle: Database handle
-        url: Users CSV URL (e.g., https://raida11.cloudcoin.global/service/users)
-        timeout_sec: Request timeout
-        logger_handle: Optional logger
-
-    Returns:
-        Tuple of (error_code, number of users synced)
-
-    C signature: SyncErrorCode sync_users(DatabaseHandle* db, const char* url,
-                                           int timeout_sec, int* out_count);
+    Download users CSV and sync to database using the new Supervisor format.
     """
-    log_info(logger_handle, SYNC_CONTEXT, f"Syncing users from: {url}")
+    from data_sync import download_text, SyncErrorCode
+    from database import upsert_user, DatabaseErrorCode
+    from logger import log_info, log_warning
+    
+    log_info(logger_handle, "DataSync", f"Syncing users from: {url}")
 
-    # Download CSV text
+    # 1. Download CSV text
     err, csv_text = download_text(url, timeout_sec, logger_handle)
     if err != SyncErrorCode.SUCCESS:
         return err, 0
 
     if not csv_text:
-        log_warning(logger_handle, SYNC_CONTEXT,
-                    "Empty response from users URL")
+        log_warning(logger_handle, "DataSync", "Empty response from users URL")
         return SyncErrorCode.SUCCESS, 0
 
-    # Parse CSV into user dictionaries
+    # 2. Parse CSV (Using the corrected helper above)
     users = parse_users_csv(csv_text, logger_handle)
 
     if not users:
-        log_warning(logger_handle, SYNC_CONTEXT, "No users found in CSV")
+        log_warning(logger_handle, "DataSync", "No users found in CSV or parse failed")
         return SyncErrorCode.SUCCESS, 0
 
-    # Sync each user to database
+    # 3. Sync to database
     synced_count = 0
-    invalid_count = 0
-
     for user in users:
-        # Validate
-        if not validate_user(user):
-            invalid_count += 1
-            continue
-
-        # Upsert to database
+        # Upsert ensures we update existing 'C23' records
         db_err = upsert_user(db_handle, user)
         if db_err == DatabaseErrorCode.SUCCESS:
             synced_count += 1
-        else:
-            log_warning(logger_handle, SYNC_CONTEXT,
-                        f"Failed to sync user {user.get('user_id')}: {db_err}")
 
-    if invalid_count > 0:
-        log_warning(logger_handle, SYNC_CONTEXT,
-                    f"Skipped {invalid_count} invalid user records")
-
-    log_info(logger_handle, SYNC_CONTEXT, f"Synced {synced_count} users")
+    log_info(logger_handle, "DataSync", f"Synced {synced_count} users successfully")
     return SyncErrorCode.SUCCESS, synced_count
 
 

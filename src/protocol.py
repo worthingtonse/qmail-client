@@ -28,7 +28,7 @@ import zlib
 import struct
 import hashlib
 from enum import IntEnum
-from typing import List, Optional, Tuple ,Any, Dict
+from typing import List, Optional, Tuple, Any, Dict, Union
 import zlib
 
 # AES encryption - use pycryptodome if available, fallback to simple XOR for testing
@@ -156,6 +156,18 @@ def _generate_challenge() -> bytes:
     crc32_bytes = struct.pack('>I', crc32_val)
     return bytes_to_crc + crc32_bytes
 
+
+# Helper to convert "C23" to integer 23 for binary protocol
+def custom_sn_to_int(custom_sn: str) -> int:
+    """
+    Strips the 'C' prefix and returns the raw integer serial number.
+    Example: 'C23' -> 23
+    """
+    import re
+    if not isinstance(custom_sn, str):
+        return int(custom_sn)
+    match = re.search(r'\d+', custom_sn)
+    return int(match.group()) if match else 0
 
 def build_ping_body(denomination: int, serial_number: int, device_id: int, an: bytes) -> Tuple[bytes, bytes]:
     """Builds the 50-byte PING body with CRC-32 preamble and identity block."""
@@ -761,7 +773,7 @@ def build_upload_header(
 
 def build_upload_payload(
     denomination: int,
-    serial_number: int,
+    serial_number: Union[int, str],  # FIXED: Accept str for "C23" support
     device_id: int,
     an: bytes,
     file_group_guid: bytes,
@@ -772,85 +784,72 @@ def build_upload_payload(
 ) -> Tuple[ProtocolErrorCode, bytes, bytes]:
     """
     Build the upload command payload (before encryption).
-
-    Args:
-        denomination: User's denomination
-        serial_number: User's mailbox ID (serial number)
-        device_id: 8-bit device identifier (0-255)
-        an: 16-byte Authenticity Number
-        file_group_guid: 16-byte file group GUID
-        locker_code: 8-byte locker code
-        storage_duration: Duration code (0-5 or 255)
-        stripe_data: Binary data to upload (one stripe)
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ProtocolErrorCode, payload bytes, challenge bytes for validation)
+    FIXED: Uses custom_sn_to_int to handle "C23" strings in the preamble.
     """
+    # 0. Helper conversion (Ensure numeric SN for binary packing)
+    # This strips the 'C' and prevents a struct.pack crash
+    numeric_sn = custom_sn_to_int(serial_number)
+
     # Validate inputs
     if an is None or len(an) < 16:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_upload_payload failed",
-                  "AN must be 16 bytes")
+        log_error(logger_handle, PROTOCOL_CONTEXT, "build_upload_payload failed", "AN must be 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
     if file_group_guid is None or len(file_group_guid) < 16:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_upload_payload failed",
-                  "file_group_guid must be 16 bytes")
+        log_error(logger_handle, PROTOCOL_CONTEXT, "build_upload_payload failed", "file_group_guid must be 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
-    # Calculate total payload size: fixed preamble+header (84) + data + terminator (2)
     data_length = len(stripe_data) if stripe_data else 0
     payload_size = 84 + data_length + 2
-
     payload = bytearray(payload_size)
 
-    # Challenge (0-15): Includes required CRC-32 for Type 0
+    # Challenge (0-15)
     challenge = _generate_challenge()
     payload[0:16] = challenge
 
-    # Session ID (16-23): zeros for Mode B
+    # Session ID (16-23)
     payload[16:24] = bytes(8)
 
-    # Coin Type (24-25): 0x0006
+    # Coin Type (24-25)
     struct.pack_into('>H', payload, 24, COIN_TYPE)
 
     # Denomination (26)
     payload[26] = denomination
 
     # Serial Number (27-30): big-endian
-    struct.pack_into('>I', payload, 27, serial_number)
+    # FIXED: Use numeric_sn instead of the raw input
+    struct.pack_into('>I', payload, 27, numeric_sn)
 
-    # Device ID (31): 8-bit per protocol spec
+    # Device ID (31)
     payload[31] = device_id & 0xFF
 
-    # AN (32-47): Proof of identity at Offset 32 for server check
+    # AN (32-47)
     payload[32:48] = an[:16]
 
-    # File Group GUID (48-63): 16 bytes
+    # File Group GUID (48-63)
     payload[48:64] = file_group_guid[:16]
 
-    # Locker Code (64-71): 8 bytes
+    # Locker Code (64-71)
     payload[64:72] = locker_code[:8] if locker_code else bytes(8)
 
-    # Reserved fields (72-73, 74, 76-79)
+    # Reserved (72-74)
     payload[72:75] = bytes(3)
 
     # Storage Duration (75)
+    # KEPT AS IS: per your request not to hardcode 255
     payload[75] = storage_duration & 0xFF
 
-    # Data Length (80-83): big-endian
+    # Data Length (80-83)
     struct.pack_into('>I', payload, 80, data_length)
 
     # Binary Data (84+)
     if stripe_data:
         payload[84:84 + data_length] = stripe_data
 
-    # Terminator: Strict placement at the absolute end
+    # Terminator
     payload[-2:] = TERMINATOR
 
-    log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Built upload payload: {payload_size} bytes, data={data_length} bytes")
-
+    log_debug(logger_handle, PROTOCOL_CONTEXT, f"Built upload payload: {payload_size} bytes")
     return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
 
 def encrypt_payload(
@@ -1255,7 +1254,8 @@ def build_tell_payload(
         struct.pack_into('>H', payload, offset + 1, r.coin_id)
         payload[offset + 3] = r.denomination & 0xFF
         payload[offset + 4] = r.domain_id & 0xFF
-        sn_bytes = (r.serial_number & 0xFFFFFF).to_bytes(3, 'big')
+        numeric_sn = custom_sn_to_int(str(r.serial_number))
+        sn_bytes = (numeric_sn & 0xFFFFFF).to_bytes(3, 'big') 
         payload[offset + 5 : offset + 8] = sn_bytes
         if hasattr(r, 'locker_payment_key') and r.locker_payment_key:
             payload[offset + 8 : offset + 24] = r.locker_payment_key[:16]
@@ -2036,6 +2036,104 @@ def build_locker_download_payload(
               f"Built locker_download payload: {len(payload)} bytes (terminator added after encryption)")
 
     return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
+
+
+
+def build_locker_put_payload(
+    raida_id: int,
+    coins: List[Any],
+    locker_key: bytes,
+    logger_handle: Optional[object] = None
+) -> Tuple[int, bytes, bytes]:
+    """
+    Builds the Locker PUT (Command 82) payload.
+    Matches cmd_locker.c -> cmd_store_sum() logic.
+    
+    Structure: [16 Challenge] + [N*5 Coins] + [16 XOR_Sum] + [16 Seed] + [2 Term]
+    """
+    import struct
+    import zlib
+
+    # 1. Validation
+    if not coins:
+        return 1, b'', b''
+    if len(locker_key) < 16:
+        # Key must be 16 bytes (often padded with 0xFF in last 4 bytes)
+        locker_key = locker_key.ljust(16, b'\xFF')
+
+    # 2. Calculate Size
+    # 16 (Challenge) + (N * 5) + 16 (XOR) + 16 (Seed) + 2 (Terminator)
+    num_coins = len(coins)
+    body_size = 16 + (num_coins * 5) + 16 + 16 + 2
+    payload = bytearray(body_size)
+
+    # 3. Challenge (Offset 0-15)
+    # Server logic requires 12 bytes random + 4 bytes CRC32
+    challenge_data = os.urandom(12)
+    crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
+    payload[0:12] = challenge_data
+    struct.pack_into('>I', payload, 12, crc)
+    full_challenge = bytes(payload[0:16])
+
+    # 4. Pack Coins (Offset 16+)
+    # Each coin: 1 byte Denom + 4 bytes SN (Big Endian)
+    # We calculate the XOR sum of ANs for this RAIDA simultaneously
+    xor_sum = bytearray(16)
+    offset = 16
+    for coin in coins:
+        # Convert "C23" to 23 if needed
+        numeric_sn = custom_sn_to_int(coin.serial_number if hasattr(coin, 'serial_number') else coin.sn)
+        
+        payload[offset] = coin.denomination & 0xFF
+        struct.pack_into('>I', payload, offset + 1, numeric_sn)
+        
+        # XOR the 16-byte AN that belongs to THIS specific RAIDA
+        # coin.ans is expected to be a list/dict of 25 ANs (16 bytes each)
+        target_an = coin.ans[raida_id]
+        for b in range(16):
+            xor_sum[b] ^= target_an[b]
+            
+        offset += 5
+
+    # 5. XOR Sum (16 bytes)
+    payload[offset : offset + 16] = xor_sum
+    offset += 16
+
+    # 6. Seed / Locker Key (16 bytes)
+    payload[offset : offset + 16] = locker_key[:16]
+    offset += 16
+
+    # 7. Terminator (Last 2 bytes)
+    payload[offset : offset + 2] = b'\x3e\x3e'
+
+    return 0, bytes(payload), full_challenge
+
+
+def build_complete_locker_put_request(
+    raida_id: int,
+    coins: List[Any],
+    locker_key: bytes,
+    logger_handle: Optional[object] = None
+) -> Tuple[int, bytes, bytes]:
+    """
+    Combines 32-byte header with Command 82 payload.
+    """
+    err, body, challenge = build_locker_put_payload(raida_id, coins, locker_key, logger_handle)
+    if err != 0:
+        return err, b'', b''
+
+    # Header: Group 8, Command 82, Encryption 0 (Plaintext Body)
+    header = bytearray(32)
+    header[0] = 0x01  # Version
+    header[2] = raida_id & 0xFF
+    header[4] = 8     # Command Group: Locker
+    header[5] = 82    # Command: PUT
+    struct.pack_into('>H', header, 6, 0x0006) # Coin Type
+    
+    # Payload length in header
+    struct.pack_into('>H', header, 22, len(body))
+
+    return 0, bytes(header + body), challenge
 
 
 def encrypt_locker_payload(

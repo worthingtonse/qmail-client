@@ -89,12 +89,15 @@ NUM_SERVERS = 5                  # Number of servers (4 data + 1 parity)
 
 @dataclass
 class ServerFees:
-    """Fee structure for a single server."""
+    """
+    Fee structure for a single server.
+    UPDATED: Matches the 8-week block model from RAIDA11 Server Service.
+    """
     server_id: str
     cost_per_mb: float = DEFAULT_COST_PER_MB
-    cost_per_week: float = DEFAULT_COST_PER_WEEK
+    # Change this field name to match your calculation logic
+    cost_per_8_weeks: float = 1.0  
     is_available: bool = True
-
 
 @dataclass
 class PaymentCalculation:
@@ -117,117 +120,42 @@ class PaymentCalculation:
 # ============================================================================
 
 def calculate_storage_cost(
-    total_file_size: int,
-    num_servers: int,
+    total_file_size_bytes: int,
     storage_weeks: int,
-    server_fees: List[ServerFees],
-    logger_handle: Optional[object] = None
-) -> Tuple[ErrorCode, PaymentCalculation]:
+    server_fees: List[Any] # Objects containing cost_per_mb and cost_per_8_weeks
+) -> float:
     """
-    Calculate the total storage cost for uploading data.
-
-    The cost is calculated per server based on:
-    - Data size stored on each server (total / num_data_servers)
-    - Storage duration
-    - Server-specific fees
-
-    Args:
-        total_file_size: Total size of data in bytes (before striping)
-        num_servers: Number of servers to distribute data across (default 5)
-        storage_weeks: Number of weeks to store data
-        server_fees: List of ServerFees for each server
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ErrorCode, PaymentCalculation)
-
-    Example:
-        fees = [ServerFees(server_id=f"RAIDA{i}") for i in range(5)]
-        err, calc = calculate_storage_cost(1024 * 1024, 5, 8, fees)
-        print(f"Total cost: {calc.total_cost}")
+    NEW: Uses the 8-week block math from the qmail_servers service.
+    Formula: (MB * cost_per_mb) + ((weeks / 8) * cost_per_8_weeks)
     """
-    result = PaymentCalculation()
+    size_mb = total_file_size_bytes / (1024 * 1024)
+    total_storage_cost = 0.0
+    
+    # Calculate for the 5 servers (4 data + 1 parity)
+    for fee in server_fees[:5]:
+        # MB component
+        mb_cost = size_mb * fee.cost_per_mb
+        
+        # Duration component (normalized to 8-week blocks)
+        duration_blocks = storage_weeks / 8.0
+        time_cost = duration_blocks * fee.cost_per_8_weeks
+        
+        total_storage_cost += (mb_cost + time_cost)
+        
+    return total_storage_cost
 
-    # Validate inputs
-    if total_file_size < 0:
-        log_error(logger_handle, PAYMENT_CONTEXT, "calculate_storage_cost failed",
-                  "total_file_size cannot be negative")
-        result.error_code = ErrorCode.ERR_INVALID_PARAM
-        result.error_message = "File size cannot be negative"
-        return ErrorCode.ERR_INVALID_PARAM, result
-
-    if num_servers < 2:
-        log_error(logger_handle, PAYMENT_CONTEXT, "calculate_storage_cost failed",
-                  f"num_servers must be at least 2, got {num_servers}")
-        result.error_code = ErrorCode.ERR_INVALID_PARAM
-        result.error_message = "Must have at least 2 servers"
-        return ErrorCode.ERR_INVALID_PARAM, result
-
-    if not server_fees:
-        log_warning(logger_handle, PAYMENT_CONTEXT,
-                    "No server fees provided, using defaults")
-        server_fees = [ServerFees(server_id=f"default_{i}") for i in range(num_servers)]
-
-    # Convert weeks to duration code
-    result.duration_code = weeks_to_duration_code(storage_weeks)
-
-    # Calculate size per server (data is distributed across all servers)
-    # Each server stores total_size / num_data_servers bytes
-    # Plus parity server stores same amount
-    num_data_servers = num_servers - 1
-    size_per_server_bytes = (total_file_size + num_data_servers - 1) // num_data_servers
-    size_per_server_mb = size_per_server_bytes / (1024 * 1024)
-
-    # Calculate cost for each server
-    total_cost = 0.0
-    breakdown = {}
-
-    for i, fee in enumerate(server_fees[:num_servers]):
-        # Cost = size_mb * cost_per_mb + weeks * cost_per_week
-        server_cost = (size_per_server_mb * fee.cost_per_mb) + \
-                     (storage_weeks * fee.cost_per_week)
-
-        breakdown[fee.server_id] = server_cost
-        total_cost += server_cost
-
-        log_debug(logger_handle, PAYMENT_CONTEXT,
-                  f"Server {fee.server_id}: {size_per_server_mb:.3f} MB * "
-                  f"{fee.cost_per_mb} + {storage_weeks} weeks * {fee.cost_per_week} = "
-                  f"{server_cost:.6f}")
-
-    result.storage_cost = total_cost
-    result.total_cost = total_cost
-    result.server_breakdown = breakdown
-    result.error_code = ErrorCode.SUCCESS
-
-    log_info(logger_handle, PAYMENT_CONTEXT,
-             f"Calculated storage cost: {total_cost:.6f} for {total_file_size} bytes "
-             f"across {num_servers} servers for {storage_weeks} weeks")
-
-    return ErrorCode.SUCCESS, result
-
-
-def calculate_recipient_fees(
-    recipient_count: int,
-    logger_handle: Optional[object] = None
-) -> Tuple[ErrorCode, float]:
+def calculate_recipient_fees(db_handle, recipients_list) -> Tuple[ErrorCode, float]:
     """
-    Calculate fees for recipients (stub - returns 0).
-
-    In the future, recipients may charge fees to receive emails.
-    Currently this is not implemented and returns 0.
-
-    Args:
-        recipient_count: Number of recipients
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ErrorCode, total recipient fees)
+    NEW: Sums the InboxFee for every recipient in the list.
     """
-    # Stub: No recipient fees currently
-    log_debug(logger_handle, PAYMENT_CONTEXT,
-              f"Recipient fees for {recipient_count} recipients: 0.0 (not implemented)")
-    return ErrorCode.SUCCESS, 0.0
+    from database import get_user_payment_requirement
+    total_fee = 0.0
+    for recipient_sn in recipients_list:
+        # lookup fee for "C23", "C24", etc.
+        err, fee, u_class = get_user_payment_requirement(db_handle, recipient_sn)
+        if err == 0:
+            total_fee += (fee if fee else 0.0)
+    return ErrorCode.SUCCESS, total_fee
 
 
 def get_server_fees(

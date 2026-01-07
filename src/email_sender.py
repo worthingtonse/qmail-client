@@ -37,7 +37,7 @@ from qmail_types import (
     FileUploadInfo, EmailPackage, IdentityConfig
 )
 from protocol import (
-    build_complete_tell_request, CMD_GROUP_QMAIL, CMD_TELL, TELL_TYPE_QMAIL,
+    build_complete_tell_request, CMD_GROUP_QMAIL, CMD_TELL, TELL_TYPE_QMAIL, custom_sn_to_int,
     weeks_to_duration_code
 )
 from network import connect_to_server, send_request, disconnect
@@ -51,58 +51,55 @@ import os
 import struct
 
 
-def load_coin_from_file(file_path: str) -> Optional[object]:
-    """Load a CloudCoin from .bin file."""
+def load_coin_from_file(file_path: str) -> Optional[Any]:
+    """
+    Loads full coin data including ANs and internal POWN status.
+    Required for payment orchestrations (Cmd 82).
+    """
+    import struct
     try:
         with open(file_path, 'rb') as f:
             data = f.read()
 
-        # Minimum size for format type 9
-        if len(data) < 407:
+        if len(data) < 439:
             return None
 
-        # Parse header
-        format_type = data[0]
-        if format_type != 0x09:
-            return None
+        # Parse internal POWN from Byte 16
+        pown_bytes = data[16:29]
+        pown_str = ""
+        for i in range(25):
+            byte_val = pown_bytes[i // 2]
+            nibble = (byte_val >> 4) if (i % 2 == 0) else (byte_val & 0x0F)
+            pown_str += 'p' if nibble == 1 else ('f' if nibble == 0 else 'u')
 
-        coin_id = struct.unpack('>H', data[2:4])[0]
+        # Parse SN/DN from Byte 32 preamble
+        denomination = struct.unpack('b', data[34:35])[0]
+        serial_number = struct.unpack('>I', data[35:39])[0]
 
-        # Parse body (starts at byte 32)
-        body = data[32:]
-        denomination = body[2]
-        serial_number = struct.unpack('>I', body[3:7])[0]
-
-        # Parse 25 ANs (16 bytes each)
+        # Parse 25 Authenticity Numbers (ANs)
+        # ANs start at Offset 39 (Byte 32 + 7 bytes of header)
         ans = []
         for i in range(25):
-            offset = 7 + (i * 16)
-            an = body[offset:offset + 16]
-            ans.append(an)
+            start = 39 + (i * 16)
+            ans.append(data[start : start + 16])
 
-        # Create coin object
-        coin = type(
-            'Coin',
-            (),
-            {
-                'denomination': denomination,
-                'sn': serial_number,
-                'ans': ans,
-                'file_path': file_path
-            }
-        )()
-
-        return coin
-
+        # Create a simple object to match the expected coin interface
+        return type('Coin', (), {
+            'denomination': denomination,
+            'sn': serial_number,
+            'ans': ans,
+            'pown_string': pown_str,
+            'file_path': file_path
+        })()
     except Exception:
         return None
-
 
 def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int = None) -> List:
     """
     Get coins from wallet that total the target value.
     
     IMPORTANT: Excludes identity coin to prevent accidental spending.
+    Uses internal file scanning (Byte 16) to ensure coin validity.
     
     Args:
         wallet_path: Path to wallet (e.g., "Data/Wallets/Default")
@@ -112,22 +109,24 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
     Returns:
         List of coin objects
     """
-    from coin_scanner import parse_denomination_code, load_coin_metadata
+    from coin_scanner import parse_denomination_code
+    import os
     
     bank_path = os.path.join(wallet_path, "Bank")
     
     if not os.path.exists(bank_path):
         return []
     
-    # Scan for coins matching target value
-    exact_match_coins = []
     all_coins = []
     
+    # 1. Scan and load all available coins
     for filename in os.listdir(bank_path):
         if not filename.endswith('.bin'):
             continue
             
         file_path = os.path.join(bank_path, filename)
+        
+        # This reads Byte 16 inside the file for POWN status
         coin = load_coin_from_file(file_path)
         
         if coin is None:
@@ -137,25 +136,38 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
         if identity_sn and coin.sn == identity_sn:
             continue
         
+        # Get float value (1.0, 0.1, etc.)
         coin_value = parse_denomination_code(coin.denomination)
         all_coins.append((coin, coin_value))
-        
-        if abs(coin_value - target_value) < 0.0001:
-            exact_match_coins.append(coin)
+
+    # 2. Try to find an EXACT MATCH using a greedy aggregation
+    # Sort descending to use larger coins first
+    all_coins.sort(key=lambda x: x[1], reverse=True)
     
-    # If we have exact match, return one
-    if exact_match_coins:
-        return [exact_match_coins[0]]
+    selected_for_aggregation = []
+    accumulated_value = 0.0
     
-    # Otherwise, find smallest coin larger than target
+    for coin, val in all_coins:
+        # Check if adding this coin stays within the target
+        if accumulated_value + val <= target_value + 0.000001:
+            selected_for_aggregation.append(coin)
+            accumulated_value += val
+            
+        # If we hit the exact target, return the list
+        if abs(accumulated_value - target_value) < 0.000001:
+            return selected_for_aggregation
+
+    # 3. No exact match found via aggregation? 
+    # Find the SMALLEST single coin that is larger than the target (to be broken)
     larger_coins = [(c, v) for c, v in all_coins if v > target_value]
-    
     if larger_coins:
-        # Sort by value, take smallest
+        # Sort ascending to find the smallest overhead
         larger_coins.sort(key=lambda x: x[1])
         return [larger_coins[0][0]]
     
+    # Truly insufficient funds
     return []
+
 
 async def create_recipient_locker(
     wallet_path: str,
@@ -184,81 +196,92 @@ async def create_recipient_locker(
     from coin_scanner import parse_denomination_code
     import secrets
     import string
+    import os
+    import math
     
     try:
-        # 1. Get coins from wallet (EXCLUDING identity coin)
+        # 1. Get coins (Could be a single large coin or a list of small coins)
         coins = get_coins_by_value(wallet_path, amount, identity_sn=identity_sn)
         
         if not coins:
             log_warning(logger_handle, "LockerCreate", 
-                       f"No spendable coins available for amount {amount}")
+                        f"No spendable coins available for amount {amount}")
             return 1, None
         
-        coin = coins[0]
-        coin_value = parse_denomination_code(coin.denomination)
-        
-        # 2. Break coin if needed
-        final_coins = []
-        
-        if abs(coin_value - amount) < 0.0001:
-            # Exact match - use as is
-            final_coins = [coin]
-        else:
-            # Need to break
+        final_coins_to_lock = []
+        total_value_selected = sum(parse_denomination_code(c.denomination) for c in coins)
+
+        # 2. Decide if we need to break or use the selection as-is
+        if abs(total_value_selected - amount) < 0.0001:
+            # Exact match (from aggregation or single coin)
+            final_coins_to_lock = coins
+        elif total_value_selected > amount:
+            # We picked a larger coin that MUST be broken
+            # Note: get_coins_by_value only returns 1 coin if it's a 'larger' case
+            coin_to_break = coins[0]
             log_info(logger_handle, "LockerCreate",
-                    f"Breaking coin {coin_value} to get {amount}")
+                    f"Breaking coin {total_value_selected} to get {amount}")
             
-            broken_coins = await break_coin(coin, amount)
+            broken_coins = await break_coin(coin_to_break, amount)
             
-            if not broken_coins or len(broken_coins) == 0:
-                log_error(logger_handle, "LockerCreate", 
-                         "Failed to break coin")
+            if not broken_coins:
+                log_error(logger_handle, "LockerCreate", "Failed to break coin")
                 return 2, None
             
-            # Take first coin (should equal amount)
-            final_coins = [broken_coins[0]]
+            # MATH FIX: Calculate how many small coins are needed
+            # e.g. If we broke a 1.0 to pay 0.3, broken_coins[0] is 0.1.
+            # num_needed = ceil(0.3 / 0.1) = 3
+            small_val = parse_denomination_code(broken_coins[0].denomination)
+            num_needed = int(math.ceil((amount - 0.000001) / small_val))
             
-            # Remaining coins automatically saved by coin_break.py
-        
+            # Take the specific number of coins needed to reach the amount
+            final_coins_to_lock = broken_coins[:num_needed]
+            
+            # The remaining broken_coins are already saved to the Bank by break_coin logic
+        else:
+            # Should not happen if get_coins_by_value logic is sound
+            return 1, None
+
         # 3. Generate random 8-char locker code
         locker_code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) 
-                             for _ in range(8))
+                              for _ in range(8))
         
-        # 4. Get 25 locker keys from code
+        # 4. Get 25 locker keys from code (MD5(raida_id + code))
         locker_keys_25 = get_keys_from_locker_code(locker_code)
         
-        # 5. Prepare coins for PUT
+        # 5. Prepare coins for PUT payload
         coins_for_put = []
-        for c in final_coins:
+        for c in final_coins_to_lock:
             coins_for_put.append(CoinForPut(
                 denomination=c.denomination,
                 serial_number=c.sn,
                 ans=c.ans
             ))
         
-        # 6. Lock coins on RAIDA
+        # 6. Lock coins on RAIDA (Command 82)
         result, details = await put_to_locker(coins_for_put, locker_keys_25)
         
         if result != PutResult.SUCCESS:
-            log_error(logger_handle, "LockerCreate",
-                     f"PUT failed: {result}")
+            log_error(logger_handle, "LockerCreate", f"PUT failed: {result}")
             return 2, None
         
-        # 7. Delete coin from bank (now in locker)
-        try:
-            os.remove(coin.file_path)
-        except:
-            pass
+        # 7. Cleanup: Delete original coins from bank (if they were used directly)
+        # If we performed a 'break', the break_coin logic usually handles the original file
+        for c in coins:
+            try:
+                if os.path.exists(c.file_path):
+                    os.remove(c.file_path)
+            except:
+                pass
         
-        # 8. Return locker code as 16-byte hex
+        # 8. Return locker code as 16-byte hex (null-padded)
+        # This is what goes into the TELL packet recipient entry
         locker_key_16 = locker_code.encode('ascii').ljust(16, b'\x00')
         return 0, locker_key_16.hex()
         
     except Exception as e:
-        log_error(logger_handle, "LockerCreate",
-                 f"Exception creating locker: {e}")
+        log_error(logger_handle, "LockerCreate", f"Exception creating locker: {e}")
         return 2, None
-
 
 import json
 import socket
@@ -1555,26 +1578,16 @@ def _build_tell_servers(
 
 
 def _parse_qmail_address(address: str) -> Tuple[int, int, int]:
-    """
-    Parse QMail address into components.
-
-    Args:
-        address: QMail address (e.g., "0006.1.12345678")
-
-    Returns:
-        Tuple of (coin_id, denomination, serial_number)
-    """
     try:
         parts = address.split('.')
         if len(parts) >= 3:
             coin_id = int(parts[0])
             denom = int(parts[1])
-            serial = int(parts[2])
+            # FIXED: Use the helper to handle the 'C' prefix
+            serial = custom_sn_to_int(parts[2]) 
             return coin_id, denom, serial
     except (ValueError, IndexError):
         pass
-
-    # Default values
     return 0x0006, 1, 0
 
 

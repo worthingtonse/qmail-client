@@ -169,22 +169,13 @@ CREATE TABLE IF NOT EXISTS QMailServers (
 -- 2. Users (Contacts)
 -- ==========================================
 CREATE TABLE IF NOT EXISTS Users (
-    UserID INTEGER PRIMARY KEY,
+    CustomSerialNumber TEXT PRIMARY KEY, -- e.g., 'C23', 'C24'
     FirstName TEXT,
-    MiddleName TEXT,
     LastName TEXT,
-    Avatar TEXT,
-    streak INTEGER DEFAULT 0,
-    sending_fee TEXT,
     Description TEXT,
-    BeaconID TEXT,
-    dreg_score INTEGER DEFAULT 0,
-    emails_sent_total INTEGER DEFAULT 0,
-    date_created DATETIME,
-    auto_address TEXT,
-    last_contacted_timestamp DATETIME,
-    contact_count INTEGER DEFAULT 0,
-    synced_at DATETIME
+    InboxFee REAL,                       -- The flat fee per message
+    Class TEXT,                          -- e.g., 'giga'
+    Beacon TEXT                          -- e.g., 'RAIDA11'
 );
 
 -- ==========================================
@@ -2407,131 +2398,86 @@ def get_folder_counts(
         return DatabaseErrorCode.ERR_QUERY_FAILED, {}
     
 
-
 def get_user_payment_requirement(
-    handle: DatabaseHandle,
-    user_id: int
-) -> Tuple[DatabaseErrorCode, Optional[float]]:
+    handle: Any, 
+    serial_number: Union[int, str]
+) -> Tuple[DatabaseErrorCode, Optional[float], Optional[str]]:
     """
-    Get recipient payment requirement for a user.
-    
-    Args:
-        handle: Database handle
-        user_id: User ID to query
-        
-    Returns:
-        Tuple of (error_code, minimum_payment_cc)
-        Returns None if user not found or no payment required
+    Look up a user's InboxFee and Class using their CustomSerialNumber.
+    FIXED: Handles both raw integers (23) and Custom strings (C23).
     """
+    # 1. Validate Handle
     if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, None
+        return DatabaseErrorCode.ERR_INVALID_PARAM, None, None
     
+    # 2. Normalize Serial Number to "C-Format" (e.g., 23 -> "C23")
+    # This ensures consistency between the identity coin and the Users table.
+    custom_sn = str(serial_number)
+    if not custom_sn.startswith('C'):
+        custom_sn = f"C{custom_sn}"
+
     try:
         cursor = handle.connection.cursor()
         
+        # 3. Query the new Supervisor Columns
         cursor.execute("""
-            SELECT minimum_payment
+            SELECT InboxFee, Class
             FROM Users
-            WHERE UserID = ?
-        """, (user_id,))
+            WHERE CustomSerialNumber = ?
+        """, (custom_sn,))
         
         row = cursor.fetchone()
         
+        # 4. Handle Missing User
         if not row:
-            return DatabaseErrorCode.ERR_NOT_FOUND, None
+            return DatabaseErrorCode.ERR_NOT_FOUND, None, None
         
-        # minimum_payment might be stored as integer (satoshis) or float
-        min_payment = row.get('minimum_payment')
+        # 5. Extract and Return (Supports sqlite3.Row factory)
+        # InboxFee is the flat CC fee; Class is the user tier (e.g., 'giga')
+        inbox_fee = row['InboxFee']
+        user_class = row['Class']
         
-        if min_payment is None or min_payment == 0:
-            return DatabaseErrorCode.SUCCESS, None  # No payment required
-        
-        # Convert to CC if stored as satoshis
-        if isinstance(min_payment, int) and min_payment > 100:
-            min_payment_cc = min_payment / 100000000.0
-        else:
-            min_payment_cc = float(min_payment)
-        
-        return DatabaseErrorCode.SUCCESS, min_payment_cc
+        return DatabaseErrorCode.SUCCESS, inbox_fee, user_class
         
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to get user payment requirement", str(e))
-        return DatabaseErrorCode.ERR_QUERY_FAILED, None
-
+        # DB_CONTEXT and log_error are imported/defined in database.py
+        log_error(handle.logger, "Database", "Failed to get user payment requirement", str(e))
+        return DatabaseErrorCode.ERR_QUERY_FAILED, None, None
 
 # ============================================================================
 # USER AND SERVER SYNC FUNCTIONS (For data_sync.py integration)
 # ============================================================================
 
-def upsert_user(handle: DatabaseHandle, user: Dict[str, Any]) -> DatabaseErrorCode:
+def upsert_user(handle, user_dict):
     """
-    Insert or update a user from remote sync data.
-
-    Uses INSERT OR REPLACE for atomic upsert.
-    Automatically generates auto_address from user_id.
-
-    Args:
-        handle: Database handle
-        user: Dictionary with user data from JSON sync:
-            - user_id: int (required)
-            - first_name: str
-            - middle_name: str
-            - last_name: str
-            - avatar: str (hex string)
-            - streak: int
-            - sending_fee: str
-            - description: str
-            - beacon_id: str
-            - dreg_score: int
-            - emails_sent_total: int
-            - date_created: str (ISO datetime)
-
-    Returns:
-        DatabaseErrorCode
-
-    C signature: DatabaseErrorCode upsert_user(DatabaseHandle* handle, const SyncUser* user);
+    Inserts a new user or updates an existing one based on CustomSerialNumber.
     """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM
-
-    user_id = user.get('user_id')
-    if user_id is None:
+    if not handle or not handle.connection:
         return DatabaseErrorCode.ERR_INVALID_PARAM
 
     try:
         cursor = handle.connection.cursor()
-
-        # Generate auto_address from user_id
-        auto_address = f"0006.1.{user_id}"
-
-        cursor.execute("""
-            INSERT OR REPLACE INTO Users
-            (UserID, FirstName, MiddleName, LastName, Avatar, streak, sending_fee,
-             Description, BeaconID, dreg_score, emails_sent_total, date_created,
-             auto_address, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        """, (
-            user_id,
-            user.get('first_name', ''),
-            user.get('middle_name', ''),
-            user.get('last_name', ''),
-            user.get('avatar'),
-            user.get('streak', 0),
-            user.get('sending_fee'),
-            user.get('description'),
-            user.get('beacon_id'),
-            user.get('dreg_score', 0),
-            user.get('emails_sent_total', 0),
-            user.get('date_created'),
-            auto_address
-        ))
-
+        # INSERT OR REPLACE ensures no duplicates for the same CustomSerialNumber
+        sql = """
+            INSERT OR REPLACE INTO Users (
+                CustomSerialNumber, FirstName, LastName, Description, 
+                InboxFee, Class, Beacon
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            user_dict['custom_sn'],
+            user_dict['first_name'],
+            user_dict['last_name'],
+            user_dict['description'],
+            user_dict['inbox_fee'],
+            user_dict['class'],
+            user_dict['beacon']
+        )
+        cursor.execute(sql, params)
         handle.connection.commit()
         return DatabaseErrorCode.SUCCESS
-
-    except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, f"Failed to upsert user {user_id}", str(e))
-        handle.connection.rollback()
+    except Exception as e:
+        # log_error(handle.logger, "Database", "Upsert user failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED
 
 
@@ -3808,46 +3754,112 @@ def fix_null_beacon_ids(
 
 
 def is_guid_in_database(handle, file_guid):
-    """Checks if a GUID has already been cached."""
-    cursor = handle.connection.cursor()
-    cursor.execute("SELECT 1 FROM received_tells WHERE file_guid = ?", (file_guid,))
-    return cursor.fetchone() is not None
+    """
+    Checks if a GUID has already been cached in the database.
+    FIXED: Converts binary GUID to Hex string for reliable comparison.
+    """
+    if not handle or not handle.connection:
+        return False
+        
+    try:
+        # 1. Binary ko Hex mein convert karo
+        if isinstance(file_guid, bytes):
+            guid_hex = file_guid.hex().upper()
+        else:
+            guid_hex = str(file_guid).upper()
+            
+        cursor = handle.connection.cursor()
+        
+        # 2. Database mein search karo
+        cursor.execute("SELECT 1 FROM received_tells WHERE file_guid = ?", (guid_hex,))
+        return cursor.fetchone() is not None
+        
+    except Exception:
+        return False
+
+# def store_received_tell(
+#     handle: DatabaseHandle,
+#     file_guid: str,
+#     locker_code: bytes,
+#     tell_type: int = 0,  # Changed from file_type
+#     version: int = 1,    # Keep for backward compatibility but don't use
+#     file_size: int = 0,  # Keep for backward compatibility but don't use
+#     status: str = 'pending'  # Keep for backward compatibility but don't use
+# ) -> Tuple[DatabaseErrorCode, int]:
+#     """Store a received tell notification in the database."""
+#     if handle is None or handle.connection is None:
+#         return DatabaseErrorCode.ERR_INVALID_PARAM, -1
+
+#     if not file_guid or locker_code is None:
+#         return DatabaseErrorCode.ERR_INVALID_PARAM, -1
+
+#     # Convert locker_code to hex string for storage
+#     locker_code_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
+
+#     try:
+#         cursor = handle.connection.cursor()
+#         cursor.execute("""
+#             INSERT OR REPLACE INTO received_tells
+#             (file_guid, locker_code, tell_type)
+#             VALUES (?, ?, ?)
+#         """, (file_guid, locker_code_hex, tell_type))
+
+#         handle.connection.commit()
+#         tell_id = cursor.lastrowid
+
+#         log_info(handle.logger, DB_CONTEXT, f"Stored received tell: {file_guid}, id={tell_id}")
+#         return DatabaseErrorCode.SUCCESS, tell_id
+
+#     except sqlite3.Error as e:
+#         log_error(handle.logger, DB_CONTEXT, "Failed to store received tell", str(e))
+#         handle.connection.rollback()
+#         return DatabaseErrorCode.ERR_QUERY_FAILED, -1
 
 def store_received_tell(
     handle: DatabaseHandle,
-    file_guid: str,
+    file_guid: Any, 
     locker_code: bytes,
-    tell_type: int = 0,  # Changed from file_type
-    version: int = 1,    # Keep for backward compatibility but don't use
-    file_size: int = 0,  # Keep for backward compatibility but don't use
-    status: str = 'pending'  # Keep for backward compatibility but don't use
+    tell_type: int = 0,
+    version: int = 1,
+    file_size: int = 0,
+    status: str = 'pending'
 ) -> Tuple[DatabaseErrorCode, int]:
-    """Store a received tell notification in the database."""
+    """
+    Store a received tell notification in the database.
+    FIXED: Converts both GUID and Locker Code to Hex strings.
+    """
+    import sqlite3
+    
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, -1
 
     if not file_guid or locker_code is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, -1
 
-    # Convert locker_code to hex string for storage
-    locker_code_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
+    # 1. CONVERT TO HEX: Dono ko string format mein lana zaroori hai
+    guid_hex = file_guid.hex().upper() if isinstance(file_guid, bytes) else str(file_guid).upper()
+    locker_code_hex = locker_code.hex().upper() if isinstance(locker_code, bytes) else str(locker_code).upper()
 
     try:
         cursor = handle.connection.cursor()
+        
+        # 2. INSERT OR REPLACE: Duplicate GUID aane par ye record ko refresh kar dega
         cursor.execute("""
             INSERT OR REPLACE INTO received_tells
             (file_guid, locker_code, tell_type)
             VALUES (?, ?, ?)
-        """, (file_guid, locker_code_hex, tell_type))
+        """, (guid_hex, locker_code_hex, tell_type))
 
         handle.connection.commit()
         tell_id = cursor.lastrowid
 
-        log_info(handle.logger, DB_CONTEXT, f"Stored received tell: {file_guid}, id={tell_id}")
+        from src.logger import log_info
+        log_info(handle.logger, "Database", f"✓ Stored notification: {guid_hex}, id={tell_id}")
         return DatabaseErrorCode.SUCCESS, tell_id
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to store received tell", str(e))
+        from src.logger import log_error
+        log_error(handle.logger, "Database", "Failed to store received tell", str(e))
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED, -1
 

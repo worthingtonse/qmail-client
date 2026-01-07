@@ -339,54 +339,60 @@ def scan_wallet_folders(bank_path: str, fracked_path: str, limbo_path: Optional[
 
     return result
 
-
-def load_coin_metadata(file_path: str) -> Optional[Dict]:
+def load_coin_metadata(filepath: str) -> Optional[Dict]:
     """
-    Load coin metadata from binary file by reading internal structure.
-    Resilient to file renaming.
+    Look inside at Byte 16 for POWN status (25 nibbles) and Byte 32 for SN/DN.
+    Matches the supervisor's stable naming requirement (DN.SN.bin).
     
-    Args:
-        file_path: Path to .bin file
-        
     Returns:
-        Dict with coin metadata or None if invalid
-        {
-            'file_path': str,
-            'coin_id': int,
-            'denomination': int,
-            'serial_number': int,
-            'ans': List[bytes]  # 25 x 16-byte ANs
-        }
+        Dictionary with denomination, serial_number, pown_string, value, and file_path
     """
+    import os
+    import struct
+    
+    if not os.path.exists(filepath):
+        return None
+
     try:
-        with open(file_path, 'rb') as f:
+        with open(filepath, 'rb') as f:
             data = f.read()
-        
+
+        # Format 9 coins are exactly 439 bytes
         if len(data) < 439:
             return None
-        
-        # Read from binary structure
-        coin_id = struct.unpack('>H', data[32:34])[0]
-        denomination = data[34]
-        serial_number = struct.unpack('>I', data[35:39])[0]
-        
-        # Extract 25 ANs (16 bytes each)
-        ans = []
+
+        # 1. PARSE POWN STATUS (Starts at Byte 16)
+        # 13 bytes contain 26 nibbles. The first 25 represent RAIDA 0-24.
+        pown_bytes = data[16:29]
+        pown_string = ""
         for i in range(25):
-            offset = 39 + (i * 16)
-            an = data[offset:offset + 16]
-            ans.append(an)
-        
+            # Extract high nibble for even indices, low nibble for odd indices
+            byte_val = pown_bytes[i // 2]
+            nibble = (byte_val >> 4) if (i % 2 == 0) else (byte_val & 0x0F)
+            
+            # RAIDA Status Mapping: 1=pass (p), 0=fail (f), 2=unknown (u)
+            if nibble == 1: 
+                pown_string += 'p'
+            elif nibble == 0: 
+                pown_string += 'f'
+            else: 
+                pown_string += 'u'
+
+        # 2. PARSE BODY (Starts at Byte 32)
+        # Offset 34: Denomination (1 byte signed int)
+        # Offset 35: Serial Number (4 bytes big-endian)
+        denomination_code = struct.unpack('b', data[34:35])[0]
+        serial_number = struct.unpack('>I', data[35:39])[0]
+
         return {
-            'file_path': file_path,
-            'coin_id': coin_id,
-            'denomination': denomination,
+            'denomination': denomination_code,
             'serial_number': serial_number,
-            'ans': ans
+            'pown_string': pown_string,
+            'value': parse_denomination_code(denomination_code),
+            'file_path': filepath
         }
     except Exception:
         return None
-
 
 def find_identity_coin(bank_path: str, target_sn: int) -> Optional[Dict]:
     """

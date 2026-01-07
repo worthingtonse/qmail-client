@@ -1090,47 +1090,53 @@ def run_with_task(
         fail_task(handle, task_id, str(e))
         return TaskErrorCode.SUCCESS, task_id, None
     
+def _encode_pown_bytes(pown_string: str) -> bytes:
+    """
+    Helper: Converts a 25-char 'ppfff...' string into 13 bytes (25 nibbles).
+    Used by write_coin_file to populate Byte 16.
+    """
+    res = bytearray(13)
+    # Mapping: p=1, f=0, u=2
+    val_map = {'p': 1, 'f': 0, 'u': 2}
+    
+    for i in range(25):
+        char = pown_string[i].lower()
+        val = val_map.get(char, 2)
+        byte_idx = i // 2
+        if i % 2 == 0:
+            res[byte_idx] |= (val << 4)  # High nibble
+        else:
+            res[byte_idx] |= (val & 0x0F) # Low nibble
+    return bytes(res)
+
 def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox", logger=None):
     """
-    Staking Implementation aligned with cmd_locker.c (Command 91).
-    FIXED: Uses MD5 locker keys, local AN derivation, and Go-style naming.
-    
-    Args:
-        locker_code_bytes: The 8-byte code extracted from the PNG or payment tell.
-        app_context: The main application context.
-        target_wallet: "Mailbox" for identity staking, "Default" for payments.
-        logger: Optional logger handle.
+    FULL STAKING: Downloads identity from RAIDA and saves using Stable Naming.
+    Aligned with cmd_locker.c and your write_coin_file logic.
     """
-    from src.network import connect_to_server, disconnect, send_raw_request
     from src.protocol import build_complete_locker_download_request, ProtocolErrorCode
-    from src.cloudcoin import CloudCoin, write_coin_file, get_int_name
     from src.locker_download import derive_locker_keys
-    import struct
-    import hashlib
-    import os
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
+    
     log_info(logger, "Staking", f"Staking coins into {target_wallet} wallet via Command 91...")
     
-    # 1. DERIVE LOCKER KEYS: MD5(raida_id + locker_code)
+    # 1. Derive MD5 keys for each RAIDA
     locker_keys = derive_locker_keys(locker_code_bytes)
-    
     seeds = {} 
-    responses = {} # raida_id -> list of (dn, sn)
+    responses = {} 
 
+    # 2. Parallel Network Requests (Command 91)
     with ThreadPoolExecutor(max_workers=25) as executor:
         future_to_raida = {}
         for raida_id in range(25):
             ip = app_context.get_server_ip(raida_id)
             if not ip: continue
             
-            # Generate unique 16-byte seed required for Command 91
+            # Seed required for AN derivation formula in cmd_locker.c
             seed = os.urandom(16)
             seeds[raida_id] = seed
 
             srv_cfg = type('Srv', (), {'ip_address': ip, 'port': 50000 + raida_id, 'index': raida_id})
             
-            # Use Command 91 builder from protocol.py
             err_p, packet, _, _ = build_complete_locker_download_request(
                 raida_id=raida_id, 
                 locker_key=locker_keys[raida_id], 
@@ -1138,23 +1144,23 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
                 logger_handle=logger
             )
             
+            # Note: execute_single_stake remains as you defined it earlier
             future = executor.submit(execute_single_stake, srv_cfg, packet, logger)
             future_to_raida[future] = raida_id
 
         for future in as_completed(future_to_raida):
             try:
                 rid = future_to_raida[future]
-                err, coins = future.result(timeout=5.0)
-                if err == ProtocolErrorCode.SUCCESS and coins:
-                    responses[rid] = coins # coins is list of (dn, sn)
-            except Exception:
-                continue
+                err, coins_found = future.result(timeout=5.0)
+                if err == 0 and coins_found:
+                    responses[rid] = coins_found 
+            except Exception: continue
 
     if not responses:
-        log_error(logger, "Staking", "Consensus failed: No coins retrieved from locker.")
+        log_error(logger, "Staking", "Consensus failed: Locker is empty.")
         return False
 
-    # 2. IDENTIFY UNIQUE COINS AND TARGET FOLDER
+    # 3. Identify Unique Coins (DN, SN pairs)
     all_coin_keys = set()
     for coin_list in responses.values():
         for dn, sn in coin_list:
@@ -1163,36 +1169,40 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
     bank_path = f"Data/Wallets/{target_wallet}/Bank"
     os.makedirs(bank_path, exist_ok=True)
 
-    # 3. AN RECONSTRUCTION AND GO-STYLE SAVING
+    # 4. Reconstruct ANs and Write Files
     for dn, sn in all_coin_keys:
         calculated_ans = []
-        for i in range(25):
-            if i in seeds:
-                # Formula from cmd_locker.c: MD5( Denom(1) + SN(4) + Seed(16) )
-                binary_input = struct.pack(">B", dn) + struct.pack(">I", sn) + seeds[i]
+        for raida_id in range(25):
+            if raida_id in seeds:
+                # AN Formula: MD5( Denom(1) + SN(4) + Seed(16) )
+                binary_input = struct.pack(">B", dn) + struct.pack(">I", sn) + seeds[raida_id]
                 digest = bytearray(hashlib.md5(binary_input).digest())
                 
-                # MANDATORY TAIL: Required for future RAIDA authentication
+                # --- MANDATORY TAIL (cmd_locker.c line 191) ---
+                # RAIDA isko future payments ke liye "Passport" maanta hai
                 digest[12:16] = b'\xff\xff\xff\xff'
-                calculated_ans.append(digest.hex().upper())
+                calculated_ans.append(digest) # Store as raw bytes
             else:
-                calculated_ans.append("00000000000000000000000000000000")
+                calculated_ans.append(bytes(16))
 
-        # Construct CloudCoin object
-        new_identity = CloudCoin(
-            serial_number=sn,
-            denomination=dn,
-            ans=calculated_ans,
-            pown_string='p' * 25
-        )
+        # Build coin object for write_coin_file
+        # It must have: denomination, serial_number, ans, pown_string
+        coin_obj = type('Coin', (), {
+            'denomination': dn,
+            'serial_number': sn,
+            'ans': calculated_ans,
+            'pown_string': 'p' * 25  # All passed since we just downloaded them
+        })()
 
-        # Generate Go-style filename (e.g., 1.00_000_000.BTC.pppppppppp...9572.extra.0.default.bin)
-        filename = get_int_name(dn, sn, "ppppppppppppppppppppppppp")
+        # STABLE NAMING: DN.SN.bin (e.g., 1.9572.bin)
+        filename = f"{dn}.{sn}.bin"
         save_path = os.path.join(bank_path, filename)
         
-        # Saves as Format Type 9 (439 bytes)
-        write_coin_file(save_path, new_identity, logger)
-        log_info(logger, "Staking", f"✓ Saved coin {sn} to {target_wallet}/Bank")
+        # Call your fixed write_coin_file
+        from src.cloudcoin import write_coin_file
+        write_coin_file(save_path, coin_obj, logger)
+        
+        log_info(logger, "Staking", f"✓ Reconstructed Stable Identity: {filename}")
 
     return True
 
