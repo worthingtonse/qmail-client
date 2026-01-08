@@ -168,8 +168,9 @@ CREATE TABLE IF NOT EXISTS QMailServers (
 -- ==========================================
 -- 2. Users (Contacts)
 -- ==========================================
-CREATE TABLE IF NOT EXISTS Users (
-    CustomSerialNumber TEXT PRIMARY KEY, -- e.g., 'C23', 'C24'
+CREATE TABLE Users (
+    SerialNumber INTEGER PRIMARY KEY,    -- Decoded integer (e.g., 2841)
+    CustomSerialNumber TEXT UNIQUE,      -- Original Base32 string (e.g., 'C23')
     FirstName TEXT,
     LastName TEXT,
     Description TEXT,
@@ -368,69 +369,152 @@ CREATE INDEX IF NOT EXISTS idx_received_stripes_tell_id ON received_stripes(tell
 # INIT DATABASE
 # ============================================================================
 
-def init_database(db_path: str, logger: Any = None, base_dir: str = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
+# def init_database(db_path: str, logger: Any = None, base_dir: str = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
+#     """
+#     Initialize database connection and create schema if needed.
+
+#     Args:
+#         db_path: Path to the SQLite database file
+#         logger: Optional logger handle for logging operations
+#         base_dir: Optional base directory for path validation security.
+#                   If provided, db_path must be within this directory.
+
+#     Returns:
+#         Tuple of (error_code, database_handle)
+#         Handle is None if initialization failed.
+
+#     C signature: DatabaseErrorCode init_database(const char* db_path, const char* base_dir, DatabaseHandle** out_handle);
+#     """
+#     if not db_path:
+#         log_error(logger, DB_CONTEXT, "init_database failed", "db_path is empty")
+#         return DatabaseErrorCode.ERR_INVALID_PARAM, None
+
+#     # Security: Validate path doesn't escape intended directory (prevents path traversal)
+#     # This check is optional but recommended for production use
+#     if base_dir is not None:
+#         abs_db_path = os.path.abspath(db_path)
+#         abs_base_dir = os.path.abspath(base_dir)
+#         if not abs_db_path.startswith(abs_base_dir):
+#             log_error(logger, DB_CONTEXT, "init_database failed", f"db_path '{db_path}' escapes base_dir (path traversal attempt)")
+#             return DatabaseErrorCode.ERR_INVALID_PARAM, None
+
+#     # Ensure directory exists
+#     db_dir = os.path.dirname(db_path)
+#     if db_dir and not os.path.exists(db_dir):
+#         try:
+#             os.makedirs(db_dir)
+#             log_info(logger, DB_CONTEXT, f"Created database directory: {db_dir}")
+#         except OSError as e:
+#             log_error(logger, DB_CONTEXT, "Failed to create database directory", str(e))
+#             return DatabaseErrorCode.ERR_IO, None
+
+#     try:
+#         # Connect to database (creates file if doesn't exist)
+#         # check_same_thread=False allows connection to be used from multiple threads
+#         # (required for multi-threaded API server)
+#         connection = sqlite3.connect(db_path, check_same_thread=False)
+#         connection.row_factory = sqlite3.Row  # Enable dict-like access to rows
+
+#         # Enable foreign keys
+#         connection.execute("PRAGMA foreign_keys = ON")
+
+#         # Create schema
+#         cursor = connection.cursor()
+#         cursor.executescript(SCHEMA_SQL)
+#         connection.commit()
+
+#         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
+#         log_info(logger, DB_CONTEXT, f"Database initialized successfully: {db_path}")
+
+#         return DatabaseErrorCode.SUCCESS, handle
+
+#     except sqlite3.Error as e:
+#         log_error(logger, DB_CONTEXT, "Database initialization failed", str(e))
+#         return DatabaseErrorCode.ERR_OPEN_FAILED, None
+
+def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
     """
-    Initialize database connection and create schema if needed.
-
-    Args:
-        db_path: Path to the SQLite database file
-        logger: Optional logger handle for logging operations
-        base_dir: Optional base directory for path validation security.
-                  If provided, db_path must be within this directory.
-
-    Returns:
-        Tuple of (error_code, database_handle)
-        Handle is None if initialization failed.
-
-    C signature: DatabaseErrorCode init_database(const char* db_path, const char* base_dir, DatabaseHandle** out_handle);
+    Initialize database connection and create/upgrade schema safely.
+    SAFE VERSION: No DROP TABLE. Uses migration logic for existing databases.
     """
-    if not db_path:
-        log_error(logger, DB_CONTEXT, "init_database failed", "db_path is empty")
-        return DatabaseErrorCode.ERR_INVALID_PARAM, None
+    import sqlite3
+    import os
+    from src.database import DatabaseErrorCode, DatabaseHandle
+    from src.logger import log_info, log_error
 
-    # Security: Validate path doesn't escape intended directory (prevents path traversal)
-    # This check is optional but recommended for production use
-    if base_dir is not None:
-        abs_db_path = os.path.abspath(db_path)
-        abs_base_dir = os.path.abspath(base_dir)
-        if not abs_db_path.startswith(abs_base_dir):
-            log_error(logger, DB_CONTEXT, "init_database failed", f"db_path '{db_path}' escapes base_dir (path traversal attempt)")
-            return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-    # Ensure directory exists
-    db_dir = os.path.dirname(db_path)
-    if db_dir and not os.path.exists(db_dir):
-        try:
-            os.makedirs(db_dir)
-            log_info(logger, DB_CONTEXT, f"Created database directory: {db_dir}")
-        except OSError as e:
-            log_error(logger, DB_CONTEXT, "Failed to create database directory", str(e))
-            return DatabaseErrorCode.ERR_IO, None
+    if not db_path: return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
     try:
-        # Connect to database (creates file if doesn't exist)
-        # check_same_thread=False allows connection to be used from multiple threads
-        # (required for multi-threaded API server)
         connection = sqlite3.connect(db_path, check_same_thread=False)
-        connection.row_factory = sqlite3.Row  # Enable dict-like access to rows
-
-        # Enable foreign keys
+        connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-
-        # Create schema
         cursor = connection.cursor()
-        cursor.executescript(SCHEMA_SQL)
+
+        # 1. CREATE CORE TABLES (IF NOT EXISTS)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS Users (
+                SerialNumber INTEGER PRIMARY KEY,
+                Denomination INTEGER DEFAULT 0,
+                CustomSerialNumber TEXT UNIQUE,
+                FirstName TEXT,
+                LastName TEXT,
+                auto_address TEXT UNIQUE,
+                Description TEXT,
+                InboxFee REAL DEFAULT 0.0,
+                Class TEXT,
+                Beacon TEXT
+            )
+        """)
+
+        # 2. AUTO-MIGRATION: Add missing columns if they don't exist
+        cursor.execute("PRAGMA table_info(Users)")
+        existing_cols = [col[1] for col in cursor.fetchall()]
+        
+        if 'contact_count' not in existing_cols:
+            log_info(logger, "Database", "Upgrading Users table: adding contact_count")
+            cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
+        
+        if 'last_contacted_timestamp' not in existing_cols:
+            cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp TEXT")
+
+        # 3. EMAILS & JUNCTION (Safe Creation)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS Emails (
+                EmailID BLOB PRIMARY KEY,
+                Subject TEXT,
+                Body TEXT,
+                ReceivedTimestamp INTEGER,
+                SentTimestamp INTEGER,
+                is_read INTEGER DEFAULT 0,
+                is_starred INTEGER DEFAULT 0,
+                is_trashed INTEGER DEFAULT 0,
+                folder TEXT DEFAULT 'inbox',
+                Meta BLOB,
+                Style BLOB
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS Junction_Email_Users (
+                EmailID BLOB,
+                SerialNumber INTEGER,
+                user_type TEXT CHECK(user_type IN ('TO', 'CC', 'BC', 'MASS', 'FROM')),
+                PRIMARY KEY (EmailID, SerialNumber, user_type),
+                FOREIGN KEY(EmailID) REFERENCES Emails(EmailID) ON DELETE CASCADE
+            )
+        """)
+
+        # 4. TELLS & INDEXES
+        cursor.execute("CREATE TABLE IF NOT EXISTS received_tells (file_guid TEXT PRIMARY KEY, locker_code BLOB, tell_type INTEGER DEFAULT 0, download_status INTEGER DEFAULT 0, created_at INTEGER DEFAULT (strftime('%s','now')))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_pretty ON Users(auto_address)")
+
         connection.commit()
-
         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
-        log_info(logger, DB_CONTEXT, f"Database initialized successfully: {db_path}")
-
         return DatabaseErrorCode.SUCCESS, handle
 
     except sqlite3.Error as e:
-        log_error(logger, DB_CONTEXT, "Database initialization failed", str(e))
+        if logger: log_error(logger, "Database", "Initialization failed", str(e))
         return DatabaseErrorCode.ERR_OPEN_FAILED, None
-
 
 # ============================================================================
 # CLOSE DATABASE
@@ -465,53 +549,54 @@ def close_database(handle: DatabaseHandle) -> bool:
 # STORE EMAIL
 # ============================================================================
 
-def store_email(handle: DatabaseHandle, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, Optional[bytes]]:
+def store_email(handle: Any, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, Optional[bytes]]:
     """
     Store an email in the database.
+    FIXED: Uses SerialNumber for linking in Junction_Email_Users.
 
     Args:
         handle: Database handle
         email: Dictionary with email data:
-            - email_id: bytes (GUID) - optional, generated if not provided
+            - email_id: bytes (GUID)
             - subject: str
             - body: str
-            - sender_id: int (UserID)
-            - recipient_ids: List[int] (UserIDs)
-            - cc_ids: List[int] (UserIDs) - optional
-            - received_timestamp: str (ISO format) - optional
-            - sent_timestamp: str (ISO format) - optional
-            - meta: bytes - optional
-            - style: bytes - optional
-
-    Returns:
-        Tuple of (error_code, email_id as bytes)
-
-    C signature: DatabaseErrorCode store_email(DatabaseHandle* handle, const Email* email, uint8_t* out_email_id);
+            - sender_sn: int (SerialNumber)
+            - recipient_sns: List[int] (SerialNumbers)
+            - cc_sns: List[int] (SerialNumbers)
+            - folder: str
+            - received_timestamp: int (Unix)
+            - sent_timestamp: int (Unix)
     """
+    import sqlite3
+    import uuid
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error, log_debug
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
-    # Generate email ID if not provided
+    # Generate or parse email ID
     email_id = email.get('email_id')
     if email_id is None:
         email_id = uuid.uuid4().bytes
     elif isinstance(email_id, str):
-        # Convert hex string to bytes (with safe conversion)
-        success, email_id_bytes, err_msg = _safe_hex_to_bytes(email_id, handle.logger)
-        if not success:
-            log_error(handle.logger, DB_CONTEXT, "Invalid email_id format", err_msg)
+        try:
+            email_id = bytes.fromhex(email_id)
+        except ValueError:
             return DatabaseErrorCode.ERR_INVALID_PARAM, None
-        email_id = email_id_bytes
 
     try:
         cursor = handle.connection.cursor()
 
-        # Insert email (with optional folder and is_read for drafts)
+        # 1. Insert into Emails table
         folder = email.get('folder', 'inbox')
         is_read = email.get('is_read', 0)
+        
         cursor.execute("""
-            INSERT INTO Emails (EmailID, Subject, Body, ReceivedTimestamp, SentTimestamp, Meta, Style, folder, is_read)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO Emails (
+                EmailID, Subject, Body, ReceivedTimestamp, 
+                SentTimestamp, Meta, Style, folder, is_read
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             email_id,
             email.get('subject', ''),
@@ -524,42 +609,37 @@ def store_email(handle: DatabaseHandle, email: Dict[str, Any]) -> Tuple[Database
             is_read
         ))
 
-        # Link sender (FROM)
-        sender_id = email.get('sender_id')
-        if sender_id is not None:
+        # 2. Link sender (FROM) using SerialNumber
+        sender_sn = email.get('sender_sn')
+        if sender_sn is not None:
             cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, UserID, user_type)
+                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
                 VALUES (?, ?, 'FROM')
-            """, (email_id, sender_id))
+            """, (email_id, sender_sn))
 
-        # Link recipients (TO)
-        for recipient_id in email.get('recipient_ids', []):
+        # 3. Link recipients (TO) using SerialNumber
+        for sn in email.get('recipient_sns', []):
             cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, UserID, user_type)
+                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
                 VALUES (?, ?, 'TO')
-            """, (email_id, recipient_id))
+            """, (email_id, sn))
 
-        # Link CC recipients
-        for cc_id in email.get('cc_ids', []):
+        # 4. Link CC recipients using SerialNumber
+        for sn in email.get('cc_sns', []):
             cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, UserID, user_type)
+                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
                 VALUES (?, ?, 'CC')
-            """, (email_id, cc_id))
+            """, (email_id, sn))
 
         handle.connection.commit()
-        log_debug(handle.logger, DB_CONTEXT, f"Stored email: {email_id.hex()}")
+        log_debug(handle.logger, "Database", f"Stored email: {email_id.hex()}")
 
         return DatabaseErrorCode.SUCCESS, email_id
 
-    except sqlite3.IntegrityError as e:
-        log_error(handle.logger, DB_CONTEXT, "Constraint violation storing email", str(e))
-        handle.connection.rollback()
-        return DatabaseErrorCode.ERR_CONSTRAINT, None
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to store email", str(e))
+        log_error(handle.logger, "Database", "Failed to store email", str(e))
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
-
 
 # ============================================================================
 # UPDATE DRAFT
@@ -678,37 +758,22 @@ def update_draft(handle: DatabaseHandle, email_id: bytes, draft_data: Dict[str, 
 # RETRIEVE EMAIL
 # ============================================================================
 
-def retrieve_email(handle: DatabaseHandle, email_id: bytes) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
+def retrieve_email(handle: Any, email_id: bytes) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
-    Retrieve an email by its ID.
-
-    Args:
-        handle: Database handle
-        email_id: Email GUID as bytes
-
-    Returns:
-        Tuple of (error_code, email_dict or None)
-
-    C signature: DatabaseErrorCode retrieve_email(DatabaseHandle* handle, const uint8_t* email_id, Email* out_email);
+    Retrieve full email including Pretty addresses for Sender and Recipients.
     """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, None
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error
 
-    if email_id is None:
+    if handle is None or handle.connection is None or email_id is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-    # Convert string to bytes if needed (with safe conversion)
-    if isinstance(email_id, str):
-        success, email_id_bytes, err_msg = _safe_hex_to_bytes(email_id, handle.logger)
-        if not success:
-            log_error(handle.logger, DB_CONTEXT, "Invalid email_id format in retrieve", err_msg)
-            return DatabaseErrorCode.ERR_INVALID_PARAM, None
-        email_id = email_id_bytes
 
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
-        # Get email
+        # 1. Get Main Email Data
         cursor.execute("""
             SELECT EmailID, Subject, Body, ReceivedTimestamp, SentTimestamp,
                    Meta, Style, is_read, is_starred, is_trashed, folder
@@ -719,80 +784,43 @@ def retrieve_email(handle: DatabaseHandle, email_id: bytes) -> Tuple[DatabaseErr
         if row is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, None
 
-        email = {
-            'email_id': row['EmailID'].hex() if row['EmailID'] else None,
-            'subject': row['Subject'],
-            'body': row['Body'],
-            'received_timestamp': row['ReceivedTimestamp'],
-            'sent_timestamp': row['SentTimestamp'],
-            'meta': row['Meta'],
-            'style': row['Style'],
-            'is_read': bool(row['is_read']),
-            'is_starred': bool(row['is_starred']),
-            'is_trashed': bool(row['is_trashed']),
-            'folder': row['folder'],
-            'recipients': [],
-            'cc': [],
-            'sender': None,
-            'attachments': []
-        }
+        email = dict(row)
+        email['email_id'] = row['EmailID'].hex()
+        email['recipients'] = []
+        email['cc'] = []
+        email['sender'] = None
+        email['attachments'] = []
 
-        # Get sender
+        # 2. Get Pretty Sender
         cursor.execute("""
-            SELECT u.UserID, u.FirstName, u.LastName, u.auto_address
+            SELECT u.SerialNumber, u.FirstName, u.LastName, u.auto_address
             FROM Junction_Email_Users j
-            JOIN Users u ON j.UserID = u.UserID
+            JOIN Users u ON j.SerialNumber = u.SerialNumber
             WHERE j.EmailID = ? AND j.user_type = 'FROM'
         """, (email_id,))
-        sender_row = cursor.fetchone()
-        if sender_row:
-            email['sender'] = {
-                'user_id': sender_row['UserID'],
-                'first_name': sender_row['FirstName'],
-                'last_name': sender_row['LastName'],
-                'auto_address': sender_row['auto_address']
-            }
+        s_row = cursor.fetchone()
+        if s_row:
+            email['sender'] = dict(s_row)
 
-        # Get recipients
+        # 3. Get Pretty Recipients (TO & CC)
         cursor.execute("""
-            SELECT u.UserID, u.FirstName, u.LastName, u.auto_address, j.user_type
+            SELECT u.SerialNumber, u.FirstName, u.LastName, u.auto_address, j.user_type
             FROM Junction_Email_Users j
-            JOIN Users u ON j.UserID = u.UserID
+            JOIN Users u ON j.SerialNumber = u.SerialNumber
             WHERE j.EmailID = ? AND j.user_type IN ('TO', 'CC')
         """, (email_id,))
         for r in cursor.fetchall():
-            recipient_info = {
-                'user_id': r['UserID'],
-                'first_name': r['FirstName'],
-                'last_name': r['LastName'],
-                'auto_address': r['auto_address']
-            }
+            info = dict(r)
             if r['user_type'] == 'TO':
-                email['recipients'].append(recipient_info)
+                email['recipients'].append(info)
             else:
-                email['cc'].append(recipient_info)
-
-        # Get attachments
-        cursor.execute("""
-            SELECT Attachment_id, name, file_extension, storage_mode, status, size_bytes
-            FROM Attachments WHERE EmailID = ?
-        """, (email_id,))
-        for a in cursor.fetchall():
-            email['attachments'].append({
-                'attachment_id': a['Attachment_id'],
-                'name': a['name'],
-                'file_extension': a['file_extension'],
-                'storage_mode': a['storage_mode'],
-                'status': a['status'],
-                'size_bytes': a['size_bytes']
-            })
+                email['cc'].append(info)
 
         return DatabaseErrorCode.SUCCESS, email
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to retrieve email", str(e))
+        log_error(handle.logger, "Database", "Failed to retrieve email", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
-
 
 # ============================================================================
 # GET EMAIL METADATA (without body for efficiency)
@@ -804,36 +832,20 @@ def get_email_metadata(
 ) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
     Retrieve email metadata without body for efficiency.
-
-    Args:
-        handle: Database handle
-        email_id: Email GUID as bytes or hex string
-
-    Returns:
-        Tuple of (error_code, email_metadata_dict or None)
-
-    C signature: DatabaseErrorCode get_email_metadata(DatabaseHandle* handle,
-                                                       const uint8_t* email_id,
-                                                       EmailMetadata* out_metadata);
+    FIXED: Uses SerialNumber for joins and returns Pretty Addresses.
     """
-    if handle is None or handle.connection is None:
+    if handle is None or handle.connection is None or email_id is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
-    if email_id is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-    # Convert string to bytes if needed (with safe conversion)
     if isinstance(email_id, str):
-        success, email_id_bytes, err_msg = _safe_hex_to_bytes(email_id, handle.logger)
-        if not success:
-            log_error(handle.logger, DB_CONTEXT, "Invalid email_id format in get_metadata", err_msg)
-            return DatabaseErrorCode.ERR_INVALID_PARAM, None
-        email_id = email_id_bytes
+        success, email_id, _ = _safe_hex_to_bytes(email_id, handle.logger)
+        if not success: return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
-        # Get email metadata (excluding Body for efficiency)
+        # 1. Get core metadata
         cursor.execute("""
             SELECT EmailID, Subject, ReceivedTimestamp, SentTimestamp,
                    is_read, is_starred, is_trashed, folder
@@ -841,78 +853,40 @@ def get_email_metadata(
         """, (email_id,))
 
         row = cursor.fetchone()
-        if row is None:
-            return DatabaseErrorCode.ERR_NOT_FOUND, None
+        if row is None: return DatabaseErrorCode.ERR_NOT_FOUND, None
 
-        metadata = {
-            'email_id': row['EmailID'].hex() if row['EmailID'] else None,
-            'subject': row['Subject'],
-            'received_timestamp': row['ReceivedTimestamp'],
-            'sent_timestamp': row['SentTimestamp'],
-            'is_read': bool(row['is_read']),
-            'is_starred': bool(row['is_starred']),
-            'is_trashed': bool(row['is_trashed']),
-            'folder': row['folder'],
-            'sender': None,
-            'recipients': [],
-            'cc': [],
-            'attachments': []
-        }
+        metadata = dict(row)
+        metadata['email_id'] = row['EmailID'].hex()
+        metadata['sender'] = None
+        metadata['recipients'] = []
+        metadata['cc'] = []
+        metadata['attachments'] = []
 
-        # Get sender
+        # 2. Get Pretty Sender (JOIN on SerialNumber)
         cursor.execute("""
-            SELECT u.UserID, u.FirstName, u.LastName, u.auto_address
+            SELECT u.SerialNumber, u.FirstName, u.LastName, u.auto_address
             FROM Junction_Email_Users j
-            JOIN Users u ON j.UserID = u.UserID
+            JOIN Users u ON j.SerialNumber = u.SerialNumber
             WHERE j.EmailID = ? AND j.user_type = 'FROM'
         """, (email_id,))
-        sender_row = cursor.fetchone()
-        if sender_row:
-            metadata['sender'] = {
-                'user_id': sender_row['UserID'],
-                'first_name': sender_row['FirstName'],
-                'last_name': sender_row['LastName'],
-                'auto_address': sender_row['auto_address']
-            }
+        s_row = cursor.fetchone()
+        if s_row: metadata['sender'] = dict(s_row)
 
-        # Get recipients
+        # 3. Get Pretty Recipients (JOIN on SerialNumber)
         cursor.execute("""
-            SELECT u.UserID, u.FirstName, u.LastName, u.auto_address, j.user_type
+            SELECT u.SerialNumber, u.FirstName, u.LastName, u.auto_address, j.user_type
             FROM Junction_Email_Users j
-            JOIN Users u ON j.UserID = u.UserID
+            JOIN Users u ON j.SerialNumber = u.SerialNumber
             WHERE j.EmailID = ? AND j.user_type IN ('TO', 'CC')
         """, (email_id,))
         for r in cursor.fetchall():
-            recipient_info = {
-                'user_id': r['UserID'],
-                'first_name': r['FirstName'],
-                'last_name': r['LastName'],
-                'auto_address': r['auto_address']
-            }
-            if r['user_type'] == 'TO':
-                metadata['recipients'].append(recipient_info)
-            else:
-                metadata['cc'].append(recipient_info)
-
-        # Get attachments (metadata only, no data_blob)
-        cursor.execute("""
-            SELECT Attachment_id, name, file_extension, storage_mode, status, size_bytes
-            FROM Attachments WHERE EmailID = ?
-        """, (email_id,))
-        for a in cursor.fetchall():
-            metadata['attachments'].append({
-                'attachment_id': a['Attachment_id'],
-                'name': a['name'],
-                'file_extension': a['file_extension'],
-                'storage_mode': a['storage_mode'],
-                'status': a['status'],
-                'size_bytes': a['size_bytes']
-            })
+            info = dict(r)
+            if r['user_type'] == 'TO': metadata['recipients'].append(info)
+            else: metadata['cc'].append(info)
 
         return DatabaseErrorCode.SUCCESS, metadata
-
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to get email metadata", str(e))
+        log_error(handle.logger, DB_CONTEXT, "Metadata fetch failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
 
 
@@ -1295,331 +1269,249 @@ def get_popular_contacts(
     auto_address_like: str = None
 ) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
     """
-    Get most popular contacts based on contact frequency and recency.
-
-    Popularity is calculated using a decaying algorithm:
-    popularity = contact_count * decay_factor
-    where decay_factor decreases based on days since last contact.
-
-    Args:
-        handle: Database handle
-        limit: Maximum number of contacts to return
-        first_name_like: Filter by first name (partial match)
-        last_name_like: Filter by last name (partial match)
-        auto_address_like: Filter by auto address (partial match)
-
-    Returns:
-        Tuple of (error_code, list of contact dicts)
-
-    C signature: DatabaseErrorCode get_popular_contacts(DatabaseHandle* handle, int limit,
-                                                         const char* first_name_like, const char* last_name_like,
-                                                         const char* auto_address_like, Contact** out_contacts, int* out_count);
+    Get most popular contacts. FIXED: Returns SerialNumber and Pretty auto_address.
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, []
 
-    if limit <= 0:
-        limit = 10
-
+    limit = max(1, limit)
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
-        # Build query with optional filters
-        # Popularity formula: contact_count / (1 + days_since_last_contact * 0.1)
         query = """
             SELECT
-                UserID,
-                FirstName,
-                MiddleName,
-                LastName,
-                auto_address,
-                Description,
-                contact_count,
-                last_contacted_timestamp,
+                SerialNumber, FirstName, LastName, auto_address, Description, contact_count,
                 CASE
                     WHEN last_contacted_timestamp IS NULL THEN 0
                     ELSE contact_count / (1.0 + (julianday('now') - julianday(last_contacted_timestamp)) * 0.1)
-                END AS popularity,
-                CASE
-                    WHEN last_contacted_timestamp IS NULL THEN 9999
-                    ELSE CAST(julianday('now') - julianday(last_contacted_timestamp) AS INTEGER)
-                END AS days_since_last_contact
+                END AS popularity
             FROM Users
             WHERE 1=1
         """
         params = []
-
         if first_name_like:
-            query += " AND FirstName LIKE ?"
-            params.append(f"%{first_name_like}%")
-
+            query += " AND FirstName LIKE ?"; params.append(f"%{first_name_like}%")
         if last_name_like:
-            query += " AND LastName LIKE ?"
-            params.append(f"%{last_name_like}%")
-
+            query += " AND LastName LIKE ?"; params.append(f"%{last_name_like}%")
         if auto_address_like:
-            query += " AND auto_address LIKE ?"
-            params.append(f"%{auto_address_like}%")
+            query += " AND auto_address LIKE ?"; params.append(f"%{auto_address_like}%")
 
         query += " ORDER BY popularity DESC LIMIT ?"
         params.append(limit)
 
         cursor.execute(query, params)
-
-        contacts = []
-        for row in cursor.fetchall():
-            contacts.append({
-                'user_id': row['UserID'],
-                'first_name': row['FirstName'],
-                'middle_name': row['MiddleName'],
-                'last_name': row['LastName'],
-                'auto_address': row['auto_address'],
-                'description': row['Description'],
-                'contact_count': row['contact_count'],
-                'popularity': row['popularity'] or 0,
-                'days_since_last_contact': row['days_since_last_contact']
-            })
-
+        contacts = [dict(row) for row in cursor.fetchall()]
         return DatabaseErrorCode.SUCCESS, contacts
-
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to get popular contacts", str(e))
+        log_error(handle.logger, DB_CONTEXT, "Popular contacts failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, []
 
 
 # ============================================================================
 # CONTACT MANAGEMENT FUNCTIONS
 # ============================================================================
-
 def get_all_contacts(
-    handle: DatabaseHandle,
+    handle: Any,
     page: int = 1,
     limit: int = 50,
     search: Optional[str] = None
 ) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]], int]:
     """
     Get paginated list of all contacts with optional search.
-    Excludes Avatar field for lightweight response.
+    FIXED: Matches the new Integer SerialNumber and Pretty Address schema.
 
     Args:
         handle: Database handle
-        page: Page number (1-indexed, default 1)
-        limit: Results per page (default 50, max 200)
-        search: Optional search term for name/email (case-insensitive)
+        page: Page number (1-indexed)
+        limit: Results per page (max 200)
+        search: Optional search term for name/pretty_address
 
     Returns:
         Tuple of (error_code, contacts_list, total_count)
-
-    C signature: DatabaseErrorCode get_all_contacts(DatabaseHandle* handle, int page, int limit,
-                                                     const char* search, Contact** out_contacts,
-                                                     int* out_count, int* out_total);
     """
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error, log_debug
+    import sqlite3
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, [], 0
 
-    # Clamp pagination values
-    if page < 1:
-        page = 1
-    if limit < 1:
-        limit = 1
-    if limit > 200:
-        limit = 200
-
+    # Pagination values clamp karein
+    page = max(1, page)
+    limit = max(1, min(limit, 200))
     offset = (page - 1) * limit
 
     try:
+        # Dictionary access enable karein
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
-        # Build WHERE clause for search
+        # 1. Search Logic
         where_clause = ""
         params = []
         if search and search.strip():
             search_pattern = f"%{search.strip()}%"
+            # Hum FirstName, LastName aur Pretty Email (auto_address) teeno mein search karenge
             where_clause = """
                 WHERE LOWER(FirstName) LIKE LOWER(?)
                    OR LOWER(LastName) LIKE LOWER(?)
                    OR LOWER(auto_address) LIKE LOWER(?)
+                   OR LOWER(CustomSerialNumber) LIKE LOWER(?)
             """
-            params = [search_pattern, search_pattern, search_pattern]
+            params = [search_pattern, search_pattern, search_pattern, search_pattern]
 
-        # Count query (respects search filter)
+        # 2. Total Count Query (Search filter ke saath)
         count_query = f"SELECT COUNT(*) FROM Users {where_clause}"
         cursor.execute(count_query, params)
         total_count = cursor.fetchone()[0]
 
-        # Data query (Avatar EXCLUDED for lightweight response)
+        # 3. Data Query (Sahi Column Names ke saath)
+        # UserID ki jagah SerialNumber aur naye fields (Class, Denomination) include kiye hain
         data_query = f"""
-            SELECT UserID, FirstName, MiddleName, LastName, auto_address,
-                   Description, date_created, last_contacted_timestamp,
-                   contact_count, emails_sent_total
+            SELECT 
+                SerialNumber, Denomination, CustomSerialNumber, 
+                FirstName, LastName, auto_address, Description, 
+                InboxFee, Class, Beacon, contact_count
             FROM Users
             {where_clause}
-            ORDER BY FirstName, LastName
+            ORDER BY FirstName ASC, LastName ASC
             LIMIT ? OFFSET ?
         """
         cursor.execute(data_query, params + [limit, offset])
 
         contacts = []
         for row in cursor.fetchall():
+            # Dictionary banana taaki API handlers ko asani ho
             contacts.append({
-                'user_id': row['UserID'],
+                'serial_number': row['SerialNumber'],
+                'denomination': row['Denomination'],
+                'custom_sn': row['CustomSerialNumber'],
                 'first_name': row['FirstName'],
-                'middle_name': row['MiddleName'],
                 'last_name': row['LastName'],
-                'auto_address': row['auto_address'],
+                'auto_address': row['auto_address'], # Pretty Email Format
                 'description': row['Description'],
-                'date_created': row['date_created'],
-                'last_contacted': row['last_contacted_timestamp'],
-                'contact_count': row['contact_count'],
-                'emails_sent_total': row['emails_sent_total']
+                'inbox_fee': row['InboxFee'],
+                'class': row['Class'],
+                'beacon': row['Beacon'],
+                'contact_count': row['contact_count']
             })
 
-        log_debug(handle.logger, DB_CONTEXT, f"get_all_contacts: found {len(contacts)} of {total_count} total")
+        log_debug(handle.logger, "Database", f"get_all_contacts: found {len(contacts)} of {total_count}")
         return DatabaseErrorCode.SUCCESS, contacts, total_count
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to get all contacts", str(e))
+        log_error(handle.logger, "Database", "Failed to get all contacts", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, [], 0
-
-
 def get_contact_by_id(
-    handle: DatabaseHandle,
-    user_id: int
+    handle: Any,
+    serial_number: int
 ) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
-    Get a single contact by ID. Excludes Avatar for consistency.
-
-    Args:
-        handle: Database handle
-        user_id: User ID (integer primary key)
-
-    Returns:
-        Tuple of (error_code, contact_dict or None)
-
-    C signature: DatabaseErrorCode get_contact_by_id(DatabaseHandle* handle, int user_id,
-                                                      Contact* out_contact);
+    Get a single contact by their SerialNumber (Integer ID).
+    FIXED: Uses SerialNumber as PK and returns all 'Pretty' fields.
     """
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
-    if user_id is None or not isinstance(user_id, int) or user_id < 1:
+    # SerialNumber must be a valid integer
+    if serial_number is None or not isinstance(serial_number, int):
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
+        # Query matches the new consolidated schema
         cursor.execute("""
-            SELECT UserID, FirstName, MiddleName, LastName, auto_address,
-                   Description, BeaconID, sending_fee, date_created,
-                   last_contacted_timestamp, contact_count, emails_sent_total
+            SELECT 
+                SerialNumber, Denomination, CustomSerialNumber, 
+                FirstName, LastName, auto_address, Description, 
+                InboxFee, Class, Beacon, contact_count
             FROM Users
-            WHERE UserID = ?
-        """, (user_id,))
+            WHERE SerialNumber = ?
+        """, (serial_number,))
 
         row = cursor.fetchone()
         if row is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, None
 
-        contact = {
-            'user_id': row['UserID'],
-            'first_name': row['FirstName'],
-            'middle_name': row['MiddleName'],
-            'last_name': row['LastName'],
-            'auto_address': row['auto_address'],
-            'description': row['Description'],
-            'beacon_id': row['BeaconID'],
-            'sending_fee': row['sending_fee'],
-            'date_created': row['date_created'],
-            'last_contacted': row['last_contacted_timestamp'],
-            'contact_count': row['contact_count'],
-            'emails_sent_total': row['emails_sent_total']
-        }
+        # Convert to dictionary for API handlers
+        contact = dict(row)
 
         return DatabaseErrorCode.SUCCESS, contact
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, f"Failed to get contact {user_id}", str(e))
+        log_error(handle.logger, "Database", f"Failed to get contact {serial_number}", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
-
-
 def delete_contact(
-    handle: DatabaseHandle,
-    user_id: int
+    handle: Any,
+    serial_number: int
 ) -> DatabaseErrorCode:
     """
-    Hard delete a contact by ID.
-
-    Args:
-        handle: Database handle
-        user_id: User ID to delete
-
-    Returns:
-        SUCCESS if deleted, ERR_NOT_FOUND if contact doesn't exist
-
-    C signature: DatabaseErrorCode delete_contact(DatabaseHandle* handle, int user_id);
+    Hard delete a contact by SerialNumber.
     """
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error, log_debug
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM
 
-    if user_id is None or not isinstance(user_id, int) or user_id < 1:
+    if serial_number is None or not isinstance(serial_number, int):
         return DatabaseErrorCode.ERR_INVALID_PARAM
 
     try:
         cursor = handle.connection.cursor()
 
-        cursor.execute("DELETE FROM Users WHERE UserID = ?", (user_id,))
+        # Delete based on the new Primary Key
+        cursor.execute("DELETE FROM Users WHERE SerialNumber = ?", (serial_number,))
         handle.connection.commit()
 
         if cursor.rowcount == 0:
             return DatabaseErrorCode.ERR_NOT_FOUND
 
-        log_debug(handle.logger, DB_CONTEXT, f"Deleted contact: {user_id}")
+        log_debug(handle.logger, "Database", f"Deleted contact: {serial_number}")
         return DatabaseErrorCode.SUCCESS
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, f"Failed to delete contact {user_id}", str(e))
+        log_error(handle.logger, "Database", f"Failed to delete contact {serial_number}", str(e))
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED
 
 
 def check_email_exists(
-    handle: DatabaseHandle,
-    auto_address: str,
-    exclude_user_id: Optional[int] = None
+    handle: Any,
+    pretty_address: str,
+    exclude_sn: Optional[int] = None
 ) -> Tuple[DatabaseErrorCode, bool]:
     """
-    Check if an email address already exists (case-insensitive).
-
-    Args:
-        handle: Database handle
-        auto_address: Email to check
-        exclude_user_id: Optional user ID to exclude (for updates)
-
-    Returns:
-        Tuple of (error_code, exists_bool)
-
-    C signature: DatabaseErrorCode check_email_exists(DatabaseHandle* handle, const char* email,
-                                                       int exclude_user_id, bool* out_exists);
+    Check if a Pretty Email address already exists (case-insensitive).
+    FIXED: Uses SerialNumber for exclusion check during updates.
     """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, False
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error
 
-    if not auto_address or not auto_address.strip():
+    if handle is None or handle.connection is None or not pretty_address:
         return DatabaseErrorCode.ERR_INVALID_PARAM, False
 
     try:
         cursor = handle.connection.cursor()
+        normalized_email = pretty_address.strip().lower()
 
-        # Normalize to lowercase for comparison
-        normalized_email = auto_address.strip().lower()
-
-        if exclude_user_id is not None:
+        # Update ke waqt hum current user ko exclude karte hain comparison se
+        if exclude_sn is not None:
             cursor.execute("""
                 SELECT 1 FROM Users
                 WHERE LOWER(auto_address) = ?
-                AND UserID != ?
+                AND SerialNumber != ?
                 LIMIT 1
-            """, (normalized_email, exclude_user_id))
+            """, (normalized_email, exclude_sn))
         else:
             cursor.execute("""
                 SELECT 1 FROM Users
@@ -1631,7 +1523,7 @@ def check_email_exists(
         return DatabaseErrorCode.SUCCESS, exists
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, f"Failed to check email exists: {auto_address}", str(e))
+        log_error(handle.logger, "Database", f"Failed to check email exists: {pretty_address}", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, False
 
 
@@ -1959,38 +1851,25 @@ def store_attachment(
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
 
 
-def update_contact_stats(handle: DatabaseHandle, user_id: int) -> bool:
+def update_contact_stats(handle: DatabaseHandle, serial_number: int) -> bool:
     """
-    Update contact statistics after sending/receiving an email.
-    Increments contact_count and updates last_contacted_timestamp.
-
-    Args:
-        handle: Database handle
-        user_id: User/contact ID
-
-    Returns:
-        True if update successful
-
-    C signature: bool update_contact_stats(DatabaseHandle* handle, int64_t user_id);
+    Update contact statistics using the numeric SerialNumber as the key.
     """
-    if handle is None or handle.connection is None:
+    if handle is None or handle.connection is None or not isinstance(serial_number, int):
         return False
 
     try:
         cursor = handle.connection.cursor()
-
         cursor.execute("""
             UPDATE Users
             SET contact_count = contact_count + 1,
                 last_contacted_timestamp = datetime('now')
-            WHERE UserID = ?
-        """, (user_id,))
-
+            WHERE SerialNumber = ?
+        """, (serial_number,))
         handle.connection.commit()
         return cursor.rowcount > 0
-
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to update contact stats", str(e))
+        log_error(handle.logger, DB_CONTEXT, "Stats update failed", str(e))
         handle.connection.rollback()
         return False
 
@@ -2034,91 +1913,76 @@ def get_database_stats(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, Dict[
 # ============================================================================
 
 def list_emails(
-    handle: DatabaseHandle,
+    handle: Any,
     folder: str = 'inbox',
     limit: int = 50,
     offset: int = 0,
     include_trashed: bool = False
 ) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
     """
-    List emails with pagination and folder filtering.
-
-    Returns list of email summaries (not full body for performance).
-
-    Args:
-        handle: Database handle
-        folder: Folder to list from (inbox, sent, drafts, trash)
-        limit: Maximum number of results
-        offset: Pagination offset
-        include_trashed: Whether to include trashed emails
-
-    Returns:
-        Tuple of (error_code, list of email dicts)
-
-    C signature: DatabaseErrorCode list_emails(DatabaseHandle* handle, const char* folder,
-                                                int limit, int offset, bool include_trashed,
-                                                EmailSummary** out_emails, int* out_count);
+    List emails with Pretty Address of the sender/recipient.
     """
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_debug
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, []
 
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
-        # Query received_tells table for inbox
+        # Inbox logic pulls from received_tells (notifications)
         if folder == 'inbox':
-            query = """
-                SELECT file_guid, tell_type, created_at, download_status
+            cursor.execute("""
+                SELECT file_guid as EmailID, tell_type, created_at as ReceivedTimestamp, download_status
                 FROM received_tells
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
-            """
-            cursor.execute(query, (limit, offset))
+            """, (limit, offset))
             rows = cursor.fetchall()
             
             emails = []
             for row in rows:
-                file_guid, tell_type, created_at, download_status = row
                 emails.append({
-                    'EmailID': file_guid,
-                    'Subject': f'Email {file_guid[:8]}...',
-                    'ReceivedTimestamp': created_at,
-                    'SentTimestamp': created_at,
-                    'is_read': download_status == 1,
-                    'is_starred': False,
-                    'is_trashed': False,
+                    'EmailID': row['EmailID'],
+                    'Subject': f"New Mail ({row['EmailID'][:8]})",
+                    'ReceivedTimestamp': row['ReceivedTimestamp'],
+                    'is_read': bool(row['download_status']),
                     'folder': 'inbox'
                 })
         else:
-            # For other folders (sent/drafts/trash), query Emails table
-            query = """
-                SELECT EmailID, Subject, ReceivedTimestamp, SentTimestamp,
-                       is_read, is_starred, is_trashed, folder
-                FROM Emails
-                WHERE folder = ? AND (is_trashed = 0 OR is_trashed = ?)
-                ORDER BY ReceivedTimestamp DESC
+            # Sent/Drafts/Trash query with JOIN to get Pretty Name
+            # We join with Junction table to find the main contact for the summary
+            cursor.execute("""
+                SELECT 
+                    e.EmailID, e.Subject, e.ReceivedTimestamp, e.SentTimestamp,
+                    e.is_read, e.is_starred, e.is_trashed, e.folder,
+                    u.auto_address as contact_pretty
+                FROM Emails e
+                LEFT JOIN Junction_Email_Users j ON e.EmailID = j.EmailID 
+                LEFT JOIN Users u ON j.SerialNumber = u.SerialNumber
+                WHERE e.folder = ? 
+                  AND (e.is_trashed = 0 OR e.is_trashed = ?)
+                  AND (j.user_type = 'TO' OR j.user_type = 'FROM')
+                GROUP BY e.EmailID
+                ORDER BY e.ReceivedTimestamp DESC
                 LIMIT ? OFFSET ?
-            """
-            cursor.execute(query, (folder, int(include_trashed), limit, offset))
-            rows = cursor.fetchall()
+            """, (folder, int(include_trashed), limit, offset))
             
-            columns = ['EmailID', 'Subject', 'ReceivedTimestamp', 'SentTimestamp',
-                       'is_read', 'is_starred', 'is_trashed', 'folder']
-            emails = []
-            for row in rows:
-                email = dict(zip(columns, row))
-                email['is_read'] = bool(email['is_read'])
-                email['is_starred'] = bool(email['is_starred'])
-                email['is_trashed'] = bool(email['is_trashed'])
-                emails.append(email)
+            rows = cursor.fetchall()
+            emails = [dict(row) for row in rows]
+            for e in emails:
+                e['is_read'] = bool(e['is_read'])
+                e['is_starred'] = bool(e['is_starred'])
+                e['is_trashed'] = bool(e['is_trashed'])
 
-        log_debug(handle.logger, DB_CONTEXT, f"Listed {len(emails)} emails from folder '{folder}'")
+        log_debug(handle.logger, "Database", f"Listed {len(emails)} emails from '{folder}'")
         return DatabaseErrorCode.SUCCESS, emails
 
-    except Exception as e:
-        log_debug(handle.logger, DB_CONTEXT, f"Error listing emails: {e}")
+    except sqlite3.Error as e:
         return DatabaseErrorCode.ERR_INTERNAL, []
-
 
 def list_drafts(
     handle: DatabaseHandle,
@@ -2126,47 +1990,25 @@ def list_drafts(
     limit: int = 50
 ) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]], int]:
     """
-    List drafts with pagination and recipient preview.
-
-    Returns draft summaries ordered by last modified (SentTimestamp) descending.
-    Includes recipient count and first recipient name for UI preview.
-
-    Args:
-        handle: Database handle
-        page: Page number (1-based, default 1)
-        limit: Maximum number of results per page (default 50, max 200)
-
-    Returns:
-        Tuple of (error_code, drafts_list, total_count)
-
-    C signature: DatabaseErrorCode list_drafts(DatabaseHandle* handle, int page, int limit,
-                                                DraftSummary** out_drafts, int* out_count, int* out_total);
+    List drafts with pagination and Pretty Name preview.
+    FIXED: References SerialNumber instead of UserID.
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, [], 0
 
-    # Clamp pagination values
-    if page < 1:
-        page = 1
-    if limit < 1:
-        limit = 1
-    if limit > 200:
-        limit = 200
-
+    page = max(1, page)
+    limit = max(1, min(limit, 200))
     offset = (page - 1) * limit
 
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
-        # Get total count first
-        cursor.execute("""
-            SELECT COUNT(*) as total
-            FROM Emails
-            WHERE folder = 'drafts' AND is_trashed = 0
-        """)
+        # Get total count
+        cursor.execute("SELECT COUNT(*) as total FROM Emails WHERE folder = 'drafts' AND is_trashed = 0")
         total_count = cursor.fetchone()['total']
 
-        # Get drafts with recipient preview
+        # Get drafts with JOIN on SerialNumber for recipient preview
         cursor.execute("""
             SELECT
                 e.EmailID, e.Subject, e.ReceivedTimestamp, e.SentTimestamp,
@@ -2175,9 +2017,9 @@ def list_drafts(
                  WHERE j.EmailID = e.EmailID AND j.user_type = 'TO') as recipient_count,
                 (SELECT u.FirstName || ' ' || COALESCE(u.LastName, '')
                  FROM Junction_Email_Users j
-                 JOIN Users u ON j.UserID = u.UserID
+                 JOIN Users u ON j.SerialNumber = u.SerialNumber
                  WHERE j.EmailID = e.EmailID AND j.user_type = 'TO'
-                 LIMIT 1) as first_recipient
+                 LIMIT 1) as first_recipient_name
             FROM Emails e
             WHERE e.folder = 'drafts' AND e.is_trashed = 0
             ORDER BY e.SentTimestamp DESC
@@ -2186,94 +2028,70 @@ def list_drafts(
 
         drafts = []
         for row in cursor.fetchall():
-            draft = {
-                'email_id': row['EmailID'].hex() if row['EmailID'] else None,
+            drafts.append({
+                'email_id': row['EmailID'].hex(),
                 'subject': row['Subject'],
                 'date_created': row['ReceivedTimestamp'],
                 'last_modified': row['SentTimestamp'],
                 'has_body': bool(row['Body']),
-                'is_starred': bool(row['is_starred']),
-                'is_read': bool(row['is_read']),
-                'recipient_count': row['recipient_count'] or 0,
-                'first_recipient': row['first_recipient']
-            }
-            drafts.append(draft)
+                'recipient_count': row['recipient_count'],
+                'first_recipient': row['first_recipient_name'] # Pretty Name
+            })
 
-        log_debug(handle.logger, DB_CONTEXT, f"Listed {len(drafts)} drafts (page {page})")
         return DatabaseErrorCode.SUCCESS, drafts, total_count
-
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to list drafts", str(e))
+        log_error(handle.logger, DB_CONTEXT, "Draft list failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, [], 0
 
-
 def search_emails(
-    handle: DatabaseHandle,
+    handle: Any,
     search_term: str,
     limit: int = 50,
     offset: int = 0
 ) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
     """
-    Full-text search using FTS5 index.
-
-    Uses the Emails_FTS virtual table for fast text search on Subject and Body.
-
-    Args:
-        handle: Database handle
-        search_term: Search query string
-        limit: Maximum number of results
-        offset: Pagination offset
-
-    Returns:
-        Tuple of (error_code, list of search result dicts with snippets)
-
-    C signature: DatabaseErrorCode search_emails(DatabaseHandle* handle, const char* search_term,
-                                                  int limit, int offset,
-                                                  SearchResult** out_results, int* out_count);
+    Search emails using FTS5 and return snippets.
     """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, []
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error
 
-    if not search_term or not search_term.strip():
+    if handle is None or handle.connection is None or not search_term:
         return DatabaseErrorCode.ERR_INVALID_PARAM, []
 
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
-
-        # Sanitize search term to prevent FTS injection
-        # Double quotes are the escape character in FTS5
         safe_term = search_term.replace('"', '""').strip()
 
-        # Use FTS5 MATCH query with snippet for context
         query = """
             SELECT e.EmailID, e.Subject, e.ReceivedTimestamp, e.is_read, e.folder,
+                   u.auto_address as sender_pretty,
                    snippet(Emails_FTS, 1, '<mark>', '</mark>', '...', 32) as snippet
             FROM Emails_FTS
             JOIN Emails e ON Emails_FTS.rowid = e.rowid
+            LEFT JOIN Junction_Email_Users j ON e.EmailID = j.EmailID AND j.user_type = 'FROM'
+            LEFT JOIN Users u ON j.SerialNumber = u.SerialNumber
             WHERE Emails_FTS MATCH ?
             ORDER BY rank
             LIMIT ? OFFSET ?
         """
 
-        # FTS5 phrase query with quotes
         cursor.execute(query, (f'"{safe_term}"', limit, offset))
         rows = cursor.fetchall()
-
-        # Convert to list of dicts
-        columns = ['EmailID', 'Subject', 'ReceivedTimestamp', 'is_read', 'folder', 'snippet']
+        
         results = []
         for row in rows:
-            result = dict(zip(columns, row))
-            result['is_read'] = bool(result['is_read'])
-            results.append(result)
+            res = dict(row)
+            res['EmailID'] = row['EmailID'].hex()
+            res['is_read'] = bool(row['is_read'])
+            results.append(res)
 
-        log_debug(handle.logger, DB_CONTEXT, f"Search '{search_term}' found {len(results)} results")
         return DatabaseErrorCode.SUCCESS, results
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, f"Search failed for '{search_term}'", str(e))
+        log_error(handle.logger, "Database", f"Search failed: {search_term}", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, []
-
 
 def get_email_count(
     handle: DatabaseHandle,
@@ -2403,84 +2221,108 @@ def get_user_payment_requirement(
     serial_number: Union[int, str]
 ) -> Tuple[DatabaseErrorCode, Optional[float], Optional[str]]:
     """
-    Look up a user's InboxFee and Class using their CustomSerialNumber.
-    FIXED: Handles both raw integers (23) and Custom strings (C23).
+    Look up a user's InboxFee and Class using their strict decoded SerialNumber.
+    REMOVED FALLBACK: Ensures no collisions between '23' and 'C23'.
     """
-    # 1. Validate Handle
+    import sqlite3
+    from protocol import custom_sn_to_int
+    from database import DatabaseErrorCode
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None, None
     
-    # 2. Normalize Serial Number to "C-Format" (e.g., 23 -> "C23")
-    # This ensures consistency between the identity coin and the Users table.
-    custom_sn = str(serial_number)
-    if not custom_sn.startswith('C'):
-        custom_sn = f"C{custom_sn}"
-
     try:
+        # 1. Decode to strict numeric SN (e.g., 'C23' -> 2841)
+        # Agar numeric_sn galat hua toh lookup fail hona chahiye, fallback nahi
+        target_numeric_sn = custom_sn_to_int(serial_number)
+        
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
         
-        # 3. Query the new Supervisor Columns
+        # 2. Strict Integer Query
+        # SerialNumber column must contain the decoded integer (e.g., 2841)
         cursor.execute("""
             SELECT InboxFee, Class
             FROM Users
-            WHERE CustomSerialNumber = ?
-        """, (custom_sn,))
+            WHERE SerialNumber = ?
+        """, (target_numeric_sn,))
         
         row = cursor.fetchone()
         
-        # 4. Handle Missing User
         if not row:
+            # Safer to fail than to pay the wrong person
             return DatabaseErrorCode.ERR_NOT_FOUND, None, None
         
-        # 5. Extract and Return (Supports sqlite3.Row factory)
-        # InboxFee is the flat CC fee; Class is the user tier (e.g., 'giga')
-        inbox_fee = row['InboxFee']
-        user_class = row['Class']
+        return DatabaseErrorCode.SUCCESS, row['InboxFee'], row['Class']
         
-        return DatabaseErrorCode.SUCCESS, inbox_fee, user_class
-        
-    except sqlite3.Error as e:
-        # DB_CONTEXT and log_error are imported/defined in database.py
-        log_error(handle.logger, "Database", "Failed to get user payment requirement", str(e))
+    except Exception as e:
+        from src.logger import log_error
+        log_error(handle.logger, "Database", "Strict lookup failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, None, None
-
 # ============================================================================
 # USER AND SERVER SYNC FUNCTIONS (For data_sync.py integration)
 # ============================================================================
 
-def upsert_user(handle, user_dict):
+def upsert_user(handle: Any, user_data: Dict[str, Any]) -> DatabaseErrorCode:
     """
-    Inserts a new user or updates an existing one based on CustomSerialNumber.
+    Inserts or updates a user from the RAIDA directory.
+    FIXED: Aligned dictionary keys with parse_users_csv and added all Phase II columns.
     """
-    if not handle or not handle.connection:
+    import sqlite3
+    # Inner import to prevent circular dependency with data_sync
+    from src.data_sync import convert_to_custom_base32 
+    from src.database import DatabaseErrorCode
+
+    if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM
+
+    # Mapping logic from parse_users_csv keys to database columns
+    sn = int(user_data.get('serial_number', 0))
+    dn = int(user_data.get('denomination', 0))
+    custom_sn = user_data.get('custom_sn', '')
+    
+    # Pretty Address (Already generated in data_sync, but we fallback just in case)
+    pretty_email = user_data.get('auto_address')
+    if not pretty_email:
+        first = user_data.get('first_name', 'User').strip().replace(' ', '.')
+        last = user_data.get('last_name', '').strip().replace(' ', '.')
+        desc = user_data.get('description', 'Member').strip().replace(' ', '.')
+        base32_sn = custom_sn if custom_sn else convert_to_custom_base32(sn)
+        class_map = {0: "Bit", 1: "Byte", 2: "Kilo", 3: "Mega", 4: "Giga"}
+        user_class = user_data.get('class', class_map.get(dn, "Coin")).capitalize()
+        pretty_email = f"{first}.{last}@{desc}#{base32_sn}.{user_class}"
 
     try:
         cursor = handle.connection.cursor()
-        # INSERT OR REPLACE ensures no duplicates for the same CustomSerialNumber
-        sql = """
-            INSERT OR REPLACE INTO Users (
-                CustomSerialNumber, FirstName, LastName, Description, 
+        cursor.execute("""
+            INSERT INTO Users (
+                SerialNumber, Denomination, CustomSerialNumber, 
+                FirstName, LastName, auto_address, Description, 
                 InboxFee, Class, Beacon
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """
-        params = (
-            user_dict['custom_sn'],
-            user_dict['first_name'],
-            user_dict['last_name'],
-            user_dict['description'],
-            user_dict['inbox_fee'],
-            user_dict['class'],
-            user_dict['beacon']
-        )
-        cursor.execute(sql, params)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(SerialNumber) DO UPDATE SET
+                Denomination=excluded.Denomination,
+                CustomSerialNumber=excluded.CustomSerialNumber,
+                FirstName=excluded.FirstName,
+                LastName=excluded.LastName,
+                auto_address=excluded.auto_address,
+                Description=excluded.Description,
+                InboxFee=excluded.InboxFee,
+                Class=excluded.Class,
+                Beacon=excluded.Beacon
+        """, (
+            sn, dn, custom_sn,
+            user_data.get('first_name'), user_data.get('last_name'),
+            pretty_email, user_data.get('description'), 
+            user_data.get('inbox_fee', 0.0), 
+            user_data.get('class', 'Coin'), 
+            user_data.get('beacon', 'RAIDA11')
+        ))
         handle.connection.commit()
         return DatabaseErrorCode.SUCCESS
-    except Exception as e:
-        # log_error(handle.logger, "Database", "Upsert user failed", str(e))
+    except sqlite3.Error as e:
+        # Optionally log the error if handle.logger exists
         return DatabaseErrorCode.ERR_QUERY_FAILED
-
-
 def upsert_server(handle: DatabaseHandle, server: Dict[str, Any]) -> DatabaseErrorCode:
     """
     Insert or update a QMail server from remote sync data.
@@ -2548,69 +2390,36 @@ def search_users(
     limit: int = 20
 ) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
     """
-    Search users by name or description for autocomplete.
-
-    Args:
-        handle: Database handle
-        query: Search query string
-        limit: Maximum number of results (default 20)
-
-    Returns:
-        Tuple of (error_code, list of user dicts)
-
-    C signature: DatabaseErrorCode search_users(DatabaseHandle* handle, const char* query,
-                                                 int limit, User** out_users, int* out_count);
+    Search users for autocomplete. FIXED: Matches on Pretty Format and returns Class.
     """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, []
-
-    if not query or not query.strip():
+    if handle is None or handle.connection is None or not query:
         return DatabaseErrorCode.ERR_INVALID_PARAM, []
 
     try:
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
+        pattern = f"%{query.strip()}%"
 
-        # Search in FirstName, LastName, and Description
-        search_pattern = f"%{query.strip()}%"
-
+        # Search in Name, Pretty Address, or Description
         cursor.execute("""
-            SELECT UserID, FirstName, MiddleName, LastName, Avatar,
-                   auto_address, Description, BeaconID, dreg_score, emails_sent_total
+            SELECT SerialNumber, FirstName, LastName, auto_address, Description, Class, Beacon
             FROM Users
-            WHERE FirstName LIKE ? OR LastName LIKE ? OR Description LIKE ?
+            WHERE FirstName LIKE ? OR LastName LIKE ? OR auto_address LIKE ? OR Description LIKE ?
             ORDER BY
                 CASE
                     WHEN FirstName LIKE ? THEN 1
-                    WHEN LastName LIKE ? THEN 2
+                    WHEN auto_address LIKE ? THEN 2
                     ELSE 3
-                END,
-                FirstName, LastName
+                END, FirstName ASC
             LIMIT ?
-        """, (search_pattern, search_pattern, search_pattern,
-              f"{query.strip()}%", f"{query.strip()}%", limit))
+        """, (pattern, pattern, pattern, pattern, f"{query.strip()}%", f"{query.strip()}%", limit))
 
-        users = []
-        for row in cursor.fetchall():
-            users.append({
-                'user_id': row['UserID'],
-                'first_name': row['FirstName'],
-                'middle_name': row['MiddleName'],
-                'last_name': row['LastName'],
-                'avatar': row['Avatar'],
-                'auto_address': row['auto_address'],
-                'description': row['Description'],
-                'beacon_id': row['BeaconID'],
-                'dreg_score': row['dreg_score'],
-                'emails_sent_total': row['emails_sent_total']
-            })
-
-        log_debug(handle.logger, DB_CONTEXT, f"User search '{query}' found {len(users)} results")
+        users = [dict(row) for row in cursor.fetchall()]
+        log_debug(handle.logger, DB_CONTEXT, f"Search '{query}' found {len(users)} users")
         return DatabaseErrorCode.SUCCESS, users
-
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, f"User search failed for '{query}'", str(e))
+        log_error(handle.logger, DB_CONTEXT, "User search failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, []
-
 
 def get_all_servers(
     handle: DatabaseHandle,
@@ -3650,24 +3459,24 @@ def delete_pending_tell(
 
 
 def get_user_by_address(
-    handle: DatabaseHandle,
+    handle: Any, 
     qmail_address: str
 ) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
-    Get user info by their qmail address.
-
-    Used to look up recipient's beacon server.
-
+    Get full user info by their Pretty Email Address.
+    REPLACES old get_user_by_address to match the new Integer SN schema.
+    
     Args:
         handle: Database handle
-        qmail_address: QMail address (e.g., "0006.1.12345678")
+        qmail_address: Pretty address (e.g., "Sean.Worthington@CEO#C23.Giga")
 
     Returns:
         Tuple of (DatabaseErrorCode, user dict or None)
-
-    C signature: DatabaseErrorCode get_user_by_address(DatabaseHandle* handle, const char* address,
-                                                         User* out_user);
     """
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
@@ -3675,33 +3484,34 @@ def get_user_by_address(
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
     try:
+        # 1. Row factory enable karein taaki dictionary access mil sake
+        handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
+        # 2. Query matching the new schema
+        # SerialNumber replace kar raha hai UserID ko.
+        # Beacon replace kar raha hai BeaconID ko.
         cursor.execute("""
-            SELECT UserID, FirstName, LastName, auto_address, BeaconID,
-                   sending_fee, dreg_score
+            SELECT 
+                SerialNumber, Denomination, CustomSerialNumber, 
+                FirstName, LastName, auto_address, Description, 
+                InboxFee, Class, Beacon
             FROM Users
             WHERE auto_address = ?
-        """, (qmail_address,))
+        """, (qmail_address.strip(),))
 
         row = cursor.fetchone()
+        
         if row is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, None
 
-        user = {
-            'user_id': row['UserID'],
-            'first_name': row['FirstName'],
-            'last_name': row['LastName'],
-            'auto_address': row['auto_address'],
-            'beacon_id': row['BeaconID'],
-            'sending_fee': row['sending_fee'],
-            'dreg_score': row['dreg_score']
-        }
+        # 3. Convert row to dict - Ye format api_handlers expect karte hain
+        user = dict(row)
 
         return DatabaseErrorCode.SUCCESS, user
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT,
+        log_error(handle.logger, "Database", 
                   f"Failed to get user by address {qmail_address}", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
 

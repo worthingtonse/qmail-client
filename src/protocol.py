@@ -157,17 +157,49 @@ def _generate_challenge() -> bytes:
     return bytes_to_crc + crc32_bytes
 
 
-# Helper to convert "C23" to integer 23 for binary protocol
-def custom_sn_to_int(custom_sn: str) -> int:
+
+def custom_sn_to_int(custom_sn: Any) -> int:
     """
-    Strips the 'C' prefix and returns the raw integer serial number.
-    Example: 'C23' -> 23
+    Converts input into a numeric integer Serial Number.
+    Supports: 
+      - Integer: 2841 
+      - Base32: 'C23'
+      - Pretty Address: 'Sean.Worthington@CEO#C23.Giga'
     """
-    import re
-    if not isinstance(custom_sn, str):
-        return int(custom_sn)
-    match = re.search(r'\d+', custom_sn)
-    return int(match.group()) if match else 0
+    # FIXED: Import FROM instead of TO
+    from src.data_sync import convert_from_custom_base32
+    
+    if isinstance(custom_sn, int):
+        return custom_sn
+    
+    if not custom_sn:
+        return 0
+        
+    s_val = str(custom_sn).strip()
+    
+    # CASE 1: Pretty Address format (contains # and .)
+    if '#' in s_val:
+        try:
+            # Sean.Worthington@CEO#C23.Giga -> C23
+            # Hum '#' ke baad wala aur '.' ke pehle wala hissa nikalenge
+            part_after_hash = s_val.split('#')[-1]
+            base32_code = part_after_hash.split('.')[0]
+            # FIXED: Calling convert_from...
+            return convert_from_custom_base32(base32_code)
+        except Exception:
+            return 0
+
+    # CASE 2: Raw Base32 string (like 'C23')
+    # Agar string mein letters hain, toh ye Base32 hai
+    if any(c.isalpha() for c in s_val):
+        # FIXED: Calling convert_from...
+        return convert_from_custom_base32(s_val)
+        
+    # CASE 3: Numeric string (like '2841')
+    try:
+        return int(s_val)
+    except ValueError:
+        return 0
 
 def build_ping_body(denomination: int, serial_number: int, device_id: int, an: bytes) -> Tuple[bytes, bytes]:
     """Builds the 50-byte PING body with CRC-32 preamble and identity block."""
@@ -226,66 +258,80 @@ def parse_tell_response(
 ) -> Tuple[ProtocolErrorCode, List[TellNotification]]:
     """
     Parses the decrypted response body from a PING or PEEK command.
+    FIXED: Now extracts sender_sn at Offset +7 to fix Beacon crash.
     
     Matches tell_file_header_t from tell.h (40 bytes):
     - Offset +0:  cluster_id (4 bytes)
     - Offset +4:  sender_coin_id (2 bytes)
     - Offset +6:  sender_denomination (1 byte)
-    - Offset +7:  sender_serial_number (4 bytes, Big Endian)
+    - Offset +7:  sender_serial_number (4 bytes, Big Endian) <--- EXTRACTED HERE
     - Offset +11: timestamp (4 bytes, Big Endian)
     - Offset +15: tell_type (1 byte)
     - Offset +16: email_id/file_guid (16 bytes)
     - Offset +32: total_file_size (4 bytes, Big Endian)
     - Offset +36: stripe_count (4 bytes, Big Endian)
     """
+    import struct
+    from src.protocol import ProtocolErrorCode
+    from src.logger import log_debug, log_error
+
     if not response_body or len(response_body) < 8:
         log_debug(logger_handle, "Protocol", "Tell response is empty or too short for a header.")
         return ProtocolErrorCode.SUCCESS, []
 
     try:
+        # Header: count (1 byte) + total remaining (2 bytes)
         tell_count = response_body[0]
         total_tells = struct.unpack('>H', response_body[1:3])[0]
 
         log_debug(logger_handle, "Protocol", 
-                  f"Parsing tell response. Header: tell_count={tell_count}, total_tells_remaining={total_tells}")
+                  f"Parsing response: {tell_count} tells in this packet, {total_tells} remaining on server.")
 
         if tell_count == 0:
             return ProtocolErrorCode.SUCCESS, []
 
         notifications = []
-        offset = 8  # Tells start after 8-byte response header
+        offset = 8  # Tells start after 8-byte response header header
 
         for i in range(tell_count):
-            min_tell_size = 40  # tell_file_header_t is 40 bytes
+            min_tell_size = 40  # tell_file_header_t size
             if offset + min_tell_size > len(response_body):
-                log_error(logger_handle, "Protocol", 
-                         f"Incomplete data for tell #{i+1} at offset {offset}.")
+                log_error(logger_handle, "Protocol", f"Incomplete data for tell #{i+1}")
                 return ProtocolErrorCode.ERR_INCOMPLETE_DATA, notifications
 
             tell = TellNotification()
 
-            # Parse with correct offsets matching C struct
+            # --- BINARY EXTRACTION WITH CORRECT OFFSETS ---
+            
+            # 1. Sender SN (Offset +7, 4 bytes)
+            # Logs confirm this is required for get_contact_by_id()
+            tell.sender_sn = struct.unpack('>I', response_body[offset + 7 : offset + 11])[0]
+            
+            # 2. Timestamp (Offset +11, 4 bytes)
             tell.timestamp = struct.unpack('>I', response_body[offset + 11 : offset + 15])[0]
+            
+            # 3. Tell Type (Offset +15, 1 byte)
             tell.tell_type = response_body[offset + 15]
-            tell.file_guid = response_body[offset + 16 : offset + 32]  # 16 bytes
+            
+            # 4. File GUID (Offset +16, 16 bytes)
+            tell.file_guid = response_body[offset + 16 : offset + 32]
+            
+            # 5. Stripe Count (Offset +36, 4 bytes)
             tell.server_count = struct.unpack('>I', response_body[offset + 36 : offset + 40])[0]
 
-            offset += 40  # Move past header
+            offset += 40  # Move past the 40-byte header block
 
-            # Parse server list (server_loc_t: 32 bytes each)
+            # --- SERVER LIST PARSING (32 bytes per server) ---
             server_list = []
             for s in range(tell.server_count):
                 if offset + 32 > len(response_body):
-                    log_error(logger_handle, "Protocol", 
-                             f"Incomplete data for server list in tell #{i+1}.")
                     break
 
                 server_data = response_body[offset : offset + 32]
-                
                 location = ServerLocation(
                     stripe_index=server_data[0],
                     total_stripes=tell.server_count,
-                    server_id=server_data[0],
+                    server_id=server_data[0], # Simple mapping for now
                     raw_entry=server_data
                 )
                 server_list.append(location)
@@ -293,7 +339,8 @@ def parse_tell_response(
 
             tell.server_list = server_list
 
-            # Parse footer (tell_file_footer_t: tag + length + 16-byte locker = 18 bytes)
+            # --- FOOTER / LOCKER CODE PARSING ---
+            # RAIDA protocol adds an 18-byte footer (Tag 0x50 + 16 bytes locker code)
             if offset + 18 <= len(response_body):
                 footer_tag = response_body[offset]
                 footer_len = response_body[offset + 1]
@@ -310,8 +357,7 @@ def parse_tell_response(
         return ProtocolErrorCode.SUCCESS, notifications
 
     except (struct.error, IndexError) as e:
-        log_error(logger_handle, "Protocol", 
-                 f"Failed to parse tell response due to malformed data: {e}")
+        log_error(logger_handle, "Protocol", f"Malformed Tell data at offset {offset}: {e}")
         return ProtocolErrorCode.ERR_INVALID_BODY, []
 # ============================================================================
 # PING/PEEK COMMAND FUNCTIONS
@@ -586,7 +632,7 @@ def decrypt_payload_with_an(
 def build_complete_peek_request(
     raida_id: int,
     denomination: int,
-    serial_number: int,
+    serial_number: Union[int, str], # UPDATED: Accepts Pretty/Base32
     device_id: int,
     an: bytes,
     since_timestamp: int = 0,
@@ -594,10 +640,14 @@ def build_complete_peek_request(
     **kwargs
 ) -> Tuple[int, bytes, bytes, bytes]:
     """
-    FIXED: Now calls build_peek_header to ensure CMD_PEEK (63) is used.
+    Build a complete PEEK request (header + payload).
+    FIXED: Uses custom_sn_to_int to ensure a numeric ID for binary packing.
     """
-    # 1. Build unpadded PEEK body
-    payload, challenge = build_peek_body(denomination, serial_number, device_id, an, since_timestamp)
+    # Resolve 'C23' or Pretty Address to 2841
+    numeric_sn = custom_sn_to_int(serial_number)
+
+    # 1. Build unpadded PEEK body with numeric SN
+    payload, challenge = build_peek_body(denomination, numeric_sn, device_id, an, since_timestamp)
 
     # 2. Build dedicated PEEK Header (CMD 63)
     err, header = build_peek_header(
@@ -605,7 +655,7 @@ def build_complete_peek_request(
         an=an,
         body_length=len(payload),
         denomination=denomination,
-        serial_number=serial_number,
+        serial_number=numeric_sn,
         encryption_type=encryption_type,
         **kwargs
     )
@@ -617,7 +667,7 @@ def build_complete_peek_request(
 def build_complete_ping_request(
     raida_id: int,
     denomination: int,
-    serial_number: int,
+    serial_number: Union[int, str], # UPDATED: Accepts Pretty/Base32
     device_id: int,
     an: bytes,
     encryption_type: int = 0,
@@ -625,21 +675,21 @@ def build_complete_ping_request(
 ) -> Tuple[int, bytes, bytes, bytes]:
     """
     Build a complete PING request (header + payload).
-    
-    FIXED: Now calls build_ping_header to ensure Command 62 is used. 
-    Using build_tell_header previously caused Status 16 misrouting errors.
+    FIXED: Uses custom_sn_to_int to ensure RAIDA receives an integer ID.
     """
-    # 1. Build the 50-byte unpadded PING body and its 16-byte challenge
-    payload, challenge = build_ping_body(denomination, serial_number, device_id, an)
+    # Resolve 'C23' or Pretty Address to 2841
+    numeric_sn = custom_sn_to_int(serial_number)
+
+    # 1. Build the 50-byte PING body
+    payload, challenge = build_ping_body(denomination, numeric_sn, device_id, an)
 
     # 2. Build the Header using the correct PING command code (62)
-    # This function correctly sets header[5] = CMD_PING
     err, header = build_ping_header(
         raida_id=raida_id,
         an=an,
         body_length=len(payload),
         denomination=denomination,
-        serial_number=serial_number,
+        serial_number=numeric_sn,
         encryption_type=encryption_type,
         **kwargs
     )
@@ -647,11 +697,7 @@ def build_complete_ping_request(
     if err != 0: 
         return err, b'', b'', b''
     
-    # 3. Combine header and payload
-    # For Type 0, the nonce at header[24:32] will be 8 null bytes
-    complete_request = header + payload
-    
-    return 0, complete_request, challenge, header[24:32]
+    return 0, header + payload, challenge, header[24:32]
 # ============================================================================
 # UPLOAD COMMAND FUNCTIONS (Added by opus45)
 # ============================================================================
@@ -1077,32 +1123,35 @@ def build_tell_header(
     an: bytes,
     body_length: int,
     denomination: int = 0,
-    serial_number: int = 0,
+    serial_number: Union[int, str] = 0, # UPDATED: Accepts Pretty/Base32
     encryption_type: int = 0,
     **kwargs
 ) -> Tuple[int, bytes]:
-    """Builds the 32-byte RAIDA Request Header."""
+    """
+    Builds the 32-byte RAIDA Request Header for CMD_TELL.
+    FIXED: Ensures header SN field is a numeric integer.
+    """
     if raida_id < 0 or raida_id > 24:
         return 1, b'' 
     
-    # Validation: Ensures short keys are caught as errors
     auth_key = an if an is not None else kwargs.get('locker_code')
     if auth_key is None or len(auth_key) < 16:
         return 1, b''
 
+    numeric_sn = custom_sn_to_int(serial_number)
+
     header = bytearray(32)
-    header[0] = 0x01  # Version
+    header[0] = 0x01
     header[2] = raida_id
     header[4] = CMD_GROUP_QMAIL
     header[5] = CMD_TELL
-    struct.pack_into('>H', header, 6, 0x0006) # Coin Type
+    struct.pack_into('>H', header, 6, 0x0006) 
 
     header[16] = encryption_type & 0xFF 
     header[17] = denomination & 0xFF
-    struct.pack_into('>I', header, 18, serial_number)
+    struct.pack_into('>I', header, 18, numeric_sn)
     struct.pack_into('>H', header, 22, body_length)
 
-    # Type 0 (Plaintext) requires a zero-nonce for server compatibility
     header[24:32] = bytes(8) if encryption_type == 0 else os.urandom(8)
     return 0, bytes(header)
 
@@ -1184,7 +1233,7 @@ def build_tell_header(
 
 def build_tell_payload(
     denomination: int,
-    serial_number: int,
+    serial_number: Union[int, str], # Identity/Sender SN (Can be Pretty Address)
     device_id: int,
     an: bytes,
     file_group_guid: bytes,
@@ -1197,41 +1246,44 @@ def build_tell_payload(
 ) -> Tuple[int, bytes, bytes]:
     """
     Builds the Tell payload for Encryption Type 0 (Plaintext).
-    STRICT VERSION: Includes the required CRC-32 in the preamble and 
-    maintains exact offsets for the RAIDA C-structures.
+    FIXED: Resolves both Sender and Recipients from Pretty Format to numeric IDs.
+    STRICT VERSION: Includes CRC-32 preamble and maintains exact RAIDA C-offsets.
     """
-    # 1. Validation: Matches server expectations and unit test failures
+    import os, struct, zlib
+    from src.protocol import custom_sn_to_int # <--- Strict resolution
+
+    # 1. Validation: Protocol requires exact 16-byte keys and GUIDs
     if an is None or len(an) < 16 or file_group_guid is None or len(file_group_guid) < 16:
         return 1, b'', b''
+
+    # 2. Resolve Sender Identity (Pretty Address -> Numeric Integer)
+    numeric_identity_sn = custom_sn_to_int(serial_number)
 
     ac = len(recipients) if recipients else 0
     qc = len(servers) if servers else 0
 
-    # EXACT Size: 48 (Preamble) + 40 (QMail Header) + AC*32 + QC*32 + 2 (Terminator)
-    # Matches expected_size logic in cmd_qmail.c
+    # EXACT Size calculation: 48 (Preamble) + 40 (QMail Header) + AC*32 + QC*32 + 2 (Terminator)
     payload_size = 48 + 40 + (ac * 32) + (qc * 32) + 2
     payload = bytearray(payload_size)
 
     # =========================================================================
     # SECTION 1: 48-BYTE PREAMBLE (Identity Block)
     # =========================================================================
-    # RAIDA protocol.c requires a 12-byte challenge followed by a 4-byte CRC-32 
-    # of those 12 bytes when using Encryption Type 0.
+    # RAIDA requires a 12-byte random challenge followed by a 4-byte CRC-32
     challenge_data = os.urandom(12)
     crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
     
     payload[0:12] = challenge_data
     struct.pack_into('>I', payload, 12, crc) # Big-Endian CRC at bytes 12-15
     
-    # The full 16-byte block is used as the challenge for verification
-    full_challenge = bytes(payload[0:16])
+    full_challenge = bytes(payload[0:16]) # Used for server response verification
 
-    # Offset 16-23: Session ID (Zeros for Type 0)
+    # Preamble Identity (Binary format expected by RAIDA C-structs)
     struct.pack_into('>H', payload, 24, 0x0006) # Coin Type 
     payload[26] = denomination & 0xFF
-    struct.pack_into('>I', payload, 27, serial_number)
+    struct.pack_into('>I', payload, 27, numeric_identity_sn) # <--- Numeric SN
     payload[31] = device_id & 0xFF
-    payload[32:48] = an[:16] # Proof of Identity at Offset 32
+    payload[32:48] = an[:16] # Proof of Identity (AN)
 
     # =========================================================================
     # SECTION 2: 40-BYTE QMAIL HEADER (Metadata Block)
@@ -1240,25 +1292,32 @@ def build_tell_payload(
     payload[h_off : h_off + 16] = file_group_guid[:16]
     struct.pack_into('>I', payload, h_off + 24, timestamp)
     payload[h_off+28] = tell_type & 0xFF
-    payload[h_off+29] = ac & 0xFF
-    payload[h_off+30] = qc & 0xFF
+    payload[h_off+29] = ac & 0xFF # Recipient Count
+    payload[h_off+30] = qc & 0xFF # Server Count
     if beacon_payment_locker:
         payload[h_off + 31 : h_off + 39] = beacon_payment_locker[:8]
 
     # =========================================================================
     # SECTION 3: RECIPIENT LIST (Offset 88+)
     # =========================================================================
+    # RAIDA structure for recipients uses a 3-byte Serial Number field
     offset = 88
     for r in (recipients or []):
         payload[offset] = r.address_type & 0xFF
         struct.pack_into('>H', payload, offset + 1, r.coin_id)
         payload[offset + 3] = r.denomination & 0xFF
         payload[offset + 4] = r.domain_id & 0xFF
-        numeric_sn = custom_sn_to_int(str(r.serial_number))
-        sn_bytes = (numeric_sn & 0xFFFFFF).to_bytes(3, 'big') 
+        
+        # FIXED: Resolve each recipient SN (could be "Sean.Worthington@CEO#C23.Giga")
+        numeric_recipient_sn = custom_sn_to_int(r.serial_number)
+        
+        # Convert numeric SN to 3-byte Big-Endian binary
+        sn_bytes = (numeric_recipient_sn & 0xFFFFFF).to_bytes(3, 'big') 
         payload[offset + 5 : offset + 8] = sn_bytes
+        
         if hasattr(r, 'locker_payment_key') and r.locker_payment_key:
             payload[offset + 8 : offset + 24] = r.locker_payment_key[:16]
+        
         offset += 32
 
     # =========================================================================
@@ -1276,9 +1335,10 @@ def build_tell_payload(
         offset += 32
 
     # =========================================================================
-    # SECTION 5: TERMINATOR (Strict Placement at absolute end)
+    # SECTION 5: TERMINATOR
     # =========================================================================
-    payload[-2:] = b'\x3e\x3e' # Required QMail Terminator
+    # Protocol specification requires strictly ending with '>>'
+    payload[-2:] = b'\x3e\x3e' 
     
     return 0, bytes(payload), full_challenge
 

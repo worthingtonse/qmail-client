@@ -144,18 +144,34 @@ def calculate_storage_cost(
         
     return total_storage_cost
 
-def calculate_recipient_fees(db_handle, recipients_list) -> Tuple[ErrorCode, float]:
+def calculate_recipient_fees(db_handle, recipients_list) -> float:
     """
-    NEW: Sums the InboxFee for every recipient in the list.
+    Calculates the total CC fees for all recipients.
+    FIXED: Now supports Pretty Email Addresses by looking up fees in the database.
     """
-    from database import get_user_payment_requirement
+    from src.database import get_user_by_address, DatabaseErrorCode
+    from src.logger import log_debug
+    
     total_fee = 0.0
-    for recipient_sn in recipients_list:
-        # lookup fee for "C23", "C24", etc.
-        err, fee, u_class = get_user_payment_requirement(db_handle, recipient_sn)
-        if err == 0:
-            total_fee += (fee if fee else 0.0)
-    return ErrorCode.SUCCESS, total_fee
+    
+    if not recipients_list:
+        return 0.0
+
+    for addr in recipients_list:
+        # addr can be "Sean.Worthington@CEO#C23.Giga"
+        # We use the new database function we just created
+        err, user_info = get_user_by_address(db_handle, addr)
+        
+        if err == DatabaseErrorCode.SUCCESS and user_info:
+            fee = user_info.get('inbox_fee', 0.0)
+            total_fee += fee
+            log_debug(db_handle.logger, "Payment", f"Fee for {addr}: {fee} CC")
+        else:
+            # Fallback: Agar DB mein nahi mila (rare), toh koi fee assume nahi karenge
+            # ya standard fee laga sakte hain.
+            continue
+            
+    return total_fee
 
 
 def get_server_fees(

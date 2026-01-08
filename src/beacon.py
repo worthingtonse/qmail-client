@@ -277,31 +277,36 @@ def stop_beacon_monitor(handle: BeaconHandle, timeout: float = 10.0) -> bool:
 def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tuple[NetworkErrorCode, List[TellNotification]]:
     """
     Performs a single, non-blocking PEEK request.
-    FIXED: Now handles Status 200 to trigger Reactive Healing.
-    FIXED: Removed internal timestamp update - let caller handle it.
+    FIXED: Resolves Identity SN to integer for network authentication.
     """
     if handle is None:
         return NetworkErrorCode.ERR_INVALID_PARAM, []
 
+    from src.protocol import custom_sn_to_int # <--- Strict numeric resolution
+    
+    # 1. Resolve Identity to Numeric (C23 -> 2841)
+    numeric_sn = custom_sn_to_int(handle.identity.serial_number)
     timestamp_to_check = since_timestamp if since_timestamp is not None else handle.last_tell_timestamp
 
     conn = None
     try:
+        # 2. Use numeric_sn for server connection
         err, conn = network.connect_to_server(
             server_info=handle.beacon_server_info,
             encryption_key=handle.encryption_key,
             denomination=handle.identity.denomination,
-            serial_number=handle.identity.serial_number,
+            serial_number=numeric_sn,
             config=handle.network_config,
             logger_handle=handle.logger_handle
         )
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
+        # 3. Build packet with numeric ID
         err_proto, peek_req, challenge, nonce = protocol.build_complete_peek_request(
             raida_id=handle.beacon_server_info.index,
             denomination=handle.identity.denomination,
-            serial_number=handle.identity.serial_number,
+            serial_number=numeric_sn,
             device_id=handle.device_id,
             an=handle.encryption_key,
             since_timestamp=timestamp_to_check,
@@ -322,9 +327,8 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
-        # --- REACTIVE HEALING TRIGGER ---
         if resp_header.status == 200:
-            log_error(handle.logger_handle, "Beacon", f"PEEK failed: RAIDA {handle.beacon_server_info.index} reported INVALID AN (200).")
+            log_error(handle.logger_handle, "Beacon", f"PEEK failed: Invalid AN for SN {numeric_sn}")
             if hasattr(handle, 'on_an_invalid') and handle.on_an_invalid:
                 handle.on_an_invalid(handle.identity)
             return NetworkErrorCode.ERR_INVALID_AN, []
@@ -336,8 +340,6 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
         if parse_err != protocol.ProtocolErrorCode.SUCCESS:
             return NetworkErrorCode.ERR_INVALID_RESPONSE, []
 
-        # DO NOT update timestamp here - let the monitoring loop handle it
-        # This prevents the catchup loop from getting stuck on the same notifications
         return NetworkErrorCode.SUCCESS, tells
         
     finally:
@@ -381,46 +383,70 @@ def _save_state(handle: BeaconHandle):
 def _monitor_loop(handle: BeaconHandle):
     """
     The main loop for the background thread.
-    FIXED: Prevents tight-loop spamming during Phase 2 when old mail persists on server.
+    FIXED: Resolves numeric sender IDs to Pretty Names for better logging.
+    FIXED: Prevents tight-loop spamming and ensures synchronous callback execution.
     """
+    import time
+    from src.logger import log_info, log_error, log_warning, log_debug
+    from src.network import NetworkErrorCode
+    from src.database import get_contact_by_id # For Pretty Logging
+
     log_info(handle.logger_handle, "BeaconLoop", "Monitoring loop started.")
     
+    # Load last known timestamp from disk
     _load_state(handle)
     
-    # PHASE 1: Initial catchup using PEEK
+    # =========================================================================
+    # PHASE 1: INITIAL CATCHUP (Using PEEK)
+    # =========================================================================
+    # Hum PEEK use karte hain taaki purane (lekin un-downloaded) mails ko jaldi utha sakein.
     log_info(handle.logger_handle, "BeaconLoop", "Phase 1: Catching up with new mail...")
     catchup_complete = False
     catchup_attempts = 0
     max_catchup_attempts = 5
     
-    while not catchup_complete and catchup_attempts < max_catchup_attempts:
+    while not catchup_complete and catchup_attempts < max_catchup_attempts and not handle.shutdown_event.is_set():
         catchup_attempts += 1
+        # do_peek ab numeric SN resolution handle karta hai
         err, tells = do_peek(handle, since_timestamp=handle.last_tell_timestamp)
         
         if err == NetworkErrorCode.SUCCESS:
             if tells:
                 log_info(handle.logger_handle, "BeaconLoop", 
-                        f"Catchup attempt {catchup_attempts}: {len(tells)} notifications")
+                         f"Catchup attempt {catchup_attempts}: Received {len(tells)} notifications")
                 
+                # Pretty Logging for Catchup Notifications
+                db_h = getattr(handle, 'db_handle', None)
+                for t in tells:
+                    if db_h:
+                        err_db, s_info = get_contact_by_id(db_h, t.sender_sn)
+                        sender_display = s_info['auto_address'] if err_db == 0 else f"Unknown ({t.sender_sn})"
+                    else:
+                        sender_display = f"SN {t.sender_sn}"
+                    log_info(handle.logger_handle, "BeaconLoop", f"✓ Pending mail from: {sender_display}")
+
+                # Advance timestamp to the latest notification
                 latest_ts = max(t.timestamp for t in tells)
                 
                 if latest_ts > handle.last_tell_timestamp:
                     handle.last_tell_timestamp = latest_ts
                     _save_state(handle)
                 else:
-                    import time
+                    # Force advance if notifications are old to prevent getting stuck
                     current_time = int(time.time())
                     log_warning(handle.logger_handle, "BeaconLoop",
-                               f"Catchup: Notifications are old. Forcing timestamp to {current_time}")
+                                f"Catchup: Old notifications detected. Forcing timestamp to {current_time}")
                     handle.last_tell_timestamp = current_time
                     _save_state(handle)
                 
+                # Process notifications via callback
                 if handle.on_mail_received:
                     try:
                         handle.on_mail_received(tells)
                     except Exception as e:
                         log_error(handle.logger_handle, "BeaconLoop", f"Catchup callback failed: {e}")
                 
+                # Continue catchup until tells are exhausted
                 continue
             else:
                 log_info(handle.logger_handle, "BeaconLoop", "Catchup complete.")
@@ -429,7 +455,10 @@ def _monitor_loop(handle: BeaconHandle):
             log_warning(handle.logger_handle, "BeaconLoop", f"Catchup failed: {err.name}")
             handle.shutdown_event.wait(timeout=2.0)
     
-    # PHASE 2: Long-polling with PING
+    # =========================================================================
+    # PHASE 2: ACTIVE LONG-POLLING (Using PING)
+    # =========================================================================
+    # Hum PING use karte hain taaki naye mail aate hi notification mil jaye.
     log_info(handle.logger_handle, "BeaconLoop", "Phase 2: Active long-poll monitoring...")
     
     retry_delay_sec = 1.0
@@ -437,85 +466,100 @@ def _monitor_loop(handle: BeaconHandle):
 
     while not handle.shutdown_event.is_set():
         try:
+            # _do_one_ping_cycle ab numeric SN resolution handle karta hai
             err, tells = _do_one_ping_cycle(handle)
             
             if handle.shutdown_event.is_set(): 
                 break
 
             if err == NetworkErrorCode.SUCCESS:
-                retry_delay_sec = 1.0  
+                retry_delay_sec = 1.0 # Reset backoff on success
                 
                 if tells:
                     log_info(handle.logger_handle, "BeaconLoop", f"Received {len(tells)} notifications.")
                     
-                    import time
+                    # --- NEW: PRETTY LOGGING ---
+                    db_h = getattr(handle, 'db_handle', None)
+                    for t in tells:
+                        if db_h:
+                            err_db, s_info = get_contact_by_id(db_h, t.sender_sn)
+                            sender_display = s_info['auto_address'] if err_db == 0 else f"Unknown ({t.sender_sn})"
+                        else:
+                            sender_display = f"SN {t.sender_sn}"
+                        log_info(handle.logger_handle, "BeaconLoop", f"✓ New mail from: {sender_display}")
+
                     latest_ts = max(t.timestamp for t in tells)
                     
-                    # Determine if we should wait (if mail is old)
-                    should_cooldown = latest_ts <= handle.last_tell_timestamp
+                    # Determine if mail is actually new or a re-send
+                    is_old_mail = latest_ts <= handle.last_tell_timestamp
                     
-                    if not should_cooldown:
-                        # New mail - advance timestamp
+                    if not is_old_mail:
+                        # Advance state
                         handle.last_tell_timestamp = latest_ts
                         _save_state(handle)
                     else:
-                        # Old mail - force skip
+                        # Old mail detected: Advance timestamp to NOW to clear server queue
                         current_time = int(time.time())
                         log_warning(handle.logger_handle, "BeaconLoop",
-                                   f"Phase 2: Old mail detected. Forcing timestamp to {current_time}")
+                                    f"Phase 2: Old mail detected. Forcing timestamp to {current_time}")
                         handle.last_tell_timestamp = current_time
                         _save_state(handle)
                         
-                        # Cooldown pause to prevent spamming
+                        # Cooldown pause to prevent tight-looping on the same mail
                         handle.shutdown_event.wait(timeout=5.0)
 
-                    # FIXED: Call the callback synchronously. 
-                    # This ensures the monitor thread stays alive until processing is done,
-                    # preventing the "Closed Database" error during shutdown.
+                    # SYNC CALLBACK: Thread stays alive until processing completes
                     if handle.on_mail_received and not handle.shutdown_event.is_set():
                         try:
                             handle.on_mail_received(tells)
                         except Exception as e:
                             log_error(handle.logger_handle, "BeaconLoop", f"Mail callback failed: {e}")
                 else:
-                    log_debug(handle.logger_handle, "BeaconLoop", "Long-poll timeout - no mail")
+                    log_debug(handle.logger_handle, "BeaconLoop", "Long-poll timeout - no new mail.")
                 
             elif err == NetworkErrorCode.ERR_INVALID_AN:
-                log_error(handle.logger_handle, "BeaconLoop", "Stopping monitor - healing required")
+                # Critical Error: Authentication failed (Status 200)
+                log_error(handle.logger_handle, "BeaconLoop", "Stopping monitor - Identity healing required (Fracked).")
                 break
                 
             else:
-                log_warning(handle.logger_handle, "BeaconLoop", f"Long-poll failed: {err.name}")
+                # Network or Server error: Apply exponential backoff
+                log_warning(handle.logger_handle, "BeaconLoop", f"Long-poll failed: {err.name}. Retrying in {retry_delay_sec}s")
                 handle.shutdown_event.wait(timeout=retry_delay_sec)
                 retry_delay_sec = min(retry_delay_sec * 2, max_retry_delay_sec)
                 
         except Exception as e:
-            log_error(handle.logger_handle, "BeaconLoop", f"Unhandled exception: {e}")
+            log_error(handle.logger_handle, "BeaconLoop", f"Unhandled monitor exception: {e}")
             handle.shutdown_event.wait(timeout=retry_delay_sec)
+
+    log_info(handle.logger_handle, "BeaconLoop", "Monitoring loop stopped.")
 def _do_one_ping_cycle(handle: BeaconHandle) -> Tuple[NetworkErrorCode, List[TellNotification]]:
     """
     Executes a single, complete long-poll PING cycle.
-    FIXED: Includes Status 0 (NO_ERROR) as a valid success condition.
+    FIXED: Resolves Identity SN to integer to prevent protocol mismatches.
     """
+    from src.protocol import custom_sn_to_int
+    numeric_sn = custom_sn_to_int(handle.identity.serial_number)
+    
     conn = None
     try:
-        # 1. Connect to the beacon server
+        # Connect using strict integer SN
         err, conn = network.connect_to_server(
             server_info=handle.beacon_server_info,
             encryption_key=handle.encryption_key,
             denomination=handle.identity.denomination,
-            serial_number=handle.identity.serial_number,
+            serial_number=numeric_sn,
             config=handle.network_config,
             logger_handle=handle.logger_handle
         )
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
-        # 2. Build the COMPLETE PING request
+        # Build request with strict integer SN
         err_proto, ping_req, challenge, nonce = protocol.build_complete_ping_request(
             raida_id=handle.beacon_server_info.index,
             denomination=handle.identity.denomination,
-            serial_number=handle.identity.serial_number,
+            serial_number=numeric_sn,
             device_id=handle.device_id,
             an=handle.encryption_key,
             encryption_type=0, 
@@ -525,7 +569,6 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> Tuple[NetworkErrorCode, List[Tel
         if err_proto != protocol.ProtocolErrorCode.SUCCESS:
             return NetworkErrorCode.ERR_INVALID_PARAM, []
 
-        # 3. Send via raw interface
         err, resp_header, resp_body = network.send_raw_request(
             connection=conn,
             raw_packet=ping_req,
@@ -537,18 +580,15 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> Tuple[NetworkErrorCode, List[Tel
         if err != NetworkErrorCode.SUCCESS:
             return err, []
 
-        # 4. Handle server status codes - FIXED: Added '0' and StatusCode.STATUS_SUCCESS
-        # Success statuses for new mail or quiet success
+        # Status 250 (You got mail), Status 214 (Success), and Status 0
         if resp_header.status in [StatusCode.STATUS_YOU_GOT_MAIL, StatusCode.STATUS_SUCCESS, 0]:
-            pass # Continue to parse the body
+            pass 
             
-        # Normal "no mail" response for long-poll
         elif resp_header.status == StatusCode.ERROR_UDP_FRAME_TIMEOUT: 
             return NetworkErrorCode.SUCCESS, []
             
-        # Handle Invalid AN (Error 200)
         elif resp_header.status == 200:
-            log_error(handle.logger_handle, "Beacon", f"RAIDA {handle.beacon_server_info.index} reported INVALID AN (200).")
+            log_error(handle.logger_handle, "Beacon", f"RAIDA reported INVALID AN (200) for SN {numeric_sn}.")
             if hasattr(handle, 'on_an_invalid') and handle.on_an_invalid:
                 handle.on_an_invalid(handle.identity)
             return NetworkErrorCode.ERR_INVALID_AN, []
@@ -557,7 +597,6 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> Tuple[NetworkErrorCode, List[Tel
             log_warning(handle.logger_handle, "Beacon", f"Unexpected status: {resp_header.status}")
             return NetworkErrorCode.ERR_SERVER_ERROR, []
 
-        # 5. Parse the response body
         parse_err, tells = protocol.parse_tell_response(resp_body, handle.logger_handle)
         if parse_err != protocol.ProtocolErrorCode.SUCCESS:
             return NetworkErrorCode.ERR_INVALID_RESPONSE, []

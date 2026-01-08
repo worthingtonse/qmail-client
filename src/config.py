@@ -94,6 +94,9 @@ REQUIRED_SECTIONS = ["paths", "identity", "encryption", "beacon", "raid",
 MIN_QMAIL_SERVERS = 5
 MIN_RAIDA_SERVERS = 25
 
+# Version aur URL define karo
+CLIENT_VERSION = "2026-01-07"  # Aapka current hardcoded version
+VERSION_URL = "https://raida11.cloudcoin.global/service/qmail_client_version"
 
 # ============================================================================
 # LOAD CONFIG

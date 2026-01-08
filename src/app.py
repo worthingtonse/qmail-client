@@ -20,7 +20,7 @@ from logger import init_logger, close_logger, log_info, log_error, log_warning, 
 from api_server import APIServer
 from api_handlers import register_all_routes
 from database import (
-    init_database, close_database, get_all_servers,
+    get_contact_by_id, init_database, close_database, get_all_servers,
     is_guid_in_database, store_received_tell, store_received_stripe,
     DatabaseErrorCode
 )
@@ -1027,7 +1027,9 @@ def main():
 
     # Start beacon monitor if initialized
     if app_context.beacon_handle:
+        app_context.beacon_handle.db_handle = app_context.db_handle
         # Initialize server cache for IP lookups (can be refreshed via app_context.refresh_server_cache())
+        
         app_context.refresh_server_cache()
 
         # Callback to update beacon handle after restart
@@ -1107,6 +1109,14 @@ def main():
             new_locker_found = False
 
             for notification in notifications:
+
+
+                sender_sn = getattr(notification, 'sender_sn', 0)
+                err_db, s_info = get_contact_by_id(app_context.db_handle, sender_sn)
+                
+                # Agar DB mein mila toh Pretty Address dikhao, warna sirf SN
+                sender_display = s_info['auto_address'] if err_db == 0 else f"SN {sender_sn}"
+                log_info(logger, "BeaconLoop", f"✓ New mail from: {sender_display}")
                 try:
                     # 1. EXTRACT & VALIDATE GUID
                     if not hasattr(notification, 'file_guid') or not notification.file_guid:

@@ -718,34 +718,45 @@ def validate_request(
 ) -> Tuple[SendEmailErrorCode, str]:
     """
     Validate a send email request.
+    UPDATED: Supports Pretty Email Address format and maintains strict security.
 
     Checks:
-    - Email file is provided
-    - At least one recipient exists
-    - All attachment paths exist
-    - Attachment count is within limits
-
-    Args:
-        request: SendEmailRequest to validate
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (SendEmailErrorCode, error message if any)
+    - Email file/content is provided
+    - At least one recipient exists and matches allowed formats
+    - All attachment paths are safe and exist
+    - Attachment count and sizes are within limits
     """
-    # Check email file
+    from src.logger import log_error, log_debug
+    from src.email_sender import SENDER_CONTEXT, MAX_ATTACHMENTS, MAX_FILE_SIZE, _validate_file_path
+    import os
+
+    # 1. CHECK EMAIL CONTENT
+    # Body ya file bytes ka hona lazmi hai
     if not request.email_file or len(request.email_file) == 0:
         log_error(logger_handle, SENDER_CONTEXT, "Validation failed", "No email file provided")
-        return SendEmailErrorCode.ERR_NO_EMAIL_FILE, "Email file is required"
+        return SendEmailErrorCode.ERR_NO_EMAIL_FILE, "Email content is required"
 
-    # Check recipients
+    # 2. CHECK RECIPIENTS
     all_recipients = (request.to_recipients or []) + \
                     (request.cc_recipients or []) + \
                     (request.bcc_recipients or [])
+    
     if not all_recipients:
         log_error(logger_handle, SENDER_CONTEXT, "Validation failed", "No recipients provided")
         return SendEmailErrorCode.ERR_NO_RECIPIENTS, "At least one recipient is required"
 
-    # Check attachment count
+    # PRETTY FORMAT VALIDATION: Check if address is technical OR pretty
+    for addr in all_recipients:
+        addr_str = str(addr).strip()
+        # Address ya toh technical hona chahiye (0006.D.SN) ya Pretty (#Base32.Class)
+        is_pretty = '#' in addr_str and '.' in addr_str
+        is_technical = addr_str.startswith('0006.')
+        
+        if not (is_pretty or is_technical):
+            log_error(logger_handle, SENDER_CONTEXT, "Validation failed", f"Invalid recipient format: {addr_str}")
+            return SendEmailErrorCode.ERR_INVALID_PARAM, f"Invalid recipient address: {addr_str}"
+
+    # 3. CHECK ATTACHMENT COUNT
     attachment_count = len(request.attachment_paths) if request.attachment_paths else 0
     if attachment_count > MAX_ATTACHMENTS:
         log_error(logger_handle, SENDER_CONTEXT, "Validation failed",
@@ -753,31 +764,35 @@ def validate_request(
         return SendEmailErrorCode.ERR_TOO_MANY_ATTACHMENTS, \
                f"Maximum {MAX_ATTACHMENTS} attachments allowed"
 
-    # Check attachment files exist and are safe (path traversal protection)
+    # 4. CHECK ATTACHMENT FILES (Security & Size)
     for path in (request.attachment_paths or []):
-        # Security: Validate path to prevent path traversal attacks
+        # SECURITY: Validate path to prevent path traversal attacks (../etc/passwd)
         is_valid, result_or_error = _validate_file_path(path, logger_handle)
+        
         if not is_valid:
             log_error(logger_handle, SENDER_CONTEXT, "Validation failed",
                       f"Attachment path validation failed: {result_or_error}")
             return SendEmailErrorCode.ERR_ATTACHMENT_NOT_FOUND, \
                    f"Attachment file error: {result_or_error}"
 
-        # Use the validated real path for size check
+        # validated real path use karein size check ke liye
         real_path = result_or_error
-        size = os.path.getsize(real_path)
-        if size > MAX_FILE_SIZE:
-            log_error(logger_handle, SENDER_CONTEXT, "Validation failed",
-                      f"Attachment too large: {path} ({size} bytes)")
-            return SendEmailErrorCode.ERR_ATTACHMENT_NOT_FOUND, \
-                   f"Attachment too large: {path}"
+        try:
+            size = os.path.getsize(real_path)
+            if size > MAX_FILE_SIZE:
+                log_error(logger_handle, SENDER_CONTEXT, "Validation failed",
+                          f"Attachment too large: {path} ({size} bytes)")
+                return SendEmailErrorCode.ERR_ATTACHMENT_NOT_FOUND, \
+                       f"Attachment too large: {path}"
+        except OSError as e:
+            log_error(logger_handle, SENDER_CONTEXT, "Validation failed", f"Could not access file: {path}")
+            return SendEmailErrorCode.ERR_ATTACHMENT_NOT_FOUND, f"File access error: {path}"
 
     log_debug(logger_handle, SENDER_CONTEXT,
               f"Request validated: {len(all_recipients)} recipients, "
               f"{attachment_count} attachments")
 
     return SendEmailErrorCode.SUCCESS, ""
-
 
 # ============================================================================
 # FILE PROCESSING FUNCTIONS
@@ -1850,37 +1865,56 @@ def process_email_package(
     logger_handle: Optional[object] = None
 ) -> Tuple[SendEmailErrorCode, Optional[SendEmailResult]]:
     """
-    Orchestrate full upload. Plaintext transport, 8-month server grace period.
-    NOTIFIES BEACON (RAIDA 11) ONLY per Phase I requirement.
-    Uses send_raw_request to solve the Double Header bug.
+    Orchestrate full upload with Pretty Address resolution.
+    FIXED: Resolves recipients to numeric IDs for DB and technical addresses for RAIDA.
     """
-    from network import connect_to_server, disconnect, send_raw_request
-    from config import get_raida_server_config
+    import uuid, os, time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from src.network import connect_to_server, disconnect, send_raw_request
+    from src.config import get_raida_server_config
+    from src.protocol import build_complete_tell_request, weeks_to_duration_code, TELL_TYPE_QMAIL
+    from src.database import get_user_by_address, store_email, DatabaseErrorCode
+    from src.logger import log_info, log_error
 
-    log_info(logger_handle, "Sender", "Starting mail upload process.")
+    log_info(logger_handle, "Sender", "Starting Pretty Email upload process.")
     file_group_guid = uuid.uuid4().bytes
 
-    # 1. Cost & Locker
+    # --- 1. RECIPIENT RESOLUTION (Pretty -> Technical & Numeric) ---
+    recipient_sns = []
+    tech_addresses = []
+    # Hum har Pretty Address ko resolve karenge taaki protocol aur DB ko sahi data mile
+    for addr in package.recipients:
+        err, user_info = get_user_by_address(db_handle, addr)
+        if err == DatabaseErrorCode.SUCCESS and user_info:
+            # DB Junction table ke liye numeric SN (e.g. 2841)
+            recipient_sns.append(user_info['SerialNumber'])
+            # RAIDA Tell packet ke liye technical address (e.g. 0006.4.2841)
+            tech_addresses.append(f"0006.{user_info['Denomination']}.{user_info['SerialNumber']}")
+        else:
+            # Agar DB mein nahi hai, toh raw string use karein (direct address case)
+            tech_addresses.append(addr)
+            # Try to extract numeric SN for DB mapping
+            from src.protocol import custom_sn_to_int
+            recipient_sns.append(custom_sn_to_int(addr))
+
+    # --- 2. COST & LOCKER ---
     total_size = len(package.email_file) + sum(os.path.getsize(p) for p in package.attachment_paths)
-    cost = calculate_storage_cost(total_size, storage_weeks, len(package.recipients))
+    cost = calculate_storage_cost(total_size, storage_weeks, len(recipient_sns))
     err, locker_code = request_locker_code(cost, db_handle, logger_handle)
     if err != ErrorCode.SUCCESS: 
         return SendEmailErrorCode.ERR_PAYMENT_FAILED, None
 
-    # 2. Locker Sanitization (AS8D-HJL -> 8 Bytes Null-Padded)
-   # In process_email_package or any locker handler:
+    # Locker Sanitization (8 Bytes Null-Padded)
     if isinstance(locker_code, str):
-    # If the user provided an 8-char code (like ASB-JH7J), use it as is
         if len(locker_code) == 8:
             locker_code = locker_code.encode('ascii')
         else:
-        # Fallback for other formats: strip hyphens and pad with nulls to 8 bytes
             clean_code = locker_code.replace('-', '').strip().upper()
             locker_code = clean_code.encode('ascii').ljust(8, b'\x00')
 
-    # 3. Preparation (Plaintext / Type 0)
+    # --- 3. PREPARATION ---
     files_to_upload = []
-    # Body index 0
+    # Body
     err, body_info = prepare_file_for_upload(package.email_file, "body.qmail", 0, bytes(16), logger_handle)
     if err == ErrorCode.SUCCESS: files_to_upload.append(body_info)
 
@@ -1890,13 +1924,12 @@ def process_email_package(
             err, att_info = prepare_file_for_upload(f.read(), os.path.basename(path), i+1, bytes(16), logger_handle)
             if err == ErrorCode.SUCCESS: files_to_upload.append(att_info)
 
-    # 4. Parallel Upload (With Adaptive Idempotency)
+    # --- 4. PARALLEL UPLOAD ---
     duration_code = weeks_to_duration_code(storage_weeks)
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = []
         for info in files_to_upload:
             for s_idx, s_data in enumerate(info.stripes + [info.parity_stripe]):
-                # Map stripe index to a server (0-4)
                 srv = config.qmail_servers[s_idx]
                 futures.append(executor.submit(
                     upload_stripe_to_server, 
@@ -1906,21 +1939,18 @@ def process_email_package(
                 ))
         for f in as_completed(futures): f.result()
 
-    # 5. BEACON NOTIFICATION (RAIDA 11 ONLY - Using Raw Send)
+    # --- 5. BEACON NOTIFICATION (Using Technical Addresses) ---
     beacon_id = 11
-    tell_success = False
     try:
         timestamp = int(time.time())
-        # Determine AN slice for RAIDA 11 (Format 9 Offset: 39)
-        if hasattr(identity, 'authenticity_number') and len(identity.authenticity_number) == 800:
-            start = beacon_id * 32
-            target_an = bytes.fromhex(identity.authenticity_number[start : start+32])
+        # AN slicing remains the same (Format 9 support)
+        if hasattr(identity, 'authenticity_number') and len(identity.authenticity_number) >= 400:
+            start = beacon_id * 16
+            target_an = identity.authenticity_number[start : start+16]
         else:
             target_an = bytes(16)
 
-        # build_complete_tell_request returns (ProtocolErrorCode, packet, challenge)
-       # Update within process_email_package (around line 915)
-        # UPDATED UNPACKING: Added 'nonce'
+        # UPDATED: Using tech_addresses (0006.DN.SN) for the RAIDA network packet
         err_proto, tell_req, challenge, nonce = build_complete_tell_request(
             raida_id=beacon_id,
             denomination=identity.denomination,
@@ -1931,7 +1961,7 @@ def process_email_package(
             locker_code=locker_code,
             timestamp=timestamp,
             tell_type=TELL_TYPE_QMAIL,
-            recipients=package.recipients,
+            recipients=tech_addresses, # <--- Correct technical format
             servers=[] 
         )
         
@@ -1939,17 +1969,26 @@ def process_email_package(
         if srv_cfg:
             conn_err, conn = connect_to_server(srv_cfg)
             if conn_err == 0:
-                # FIXED: send_raw_request avoids the Double Header bug
                 net_err, resp, _ = send_raw_request(conn, tell_req, logger_handle=logger_handle)
                 if net_err == 0 and resp.status == 250:
-                    tell_success = True
                     log_info(logger_handle, "Sender", f"Tell accepted by Beacon (RAIDA {beacon_id})")
                 disconnect(conn)
     except Exception as e:
         log_error(logger_handle, "Sender", f"Tell failed: {e}")
 
-    # 6. Local Storage (Sender Copy)
-    store_sent_email(db_handle, file_group_guid.hex(), locker_code, package.subject)
+    # --- 6. LOCAL STORAGE (Using Fixed Database function) ---
+    # Save a copy in the 'sent' folder with properly linked Serial Numbers
+    sent_email_data = {
+        'email_id': file_group_guid,
+        'subject': package.subject,
+        'body': package.searchable_text, # Or full body
+        'sender_sn': identity.serial_number,
+        'recipient_sns': recipient_sns,
+        'folder': 'sent',
+        'is_read': 1,
+        'sent_timestamp': int(time.time())
+    }
+    store_email(db_handle, sent_email_data)
 
     return SendEmailErrorCode.SUCCESS, SendEmailResult(file_group_guid, locker_code)
 

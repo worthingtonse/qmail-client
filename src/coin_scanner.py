@@ -394,31 +394,22 @@ def load_coin_metadata(filepath: str) -> Optional[Dict]:
     except Exception:
         return None
 
-def find_identity_coin(bank_path: str, target_sn: int) -> Optional[Dict]:
+def find_identity_coin(wallet_path: str, target_sn: Optional[int] = None) -> Optional[dict]:
     """
-    Find identity coin by serial number via content scanning.
-    Resilient to file renaming - scans all .bin files and reads their metadata.
-    
-    Args:
-        bank_path: Path to Bank folder
-        target_sn: Target serial number to find
-        
-    Returns:
-        Coin metadata dict or None if not found
+    Scans wallet for an identity coin. Comparison is integer-to-integer.
     """
-    if not os.path.exists(bank_path):
-        return None
+    import os
+    from src.coin_scanner import load_coin_metadata
     
-    for filename in os.listdir(bank_path):
-        if not filename.endswith('.bin'):
-            continue
-        
-        filepath = os.path.join(bank_path, filename)
-        coin = load_coin_metadata(filepath)
-        
-        if coin and coin['serial_number'] == target_sn:
-            return coin
+    if not os.path.exists(wallet_path): return None
     
+    for filename in os.listdir(wallet_path):
+        if not filename.endswith('.bin'): continue
+        meta = load_coin_metadata(os.path.join(wallet_path, filename))
+        if meta:
+            # If target_sn is None, take the first coin, else match SN (integer)
+            if target_sn is None or meta['serial_number'] == int(target_sn):
+                return meta
     return None
 
 

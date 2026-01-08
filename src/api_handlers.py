@@ -62,7 +62,7 @@ from database import (
 )
 
 # Data sync imports
-from data_sync import sync_all, SyncErrorCode
+from data_sync import sync_all, SyncErrorCode, check_client_version
 
 # Wallet structure imports
 from wallet_structure import initialize_wallet_structure
@@ -107,13 +107,38 @@ def handle_health(request_handler, context):
     request_handler.send_json_response(200, response)
 
 
+def handle_version_check(request_handler, request_context):
+     """
+    GET /api/admin/version-check - Check if a new client version is available.
+    """
+    # Hardcoded local version for comparison
+     LOCAL_VERSION = "2026-01-05"
+    
+     app_ctx = request_handler.server_instance.app_context
+     logger = app_ctx.logger
+    
+     try:
+        # data_sync.py wala helper call karo
+        update_needed, latest = check_client_version(logger)
+        
+        return request_handler.send_json_response(200, {
+            "status": "success",
+            "current_version": LOCAL_VERSION,
+            "latest_version": latest,
+            "update_available": update_needed,
+            "message": "Mandatory update available!" if update_needed else "Up to date"
+        })
+     except Exception as e:
+        return request_handler.send_json_response(500, {"error": str(e)})
+
+
 def handle_ping(request_handler, context):
     """
     GET /api/qmail/ping - Beacon check for new mail.
-    FIXED: Uses correct AN slice for RAIDA 11 and triggers healing on failure.
+    FIXED: Decodes SN to integer before building protocol request to ensure RAIDA auth passes.
     """
     import asyncio
-    from protocol import build_complete_ping_request, parse_tell_response
+    from protocol import build_complete_ping_request, parse_tell_response, custom_sn_to_int # <--- Added custom_sn_to_int
     from network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
     from network import ServerInfo
     from logger import log_error
@@ -126,22 +151,20 @@ def handle_ping(request_handler, context):
     if not identity:
         return request_handler.send_json_response(401, {"error": "no_identity_found"})
 
-    # Target RAIDA 11 as the beacon server
+    # --- FIXED: Decode Identity SN to integer for the binary packet ---
+    numeric_sn = custom_sn_to_int(identity.serial_number) 
     target_raida_index = 11
 
     try:
         an_block = _get_an_for_download(app_ctx)
         
-        # FIXED: Slice the correct 16 bytes for the targeted RAIDA (index 11)
         if len(an_block) >= 400:
             start = target_raida_index * 16
             an_bytes = an_block[start : start + 16]
         else:
-            # If we only have 16 bytes (fallback from beacon handle), use them directly
             an_bytes = an_block[:16]
             
     except Exception as e:
-        # Trigger Reactive Healing if discovery fails locally
         from src.app import move_identity_to_fracked
         log_error(app_ctx.logger, "API", f"Identity AN load failure: {e}. Moving to Fracked.")
         move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
@@ -153,7 +176,6 @@ def handle_ping(request_handler, context):
         })
 
     async def perform_ping_task():
-        # 1. Resolve RAIDA 11 Info
         raida_servers = getattr(app_ctx.config, 'raida_servers', [])
         server_entry = next(
             (s for s in raida_servers if getattr(s, 'index', -1) == target_raida_index), None)
@@ -168,23 +190,21 @@ def handle_ping(request_handler, context):
             return {"status": "error", "message": "offline"}
 
         try:
-            # 2. Command 62 PING
+            # --- FIXED: Pass numeric_sn instead of identity.serial_number ---
             err_proto, req, _, _ = build_complete_ping_request(
-                target_raida_index, identity.denomination, identity.serial_number, 0, an_bytes, 0)
+                target_raida_index, identity.denomination, numeric_sn, 0, an_bytes, 0)
 
             net_err, resp_h, resp_b = await send_raw_request_async(conn, req)
 
             if net_err != NetworkErrorCode.SUCCESS:
                 return {"status": "error", "message": "net_failure"}
 
-            # Handle Fracked status (RAIDA reports invalid AN with Status 200)
             if resp_h.status == 200:
                 from src.app import move_identity_to_fracked
                 log_error(app_ctx.logger, "API", "RAIDA reported Invalid AN (200). Initiating healing.")
                 move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
                 return {"status": "healing", "message": "coin_fracked"}
 
-            # 3. Parse and Return
             err_parse, notifications = parse_tell_response(resp_b, app_ctx.logger)
             return {
                 "status": "ok",
@@ -206,122 +226,110 @@ def handle_ping(request_handler, context):
 def handle_mail_send(request_handler, context):
     """
     POST /api/mail/send - Send an email
-    FIXED: Uses standardized identity borrowing and triggers healing on Status 200.
+    RESOLVES: Pretty Addresses (Sean.Worthington@CEO#C23.Giga) to numeric IDs for binary protocol.
     """
     from src.email_sender import send_email_async, SendEmailErrorCode, validate_request
     from src.qmail_types import SendEmailRequest
     from src.task_manager import create_task, start_task, update_task_progress, complete_task, fail_task
     from src.logger import log_info, log_error
+    from src.database import get_user_by_address, DatabaseErrorCode
 
     app_ctx = request_handler.server_instance.app_context
     content_type = context.headers.get('Content-Type', '')
     email_data = context.json if context.json else {}
     request_obj = SendEmailRequest()
 
-    # --- Full Parsing Logic ---
+    # --- 1. FULL PARSING LOGIC (Multipart vs JSON) ---
     if 'multipart/form-data' in content_type.lower():
         form_data = email_data
         request_obj.email_file = form_data.get('email_file', b'')
         request_obj.searchable_text = form_data.get('searchable_text', '')
         request_obj.subject = form_data.get('subject', '')
-        request_obj.to_recipients = form_data.get('to', [])
+        raw_recipients = form_data.get('to', [])
         request_obj.attachment_paths = form_data.get('attachments', [])
     else:
         if not email_data.get("to") or not email_data.get("subject"):
-            request_handler.send_json_response(
-                400, {"error": "Missing 'to' or 'subject'", "status": "error"})
-            return
+            return request_handler.send_json_response(400, {"error": "Missing 'to' or 'subject'", "status": "error"})
+        
         body_text = email_data.get('body', '')
-        request_obj.email_file = body_text.encode(
-            'utf-8') if body_text else b''
+        request_obj.email_file = body_text.encode('utf-8') if body_text else b''
         request_obj.searchable_text = body_text
         request_obj.subject = email_data.get('subject', '')
-        to_list = email_data.get('to', [])
-        request_obj.to_recipients = to_list if isinstance(to_list, list) else [
-            to_list]
+        raw_recipients = email_data.get('to', [])
         request_obj.storage_weeks = int(email_data.get('storage_weeks', 8))
 
-    # --- Validation ---
+    # --- 2. PRETTY ADDRESS RESOLUTION ---
+    # Convert "Pretty Name" into actual QMail technical addresses for the protocol
+    if isinstance(raw_recipients, str): raw_recipients = [raw_recipients]
+    resolved_to = []
+    
+    for addr in raw_recipients:
+        # DB lookup for Sean.Worthington@CEO#C23.Giga
+        err, user_info = get_user_by_address(app_ctx.db_handle, addr)
+        if err == DatabaseErrorCode.SUCCESS and user_info:
+            # We store the user info; sender logic will extract SN/Denom later
+            resolved_to.append(user_info['auto_address'])
+        else:
+            resolved_to.append(addr) # Fallback to raw string
+    
+    request_obj.to_recipients = resolved_to
+
+    # --- 3. VALIDATION & IDENTITY ---
     err, err_msg = validate_request(request=request_obj)
     if err != SendEmailErrorCode.SUCCESS:
-        request_handler.send_json_response(
-            400, {"error": err_msg, "error_code": int(err), "status": "error"})
-        return
+        return request_handler.send_json_response(400, {"error": err_msg, "error_code": int(err), "status": "error"})
 
-    # --- Standardized Identity Borrowing ---
     identity = app_ctx.config.identity
     try:
-        # Returns full 400 bytes, handling 39/48 byte offsets
+        # Borrow full 400-byte AN for multi-stripe upload
         identity.authenticity_number = _get_an_for_download(app_ctx)
     except Exception as e:
         log_error(app_ctx.logger, "API", f"Failed to borrow identity AN: {e}")
-        request_handler.send_json_response(
-            403, {"error": "Identity coin missing or inaccessible", "status": "error"})
-        return
+        return request_handler.send_json_response(403, {"error": "Identity coin missing", "status": "error"})
 
-    # Task Registration
-    _, task_id = create_task(app_ctx.task_manager, "send", {
-                             "subject": request_obj.subject})
+    # --- 4. ASYNC TASK EXECUTION ---
+    _, task_id = create_task(app_ctx.task_manager, "send", {"subject": request_obj.subject})
     start_task(app_ctx.task_manager, task_id, "Initializing send process")
 
     def process_send():
         try:
-            from database import get_stripe_servers, get_parity_server, DatabaseErrorCode
-
+            from database import get_stripe_servers, get_parity_server
             err_stripe, stripe_servers = get_stripe_servers(app_ctx.db_handle)
             err_parity, parity_server = get_parity_server(app_ctx.db_handle)
 
             if err_stripe != DatabaseErrorCode.SUCCESS or not stripe_servers:
-                fail_task(app_ctx.task_manager, task_id,
-                          "No stripe servers available", "Server configuration error")
+                fail_task(app_ctx.task_manager, task_id, "No stripe servers available", "Server configuration error")
                 return
 
-            # Combine stripe servers + parity server
             all_servers = stripe_servers.copy()
-            if parity_server:
-                all_servers.append(parity_server)
+            if parity_server: all_servers.append(parity_server)
 
-            log_info(app_ctx.logger, "API",
-                     f"Using {len(all_servers)} servers from database")
+            log_info(app_ctx.logger, "API", f"Using {len(all_servers)} servers for upload")
 
             err, result = send_email_async(
-                request_obj, identity, app_ctx.db_handle, all_servers,  # ← Use database servers!
+                request_obj, identity, app_ctx.db_handle, all_servers,
                 app_ctx.thread_pool.executor,
-                lambda s: update_task_progress(
-                    app_ctx.task_manager, task_id, s.progress, s.message),
+                lambda s: update_task_progress(app_ctx.task_manager, task_id, s.progress, s.message),
                 app_ctx.logger,
                 cc_handle=app_ctx.cc_handle
             )
 
             if result.success:
-                complete_task(app_ctx.task_manager, task_id, {
-                              "success": True}, "Email sent successfully")
+                complete_task(app_ctx.task_manager, task_id, {"success": True}, "Email sent successfully")
             else:
-                # --- REACTIVE HEALING INTEGRATION ---
-                is_fracked = any(getattr(r, 'status', 0) ==
-                                 200 for r in (result.upload_results or []))
+                # Reactive Healing check
+                is_fracked = any(getattr(r, 'status', 0) == 200 for r in (result.upload_results or []))
                 if is_fracked:
                     from src.app import move_identity_to_fracked
-                    log_error(
-                        app_ctx.logger, "API", f"Reactive Healing triggered for SN {identity.serial_number}")
-                    move_identity_to_fracked(
-                        identity, app_ctx.beacon_handle, app_ctx.logger)
+                    move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
 
-                fail_task(app_ctx.task_manager, task_id,
-                          result.error_message, "Email sending failed")
+                fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
         except Exception as e:
             log_error(app_ctx.logger, "API", f"Background send crash: {e}")
-            fail_task(app_ctx.task_manager, task_id,
-                      str(e), "Internal thread crash")
+            fail_task(app_ctx.task_manager, task_id, str(e), "Internal thread crash")
 
     app_ctx.thread_pool.executor.submit(process_send)
-
-    request_handler.send_json_response(202, {
-        "status": "accepted",
-        "task_id": task_id,
-        "message": "Email queued for sending"
-    })
-
+    return request_handler.send_json_response(202, {"status": "accepted", "task_id": task_id, "message": "Email queued"})
 
 def handle_mail_download(request_handler, context):
     """
@@ -534,13 +542,17 @@ def handle_mail_payment_download(request_handler, context):
 def _get_an_for_download(app_ctx):
     """
     Get the full 400-byte Authenticity Number (AN) block.
-    FIXED: Corrected indentation to fix variable access error.
+    FIXED: Handles Base32 (C23) decoding before scanning for coins.
     """
     from src.logger import log_error, log_debug, log_warning
-    from coin_scanner import find_identity_coin
+    from src.coin_scanner import find_identity_coin
+    from src.protocol import custom_sn_to_int # <--- Zaroori import
     import os
 
     identity = app_ctx.config.identity
+    
+    # FIXED: Ensure SN is an integer (e.g., "C23" -> 2841) before using it in scanner
+    numeric_sn = custom_sn_to_int(identity.serial_number)
 
     # 1. Try loaded identity object
     if hasattr(identity, 'authenticity_number') and identity.authenticity_number:
@@ -549,13 +561,14 @@ def _get_an_for_download(app_ctx):
         if len(an_bytes) >= 400:
             return an_bytes[:400]
 
-    # 2. FIXED: Content-based search (indented correctly now)
+    # 2. Content-based search using the numeric_sn
     mailbox_bank = "Data/Wallets/Mailbox/Bank"
     default_bank = "Data/Wallets/Default/Bank"
     
-    identity_coin = find_identity_coin(mailbox_bank, identity.serial_number)
+    # Yahan numeric_sn pass kar rahe hain taaki coin_scanner crash na ho
+    identity_coin = find_identity_coin(mailbox_bank, numeric_sn)
     if not identity_coin:
-        identity_coin = find_identity_coin(default_bank, identity.serial_number)
+        identity_coin = find_identity_coin(default_bank, numeric_sn)
         
     if identity_coin:
         # Convert 25 ANs to 400-byte block
@@ -570,195 +583,136 @@ def _get_an_for_download(app_ctx):
         log_warning(app_ctx.logger, "API", "Using single-RAIDA AN for multi-stripe download.")
         return app_ctx.beacon_handle.encryption_key
 
-    raise ValueError(f"Full 400-byte AN not found for SN {identity.serial_number}")
+    raise ValueError(f"Full 400-byte AN not found for SN {numeric_sn} ({identity.serial_number})")
 
 def handle_mail_list(request_handler, context):
     """
-    GET /api/mail/list - List emails in a folder
-
-    Query parameters:
-        folder: inbox, sent, drafts, trash (default: inbox)
-        limit: max results (default: 50)
-        offset: pagination offset (default: 0)
-
-    Returns paginated list of email summaries from database.
+    GET /api/mail/list - List emails with Pretty Addresses
     """
-    # Get app context from server instance
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
-    # Parse query parameters
     folder = context.query_params.get('folder', ['inbox'])[0]
-
-    # Validate folder
-    valid_folders = ['inbox', 'sent', 'drafts', 'trash']
-    if folder not in valid_folders:
-        folder = 'inbox'
+    if folder not in ['inbox', 'sent', 'drafts', 'trash']: folder = 'inbox'
 
     try:
         limit = int(context.query_params.get('limit', ['50'])[0])
-        limit = max(1, min(limit, 100))  # Clamp to 1-100
-    except ValueError:
-        limit = 50
-
-    try:
         offset = int(context.query_params.get('offset', ['0'])[0])
-        offset = max(0, offset)
-    except ValueError:
-        offset = 0
+    except:
+        limit, offset = 50, 0
 
-    # Get emails from database
-    err, emails = list_emails(db_handle, folder=folder,
-                              limit=limit, offset=offset)
+    # list_emails ab join karke 'contact_pretty' la raha hai
+    from src.database import list_emails, get_email_count, DatabaseErrorCode
+    err, emails = list_emails(db_handle, folder=folder, limit=limit, offset=offset)
 
     if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
-            "error": "Database error",
-            "code": int(err),
-            "status": "error"
-        })
-        return
+        return request_handler.send_json_response(500, {"error": "Database error"})
 
-    # Get total count for pagination
-    _, total_count = get_email_count(db_handle, folder=folder)
-
-    # Convert EmailID bytes to hex strings for JSON serialization
+    # Hexify IDs for JSON
     for email in emails:
-        if email.get('EmailID') and isinstance(email['EmailID'], bytes):
+        if isinstance(email.get('EmailID'), bytes):
             email['EmailID'] = email['EmailID'].hex()
 
-    response = {
+    _, total_count = get_email_count(db_handle, folder=folder)
+
+    return request_handler.send_json_response(200, {
         "folder": folder,
-        "emails": emails,
-        "total_count": total_count,
-        "limit": limit,
-        "offset": offset
-    }
-    request_handler.send_json_response(200, response)
+        "emails": emails, # Includes contact_pretty (e.g. Sean.Worthington...)
+        "total_count": total_count
+    })
 
 # src/api_handlers.py
 
 def handle_create_mailbox(request_handler, request_context):
     """
     POST /api/mail/create-mailbox - Establish identity by staking a locker code.
-    
-    JSON Payload: { "locker_code": "FG9YUE3X" }
-    
-    Role: Takes a human locker code, downloads identity coins from RAIDA, 
-    saves them to Mailbox/Bank, and auto-configures the user's email address.
+    FIXED: Resolves Identity to Pretty Address format after staking.
     """
     from src.task_manager import stake_locker_identity
     from src.coin_scanner import find_identity_coin
     from src.logger import log_info, log_error
-    import re
-    import os
-    import toml
-    import json
+    import re, os, toml, json
 
     app_ctx = request_handler.server_instance.app_context
     logger = app_ctx.logger
 
-    # 1. PARSE JSON PAYLOAD
     try:
-        # request_context.body contains the raw bytes from the POST request
         data = json.loads(request_context.body.decode('utf-8'))
         raw_code = data.get('locker_code', '').strip()
     except Exception as e:
         log_error(logger, "CreateMailbox", f"Failed to parse JSON body: {e}")
-        return request_handler.send_json_response(400, {
-            "error": "Invalid JSON payload",
-            "status": "error"
-        })
+        return request_handler.send_json_response(400, {"error": "Invalid JSON payload"})
 
-    # 2. CLEAN AND VALIDATE LOCKER CODE
-    # Strip dashes or underscores and ensure it is 8 alphanumeric characters
     locker_code = raw_code.replace('-', '').replace('_', '').upper()
-    
     if len(locker_code) != 8 or not re.match(r'^[A-Z0-9]{8}$', locker_code):
-        return request_handler.send_json_response(400, {
-            "error": "Invalid locker code format",
-            "details": f"Expected 8 alphanumeric characters, got '{locker_code}'",
-            "status": "error"
-        })
+        return request_handler.send_json_response(400, {"error": "Invalid locker code format"})
 
     try:
-        # 3. EXECUTE STAKING (Targeting Mailbox Wallet)
+        # 1. EXECUTE STAKING
         log_info(logger, "CreateMailbox", f"Establishing identity from code: {locker_code}")
-        
-        # This function handles derived keys, Command 91, and saving to Data/Wallets/Mailbox/Bank
         success = stake_locker_identity(
             locker_code_bytes=locker_code.encode('ascii'),
             app_context=app_ctx,
-            target_wallet="Mailbox",  # This ensures it goes to the Mailbox folder
+            target_wallet="Mailbox",
             logger=logger
         )
 
         if not success:
-            return request_handler.send_json_response(404, {
-                "error": "Locker is empty or consensus failed",
-                "details": "RAIDA servers did not return any coins for this code.",
-                "status": "error"
-            })
+            return request_handler.send_json_response(404, {"error": "Locker is empty or consensus failed"})
 
-        # 4. DISCOVER THE NEW IDENTITY COIN
-        # Scan the Mailbox/Bank to find the coin that was just created/saved
+        # 2. DISCOVER COIN & NUMERIC DATA
         mailbox_bank = "Data/Wallets/Mailbox/Bank"
-        identity_coin = find_identity_coin(mailbox_bank, None) # None finds the first available coin
+        identity_coin = find_identity_coin(mailbox_bank, None)
 
         if not identity_coin:
-            return request_handler.send_json_response(500, {
-                "error": "Identity staked successfully but coin file not found on disk.",
-                "status": "error"
-            })
+            return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
 
-        sn = identity_coin['sn']
-        dn = identity_coin['dn']
-        email_address = f"0006.{dn}.{sn}"
+        sn = int(identity_coin['sn'])
+        dn = int(identity_coin['dn']) # Offset 34 logic
 
-        # 5. AUTO-UPDATE CONFIG FILE (qmail.toml)
-        # This allows the app to know which coin to use for the Beacon on next start
+        # 3. PRETTY IDENTITY RESOLUTION (Lookup in Directory)
+        # Hum database mein is SerialNumber ko dhoondenge jo sync se aaya hai
+        from src.database import execute_query
+        err, rows = execute_query(app_ctx.db_handle, "SELECT auto_address FROM Users WHERE SerialNumber = ?", (sn,))
+        
+        if err == 0 and rows:
+            # Format: Sean.Worthington@CEO#C23.Giga (Stored in auto_address)
+            email_address = rows[0]['auto_address']
+        else:
+            # Fallback agar sync abhi nahi hua: standard format
+            email_address = f"0006.{dn}.{sn}"
+
+        # 4. AUTO-UPDATE CONFIG FILE
         config_path = "config/qmail.toml"
         try:
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    config_data = toml.load(f)
-            else:
-                config_data = {}
-
-            if 'identity' not in config_data:
-                config_data['identity'] = {}
+            config_data = toml.load(config_path) if os.path.exists(config_path) else {}
+            if 'identity' not in config_data: config_data['identity'] = {}
 
             config_data['identity']['serial_number'] = sn
             config_data['identity']['denomination'] = dn
+            config_data['identity']['email_address'] = email_address # Save Pretty Address
 
-            with open(config_path, 'w') as f:
-                toml.dump(config_data, f)
+            with open(config_path, 'w') as f: toml.dump(config_data, f)
             
-            # Update memory context immediately so the Beacon can find it without a restart
             app_ctx.config.identity.serial_number = sn
             app_ctx.config.identity.denomination = dn
+            app_ctx.config.identity.email_address = email_address
             
-            log_info(logger, "CreateMailbox", f"✓ Config updated for identity {email_address}")
+            log_info(logger, "CreateMailbox", f"✓ Config updated for pretty identity: {email_address}")
         except Exception as e:
             log_error(logger, "CreateMailbox", f"Failed to auto-update qmail.toml: {e}")
 
-        # 6. RETURN SUCCESS
-        # The frontend will receive the email address and serial number to show the user
         return request_handler.send_json_response(200, {
             "status": "success",
             "message": "Mailbox established successfully.",
             "email_address": email_address,
             "serial_number": sn,
-            "wallet": "Mailbox"
+            "denomination": dn
         })
 
     except Exception as e:
         log_error(logger, "CreateMailbox", f"Staking process crashed: {e}")
-        return request_handler.send_json_response(500, {
-            "error": "Internal server error during staking",
-            "details": str(e),
-            "status": "error"
-        })
+        return request_handler.send_json_response(500, {"error": str(e)})
 # ============================================================================
 # DATA ENDPOINTS
 # ============================================================================
@@ -766,156 +720,127 @@ def handle_create_mailbox(request_handler, request_context):
 
 def handle_get_contacts(request_handler, context):
     """
-    GET /api/data/contacts/popular - Get frequently contacted users
-
-    Query parameters:
-        limit: max results (default: 10)
-
-    Returns contacts sorted by contact_count descending.
+    GET /api/data/contacts - Get contacts with Pretty Addresses and filtering.
+    Supports query params: search, limit, page.
     """
-    # Get app context from server instance
+    from src.database import get_all_contacts, DatabaseErrorCode
+    
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
-    # Parse query parameters
+    # 1. PARSE QUERY PARAMETERS
     try:
-        limit = int(context.query_params.get('limit', ['10'])[0])
-        limit = max(1, min(limit, 100))  # Clamp to 1-100
-    except ValueError:
-        limit = 10
+        limit = int(context.query_params.get('limit', ['50'])[0])
+        limit = max(1, min(limit, 200))
+        
+        page = int(context.query_params.get('page', ['1'])[0])
+        page = max(1, page)
+        
+        search_term = context.query_params.get('search', [None])[0]
+    except (ValueError, TypeError, IndexError):
+        limit = 50
+        page = 1
+        search_term = None
 
-    # Query database
-    err, contacts = get_popular_contacts(db_handle, limit=limit)
+    # 2. QUERY DATABASE
+    # This function returns contacts where 'auto_address' is the Pretty Format
+    err, contacts, total_count = get_all_contacts(
+        db_handle, 
+        page=page, 
+        limit=limit, 
+        search=search_term
+    )
 
     if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
+        return request_handler.send_json_response(500, {
             "error": "Database error",
             "code": int(err),
             "status": "error"
         })
-        return
 
+    # 3. CONSTRUCT RESPONSE
+    # Frontend will use 'auto_address' to show Sean.Worthington@CEO#C23.Giga
     response = {
+        "status": "success",
         "contacts": contacts,
-        "count": len(contacts),
-        "limit": limit
+        "pagination": {
+            "total_count": total_count,
+            "page": page,
+            "limit": limit,
+            "total_pages": (total_count + limit - 1) // limit
+        },
+        "search_term": search_term
     }
-    request_handler.send_json_response(200, response)
+    
+    return request_handler.send_json_response(200, response)
 
 
 def handle_search_emails(request_handler, context):
     """
-    GET /api/data/emails/search - Search emails using FTS5 full-text search
-
-    Query parameters:
-        q: search query string (required)
-        limit: max results (default: 50)
-        offset: pagination offset (default: 0)
-
-    Returns search results with snippets showing match context.
+    GET /api/data/emails/search - Search emails with Pretty Context
     """
-    # Get app context from server instance
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
-    # Parse query parameters
     query = context.query_params.get('q', [''])[0]
-
-    if not query or not query.strip():
-        request_handler.send_json_response(400, {
-            "error": "Missing required query parameter: 'q'",
-            "status": "error"
-        })
-        return
+    if not query.strip():
+        return request_handler.send_json_response(400, {"error": "Missing query"})
 
     try:
         limit = int(context.query_params.get('limit', ['50'])[0])
-        limit = max(1, min(limit, 100))  # Clamp to 1-100
-    except ValueError:
-        limit = 50
-
-    try:
         offset = int(context.query_params.get('offset', ['0'])[0])
-        offset = max(0, offset)
-    except ValueError:
-        offset = 0
+    except:
+        limit, offset = 50, 0
 
-    # Search database using FTS5
-    err, results = search_emails(
-        db_handle, query.strip(), limit=limit, offset=offset)
+    from src.database import search_emails, DatabaseErrorCode
+    err, results = search_emails(db_handle, query.strip(), limit=limit, offset=offset)
 
     if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
-            "error": "Search failed",
-            "code": int(err),
-            "status": "error"
-        })
-        return
+        return request_handler.send_json_response(500, {"error": "Search failed"})
 
-    # Convert EmailID bytes to hex strings for JSON serialization
     for result in results:
-        if result.get('EmailID') and isinstance(result['EmailID'], bytes):
+        if isinstance(result.get('EmailID'), bytes):
             result['EmailID'] = result['EmailID'].hex()
 
-    response = {
+    return request_handler.send_json_response(200, {
         "query": query,
-        "results": results,
-        "count": len(results),
-        "limit": limit,
-        "offset": offset
-    }
-    request_handler.send_json_response(200, response)
-
+        "results": results, # Includes sender_pretty
+        "count": len(results)
+    })
 
 def handle_search_users(request_handler, context):
     """
-    GET /api/data/users/search - Search users for recipient autocomplete
-
-    Query parameters:
-        q: search query string (required) - searches first_name, last_name, description
-        limit: max results (default: 20)
-
-    Returns matching users sorted by relevance.
+    GET /api/data/users/search - Search users for autocomplete (Pretty Format)
     """
-    # Get app context from server instance
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
-    # Parse query parameters
     query = context.query_params.get('q', [''])[0]
+    if not query.strip():
+        return request_handler.send_json_response(400, {"error": "Missing query"})
 
-    if not query or not query.strip():
-        request_handler.send_json_response(400, {
-            "error": "Missing required query parameter: 'q'",
-            "status": "error"
-        })
-        return
-
-    try:
-        limit = int(context.query_params.get('limit', ['20'])[0])
-        limit = max(1, min(limit, 100))  # Clamp to 1-100
-    except ValueError:
-        limit = 20
-
-    # Search database
-    err, users = search_users(db_handle, query.strip(), limit=limit)
+    # Hum get_all_contacts ki logic use karenge search filter ke sath
+    from src.database import get_all_contacts, DatabaseErrorCode
+    err, users, _ = get_all_contacts(db_handle, page=1, limit=20, search=query.strip())
 
     if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
-            "error": "Search failed",
-            "code": int(err),
-            "status": "error"
+        return request_handler.send_json_response(500, {"error": "Search failed"})
+
+    # Frontend ko 'auto_address' (Pretty Format) return karenge
+    formatted_users = []
+    for u in users:
+        formatted_users.append({
+            "name": f"{u['first_name']} {u['last_name']}",
+            "email": u['auto_address'], # Sean.Worthington@CEO#C23.Giga
+            "serial_number": u['serial_number'],
+            "class": u['class']
         })
-        return
 
-    response = {
+    return request_handler.send_json_response(200, {
         "query": query,
-        "users": users,
-        "count": len(users),
-        "limit": limit
-    }
-    request_handler.send_json_response(200, response)
-
+        "users": formatted_users,
+        "count": len(formatted_users)
+    })
 
 def handle_get_servers(request_handler, context):
     """
@@ -1327,106 +1252,50 @@ def _validate_email_id(email_id_str):
 
 def handle_mail_get(request_handler, context):
     """
-    GET /api/mail/{id} - Get email metadata (without body by default)
-
-    UPDATED: Checks both downloaded emails (Emails table) and pending notifications (received_tells table)
-
-    Path parameter:
-        id: The email ID (hex string, 32 chars)
-
-    Returns:
-        - 200 with email metadata
-        - 400 for invalid id format
-        - 404 if email not found
-        - 500 for database errors
+    GET /api/mail/{id} - Get email metadata (Pretty Format aware)
     """
     from src.logger import log_error
+    from src.database import get_email_metadata, DatabaseErrorCode
 
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
-    # Validate email_id
     email_id = context.path_params.get('id')
     is_valid, clean_id, error_msg = _validate_email_id(email_id)
     if not is_valid:
-        request_handler.send_json_response(400, {
-            "error": "Invalid email_id format",
-            "details": error_msg,
-            "status": "error"
-        })
-        return
+        return request_handler.send_json_response(400, {"error": "Invalid id", "details": error_msg})
 
-    # Try to get from downloaded emails first
+    # 1. Try downloaded emails
     err, metadata = get_email_metadata(db_handle, clean_id)
 
     if err == DatabaseErrorCode.SUCCESS:
-        # Email has been downloaded - return full metadata
-        request_handler.send_json_response(200, metadata)
-        return
+        # metadata ab 'sender_pretty' aur 'recipients_pretty' fields return karega
+        return request_handler.send_json_response(200, metadata)
 
-    # Email not downloaded - check if it's a pending tell notification
+    # 2. Check pending tells
     if err == DatabaseErrorCode.ERR_NOT_FOUND:
         try:
             cursor = db_handle.connection.cursor()
-            cursor.execute("""
-                SELECT file_guid, created_at, locker_code
-                FROM received_tells 
-                WHERE file_guid = ?
-            """, (clean_id,))
-
+            cursor.execute("SELECT file_guid, created_at, locker_code FROM received_tells WHERE file_guid = ?", (clean_id,))
             row = cursor.fetchone()
             if row:
-                # Convert locker_code to hex string safely
                 locker_code = row['locker_code']
-                if locker_code:
-                    if isinstance(locker_code, bytes):
-                        locker_hex = locker_code.hex()
-                    else:
-                        locker_hex = str(locker_code)
-                else:
-                    locker_hex = None
+                locker_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
 
-                # Found in pending tells - return limited metadata
-                request_handler.send_json_response(200, {
+                return request_handler.send_json_response(200, {
                     "EmailID": row['file_guid'],
-                    "Subject": f"Email {row['file_guid'][:8]}...",
+                    "Subject": f"New Mail ({row['file_guid'][:8]})",
                     "ReceivedTimestamp": row['created_at'],
-                    "SentTimestamp": row['created_at'],
                     "is_read": False,
-                    "is_starred": False,
-                    "is_trashed": False,
-                    "folder": "inbox",
                     "downloaded": False,
                     "locker_code": locker_hex,
-                    "note": "This email has not been downloaded yet. Call /api/mail/download/{id} to retrieve content."
+                    "folder": "inbox"
                 })
-                return
-
-            # Not found in either table
-            request_handler.send_json_response(404, {
-                "error": "Email not found",
-                "email_id": email_id,
-                "status": "error"
-            })
-            return
-
         except Exception as e:
-            log_error(app_ctx.logger, "API",
-                      f"Error checking received_tells: {e}")
-            request_handler.send_json_response(500, {
-                "error": "Database error",
-                "details": str(e),
-                "status": "error"
-            })
-            return
+            log_error(app_ctx.logger, "API", f"Error checking tells: {e}")
+            return request_handler.send_json_response(500, {"error": "Database error"})
 
-    # Other database error
-    request_handler.send_json_response(500, {
-        "error": "Database error",
-        "code": int(err),
-        "status": "error"
-    })
-
+    return request_handler.send_json_response(404, {"error": "Email not found"})
 
 def handle_mail_delete(request_handler, context):
     """
@@ -1654,15 +1523,14 @@ def handle_mail_read(request_handler, context):
 def handle_mail_folders(request_handler, context):
     """
     GET /api/mail/folders - List available mail folders
-
-    Returns fixed list of folders with display names.
     """
     response = {
+        "status": "success",
         "folders": [
-            {"name": "inbox", "display_name": "Inbox"},
-            {"name": "sent", "display_name": "Sent"},
-            {"name": "drafts", "display_name": "Drafts"},
-            {"name": "trash", "display_name": "Trash"}
+            {"name": "inbox", "display_name": "Inbox", "icon": "inbox"},
+            {"name": "sent", "display_name": "Sent", "icon": "send"},
+            {"name": "drafts", "display_name": "Drafts", "icon": "edit"},
+            {"name": "trash", "display_name": "Trash", "icon": "delete"}
         ]
     }
     request_handler.send_json_response(200, response)
@@ -1671,28 +1539,22 @@ def handle_mail_folders(request_handler, context):
 def handle_mail_count(request_handler, context):
     """
     GET /api/mail/count - Get unread/total counts per folder
-
-    Returns counts for all folders with summary.
     """
+    from src.database import get_folder_counts, DatabaseErrorCode
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
-    # Get folder counts
     err, counts = get_folder_counts(db_handle)
 
     if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
-            "error": "Database error",
-            "code": int(err),
-            "status": "error"
-        })
-        return
+        return request_handler.send_json_response(500, {"error": "Database error", "status": "error"})
 
-    # Calculate summary
-    total_emails = sum(folder['total'] for folder in counts.values())
-    total_unread = sum(folder['unread'] for folder in counts.values())
+    # Aggregate totals
+    total_emails = sum(f['total'] for f in counts.values())
+    total_unread = sum(f['unread'] for f in counts.values())
 
     response = {
+        "status": "success",
         "counts": counts,
         "summary": {
             "total_emails": total_emails,
@@ -3085,6 +2947,7 @@ def register_all_routes(server):
     """
     # Health / Status
     server.register_route('GET', '/api/health', handle_health)
+    server.register_route("GET", '/api/admin/version-check', handle_version_check) 
     server.register_route('GET', '/api/qmail/ping', handle_ping)
 
     # Mail operations
@@ -3147,6 +3010,7 @@ def register_all_routes(server):
     server.register_route('GET', '/api/mail/drafts', handle_drafts_list)
     server.register_route('POST', '/api/mail/draft', handle_draft_save)
     server.register_route('PUT', '/api/mail/draft/{id}', handle_draft_update)
+    
 
 
 # ============================================================================

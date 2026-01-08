@@ -162,70 +162,91 @@ def download_text(
         log_error(logger_handle, SYNC_CONTEXT,
                   f"Unexpected error fetching {url}", str(e))
         return SyncErrorCode.ERR_NETWORK, None
-
-
-def parse_users_csv(csv_text: str, logger_handle=None) -> List[Dict]:
-    """
-    Parses the new Supervisor CSV format:
-    FirstName, LastName, CustomSerialNumber, Description, InboxFee, Class, Beacon
-    """
-    import csv
-    import io
     
+
+
+# ============================================================================
+# PRETTY ADDRESS HELPERS
+# ============================================================================
+# ============================================================================
+# PRETTY ADDRESS HELPERS (Add/Update these in src/data_sync.py)
+# ============================================================================
+
+def convert_to_custom_base32(n: int) -> str:
+    """9572 -> 'C23' conversion (Matches supervisor logic)"""
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    if n == 0: return ALPHABET[0]
+    arr = []
+    while n:
+        n, rem = divmod(n, 32)
+        arr.append(ALPHABET[rem])
+    arr.reverse()
+    return ''.join(arr)
+
+def convert_from_custom_base32(encoded_str: str) -> int:
+    """'C23' -> 9572 conversion"""
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    if not encoded_str: return 0
+    encoded_str = str(encoded_str).strip().upper()
+    decimal_val = 0
+    for char in encoded_str:
+        try:
+            index = ALPHABET.index(char)
+            decimal_val = (decimal_val << 5) | index
+        except ValueError: continue
+    return decimal_val
+
+# ============================================================================
+# PARSE USERS CSV (Update this in src/data_sync.py)
+# ============================================================================
+def parse_users_csv(csv_text: str, logger_handle=None) -> list:
+    """
+    FIXED: Corrected column indices based on RAIDA11 log output.
+    """
+    import csv, io
     users = []
-    # Use csv module to handle potential quotes or commas in descriptions
     f = io.StringIO(csv_text.strip())
     reader = csv.reader(f)
     
-    header_skipped = False
-    line_num = 0
+    class_map = {'bit': 0, 'byte': 1, 'kilo': 2, 'mega': 3, 'giga': 4}
     
     for row in reader:
-        line_num += 1
-        if not row: continue
+        # Skip header intelligently
+        if not row or row[0].strip() == 'CustomSerialNumber': continue
         
-        # 1. Skip Header
-        if not header_skipped:
-            header_skipped = True
-            continue
-            
         try:
-            # 2. Map indices to new Supervisor format
-            # row[0]: FirstName, row[1]: LastName, row[2]: CustomSerialNumber
-            # row[3]: Description, row[4]: InboxFee, row[5]: Class, row[6]: Beacon
+            # RAIDA11 Format: [0:SN, 1:First, 2:Last, 3:Desc, 4:Fee, 5:Class, 6:Beacon]
+            raw_base32 = row[0].strip()
+            first = row[1].strip()
+            last = row[2].strip()
+            desc = row[3].strip()
+            fee = float(row[4].strip())
+            raw_class = row[5].strip().lower()
             
-            first_name = row[0].strip()
-            last_name = row[1].strip()
-            custom_sn = row[2].strip() # e.g., "C23"
-            description = row[3].strip()
+            # Use fixed helper from previous turn
+            numeric_sn = convert_from_custom_base32(raw_base32)
+            denom = class_map.get(raw_class, 0)
             
-            # InboxFee normalization (Flat fee per message)
-            try:
-                inbox_fee = float(row[4].strip())
-            except:
-                inbox_fee = 0.0
-                
-            user_class = row[5].strip()
-            beacon = row[6].strip()
+            # Generate Pretty Address
+            pretty_address = f"{first}.{last}@{desc}#{raw_base32}.{raw_class.capitalize()}"
             
-            # 3. Create standardized user dictionary
-            user_dict = {
-                'custom_sn': custom_sn,
-                'first_name': first_name,
-                'last_name': last_name,
-                'description': description,
-                'inbox_fee': inbox_fee,
-                'class': user_class,
-                'beacon': beacon
-            }
-            users.append(user_dict)
-            
+            users.append({
+                'serial_number': numeric_sn,
+                'denomination': denom,
+                'custom_sn': raw_base32,
+                'first_name': first,
+                'last_name': last,
+                'auto_address': pretty_address,
+                'description': desc,
+                'inbox_fee': fee,
+                'class': raw_class,
+                'beacon': row[6].strip()
+            })
         except Exception as e:
-            from logger import log_warning
-            log_warning(logger_handle, "DataSync", f"Line {line_num}: Parse error ({e}), skipping")
+            from src.logger import log_warning
+            log_warning(logger_handle, "DataSync", f"Row parse failed: {e}")
             
     return users
-
 # ============================================================================
 # DATA VALIDATION
 # ============================================================================
@@ -305,14 +326,15 @@ def sync_users(
 ) -> Tuple[SyncErrorCode, int]:
     """
     Download users CSV and sync to database using the new Supervisor format.
+    Ensures that "Pretty Addresses" and proper Denominations are stored.
     """
-    from data_sync import download_text, SyncErrorCode
+    from data_sync import download_text, SyncErrorCode, parse_users_csv
     from database import upsert_user, DatabaseErrorCode
     from logger import log_info, log_warning
     
     log_info(logger_handle, "DataSync", f"Syncing users from: {url}")
 
-    # 1. Download CSV text
+    # 1. Download CSV text from RAIDA
     err, csv_text = download_text(url, timeout_sec, logger_handle)
     if err != SyncErrorCode.SUCCESS:
         return err, 0
@@ -321,7 +343,7 @@ def sync_users(
         log_warning(logger_handle, "DataSync", "Empty response from users URL")
         return SyncErrorCode.SUCCESS, 0
 
-    # 2. Parse CSV (Using the corrected helper above)
+    # 2. Parse CSV (Using the updated logic above)
     users = parse_users_csv(csv_text, logger_handle)
 
     if not users:
@@ -331,14 +353,13 @@ def sync_users(
     # 3. Sync to database
     synced_count = 0
     for user in users:
-        # Upsert ensures we update existing 'C23' records
+        # Upsert handles the SerialNumber-based primary key logic
         db_err = upsert_user(db_handle, user)
         if db_err == DatabaseErrorCode.SUCCESS:
             synced_count += 1
 
     log_info(logger_handle, "DataSync", f"Synced {synced_count} users successfully")
     return SyncErrorCode.SUCCESS, synced_count
-
 
 # ============================================================================
 # SYNC SERVERS
@@ -485,6 +506,29 @@ def sync_all(
              f"Sync complete. Database now has {total_users} users and {total_servers} servers")
 
     return overall_error, result
+
+
+def check_client_version(logger_handle=None) -> Tuple[bool, str]:
+    """
+    Server se version date fetch karke local version se compare karta hai.
+    """
+    from data_sync import download_text, SyncErrorCode
+    # CLIENT_VERSION aur VERSION_URL ko import karo jahan bhi define kiya hai
+    from config import CLIENT_VERSION, VERSION_URL
+
+    # 1. Server se date fetch karo
+    err, remote_version = download_text(VERSION_URL, timeout_sec=10, logger_handle=logger_handle)
+    
+    if err != SyncErrorCode.SUCCESS or not remote_version:
+        return False, CLIENT_VERSION
+
+    remote_version = remote_version.strip() # "2026-01-07"
+
+    # 2. Compare: Agar remote date badi hai toh update available hai
+    if remote_version > CLIENT_VERSION:
+        return True, remote_version
+    
+    return False, remote_version
 
 
 # ============================================================================

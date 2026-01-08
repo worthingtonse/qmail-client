@@ -1041,9 +1041,11 @@ class ServerLocation:
 class TellNotification:
     """
     Represents a single, parsed "Tell" notification from the beacon.
+    FIXED: Added sender_sn for Pretty Name resolution in the monitor loop.
     """
     file_guid: bytes = field(default_factory=lambda: bytes(16))
-    locker_code: bytes = field(default_factory=lambda: bytes(8))
+    locker_code: bytes = field(default_factory=lambda: bytes(16)) # Support full 16-byte locker/AN
+    sender_sn: int = 0  # <--- NEW: Crucial for Phase II Pretty Names
     timestamp: int = 0
     tell_type: int = 0
     server_count: int = 0
