@@ -170,13 +170,17 @@ CREATE TABLE IF NOT EXISTS QMailServers (
 -- ==========================================
 CREATE TABLE IF NOT EXISTS Users (
     SerialNumber INTEGER PRIMARY KEY,    -- Decoded integer (e.g., 2841)
+    Denomination INTEGER DEFAULT 0,
     CustomSerialNumber TEXT UNIQUE,      -- Original Base32 string (e.g., 'C23')
     FirstName TEXT,
     LastName TEXT,
+    auto_address TEXT UNIQUE,            -- <--- YE COLUMN MISSING THA
     Description TEXT,
-    InboxFee REAL,                       -- The flat fee per message
+    InboxFee REAL DEFAULT 0.0,           -- The flat fee per message
     Class TEXT,                          -- e.g., 'giga'
-    Beacon TEXT                          -- e.g., 'RAIDA11'
+    Beacon TEXT,                         -- e.g., 'RAIDA11'
+    contact_count INTEGER DEFAULT 0,
+    last_contacted_timestamp INTEGER
 );
 
 -- ==========================================
@@ -518,12 +522,11 @@ CREATE INDEX IF NOT EXISTS idx_received_stripes_tell_id ON received_stripes(tell
 
 def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
     """
-    Initialize database connection and create all 13 tables from SCHEMA_SQL.
-    PERFECT VERSION: Uses executescript for the full schema and handles column migrations.
+    Initialize database connection and create all tables from SCHEMA_SQL.
+    FIXED: Ensures all columns exist before creating indexes to avoid 'no such column' errors.
     """
     import sqlite3
     import os
-    # Note: Ye variables isi file (database.py) mein defined hain
     from src.database import DatabaseErrorCode, DatabaseHandle, SCHEMA_SQL
     from src.logger import log_info, log_error
 
@@ -535,7 +538,7 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
     if db_dir and not os.path.exists(db_dir):
         try:
             os.makedirs(db_dir, exist_ok=True)
-            log_info(logger, "Database", f"Created database directory: {db_dir}")
+            log_info(logger, "Database", f"Created directory: {db_dir}")
         except OSError as e:
             if logger: log_error(logger, "Database", "Directory creation failed", str(e))
             return DatabaseErrorCode.ERR_IO, None
@@ -545,27 +548,23 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
         connection = sqlite3.connect(db_path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         
-        # Enable Foreign Keys (Critical for Junction and Attachment tables)
+        # Enable Foreign Keys
         connection.execute("PRAGMA foreign_keys = ON")
         cursor = connection.cursor()
 
-        # 3. EXECUTE FULL SCHEMA (Creates all 13 tables, Triggers, and Indexes)
-        # 'executescript' will run your entire SCHEMA_SQL block at once.
-        # It is now safe because you added IF NOT EXISTS to the Users table.
+        # 3. EXECUTE FULL SCHEMA
+        # Ab ye crash nahi karega kyunki SCHEMA_SQL mein auto_address add kar diya gaya hai.
         cursor.executescript(SCHEMA_SQL)
 
-        # 4. AUTO-MIGRATION: Add columns if upgrading an existing database
-        # This ensures 'Users' has the extra fields needed for contacts popularity.
+        # 4. SAFETY CHECK: Ensure migration columns are there anyway
         cursor.execute("PRAGMA table_info(Users)")
         existing_cols = [col[1] for col in cursor.fetchall()]
         
         if 'contact_count' not in existing_cols:
-            log_info(logger, "Database", "Upgrading Users table: adding contact_count")
             cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
         
         if 'last_contacted_timestamp' not in existing_cols:
-            log_info(logger, "Database", "Upgrading Users table: adding last_contacted_timestamp")
-            cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp TEXT")
+            cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp INTEGER")
 
         connection.commit()
         log_info(logger, "Database", f"Full database schema (13 tables) initialized: {db_path}")
