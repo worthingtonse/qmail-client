@@ -455,8 +455,8 @@ def find_identity_coin_for_beacon(logger_handle=None):
         tuple: (coin, wallet_path) or (None, None) if not found
     """
     import shutil
-    from src.coin_scanner import scan_coins_from_dir
-    from src.logger import log_info, log_warning, log_error
+    from coin_scanner import scan_coins_from_dir
+    from logger import log_info, log_warning, log_error
     
     wallet_root = "Data/Wallets"
     
@@ -519,15 +519,15 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     Move identity coin to Fracked folder and rename it to reflect failure.
     FIXED: Updates POWN string and uses Go-style naming helper.
     """
-    from src.coin_scanner import find_identity_coin
-    from src.cloudcoin import get_int_name, write_coin_file, load_coin_metadata
+    from coin_scanner import find_identity_coin , load_coin_metadata
+    from cloudcoin import get_int_name, write_coin_file
     import shutil
     import os
     import threading
     import time
-    from src.beacon import stop_beacon_monitor, start_beacon_monitor, init_beacon
-    from src.heal import heal_wallet
-    from src.logger import log_info, log_error, log_warning
+    from beacon import stop_beacon_monitor, start_beacon_monitor, init_beacon
+    from heal import heal_wallet
+    from logger import log_info, log_error, log_warning
 
     # 1. STOP THE MONITOR IMMEDIATELY
     if beacon_handle and beacon_handle.is_running:
@@ -648,6 +648,7 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     # Start the persistent recovery loop
     thread = threading.Thread(target=identity_recovery_loop, name="IdentityRecovery", daemon=True)
     thread.start()
+
 def validate_tell_payment_sync(
     locker_code_16bytes: Optional[bytes],
     recipient_user_id: int,
@@ -656,247 +657,132 @@ def validate_tell_payment_sync(
 ) -> Tuple[bool, float, str]:
     """
     Validate that tell payment meets recipient's minimum requirements.
-
-    Queries ALL 25 RAIDAs in parallel and uses consensus (13/25 minimum).
-    This matches the Go client's approach.
-
-    Args:
-        locker_code_16bytes: 16-byte locker code from tell footer (Optional[bytes])
-        recipient_user_id: Recipient's user ID (int)
-        db_handle: Database handle (Any)
-        logger: Logger handle (Any)
-
-    Returns:
-        Tuple[bool, float, str]: (is_valid, actual_amount, message)
+    FIXED: Uses 'get_all_servers', standard network parameters, and consensus logic.
     """
-    # Import required modules at function level
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from typing import Tuple, Optional, Dict, Any
 
     try:
+        # Internal imports to ensure consistency
         from protocol import build_peek_locker_request, parse_peek_locker_response, ProtocolErrorCode
-        from network import connect, send_raw_request, disconnect, NetworkErrorCode, ServerInfo, NetworkConfig
-        from database import get_raida_servers, get_user_payment_requirement, DatabaseErrorCode
+        from network import connect_to_server as connect, send_raw_request, disconnect, NetworkErrorCode
+        from qmail_types import ServerConfig as ServerInfo, NetworkConfig
+        from database import get_all_servers, get_user_payment_requirement, DatabaseErrorCode
         from locker_download import derive_locker_keys
         from logger import log_info, log_error, log_debug, log_warning
     except ImportError as e:
         if logger is not None:
-            try:
-                from logger import log_error as log_err
-                log_err(logger, "Beacon",
-                        f"Import error in payment validation: {e}")
-            except:
-                pass
+            log_error(logger, "Beacon", f"Import error in payment validation: {e}")
         return False, 0.0, f"Import error: {e}"
 
-    # Constants for consensus
-    RAIDA_COUNT: int = 25
-    MINIMUM_QUORUM: int = 13
+    RAIDA_COUNT = 25
+    MINIMUM_QUORUM = 13
 
-    # Normalize locker code to 8 bytes (with explicit None check)
-    locker_code: bytes = b'\x00' * 8
-
+    # 1. Normalize locker code to 8 bytes for access key derivation
+    locker_code = b'\x00' * 8
     if locker_code_16bytes is not None and isinstance(locker_code_16bytes, bytes):
-        code_len: int = len(locker_code_16bytes)
+        code_len = len(locker_code_16bytes)
         if code_len >= 8:
             locker_code = locker_code_16bytes[:8]
         elif code_len > 0:
             locker_code = locker_code_16bytes.ljust(8, b'\x00')
 
-    # Check if locker code is all zeros (no payment)
-    if locker_code == b'\x00' * 8:
-        try:
-            err, min_payment_result = get_user_payment_requirement(
-                db_handle, recipient_user_id)
-        except Exception as e:
-            log_warning(logger, "Beacon",
-                        f"Exception fetching payment requirement: {e}")
-            return True, 0.0, "Payment validation skipped - error fetching requirements"
-
-        if err != DatabaseErrorCode.SUCCESS:
-            log_warning(logger, "Beacon",
-                        f"Could not fetch payment requirement for user {recipient_user_id}")
-            return True, 0.0, "Payment validation skipped - user data unavailable"
-
-        if min_payment_result is None or min_payment_result == 0:
-            return True, 0.0, "No payment required"
-        else:
-            return False, 0.0, f"Payment required but none attached (minimum: {min_payment_result} CC)"
-
-    # Get recipient's payment requirement
-    min_payment: Optional[float] = None
-    try:
-        err, min_payment = get_user_payment_requirement(
-            db_handle, recipient_user_id)
-    except Exception as e:
-        log_warning(logger, "Beacon",
-                    f"Exception fetching payment requirement: {e}")
-        return True, 0.0, "Payment validation skipped - exception occurred"
-
+    # 2. Get recipient's requirement from database
+    # SerialNumber 2841 (C23) lookup for InboxFee
+    err, min_payment = get_user_payment_requirement(db_handle, recipient_user_id)
+    
     if err != DatabaseErrorCode.SUCCESS:
-        log_warning(logger, "Beacon",
-                    "Could not fetch payment requirement - accepting tell")
-        return True, 0.0, "Payment validation skipped"
+        log_warning(logger, "Beacon", f"Could not fetch requirement for user {recipient_user_id}. Accepting (Fail-Open).")
+        return True, 0.0, "Requirement lookup failed"
 
     if min_payment is None or min_payment == 0:
-        log_info(logger, "Beacon", "Recipient does not require payment")
         return True, 0.0, "No payment required"
 
-    # At this point min_payment is guaranteed non-zero
-    required_payment: float = float(min_payment)
+    # If payment is required but no locker code was attached
+    if locker_code == b'\x00' * 8:
+        return False, 0.0, f"Payment required but none attached (Min: {min_payment} CC)"
 
-    # Derive locker IDs
-    locker_ids: list = []
+    required_payment = float(min_payment)
+
+    # 3. Derive 25 Locker IDs (Access Keys) from the 8-byte payment code
     try:
         locker_ids = derive_locker_keys(locker_code)
     except Exception as e:
         log_error(logger, "Beacon", f"Failed to derive locker keys: {e}")
-        return False, 0.0, "Cannot verify payment - key derivation failed"
+        return False, 0.0, "Key derivation failed"
 
-    # Get RAIDA servers
-    servers: list = []
-    try:
-        err, servers = get_raida_servers(db_handle)
-    except Exception as e:
-        log_error(logger, "Beacon", f"Failed to get RAIDA servers: {e}")
-        return False, 0.0, "Cannot verify payment - server lookup failed"
-
+    # 4. Get active RAIDA servers from database
+    err, servers = get_all_servers(db_handle, available_only=False)
     if err != DatabaseErrorCode.SUCCESS or not servers:
-        log_error(logger, "Beacon", "Cannot verify payment - no RAIDA servers")
-        return False, 0.0, "Cannot verify payment - no server list"
+        log_error(logger, "Beacon", "No RAIDA servers found in database.")
+        return False, 0.0, "Server lookup failed"
 
-    # Create network config
-    net_config: Optional[Any] = None
-    try:
-        net_config = NetworkConfig()
-    except Exception:
-        pass
-
-    log_debug(logger, "Beacon",
-              f"Querying all {RAIDA_COUNT} RAIDAs for payment verification...")
-
-    # Thread-safe results storage
-    results_lock: threading.Lock = threading.Lock()
-    peek_results: Dict[int, float] = {}
+    net_config = NetworkConfig()
+    results_lock = threading.Lock()
+    peek_results = {}
 
     def peek_single_raida(raida_id: int) -> None:
-        """Worker function to PEEK a single RAIDA."""
-        server = next(
-            (s for s in servers if s['server_index'] == raida_id), None)
-        if not server:
-            log_debug(logger, "Beacon", f"RAIDA{raida_id} not in server list")
-            return
+        """Worker: Check balance in the locker of RAIDA index X."""
+        server = next((s for s in servers if s['server_index'] == raida_id), None)
+        if not server: return
 
         try:
-            locker_id: bytes = locker_ids[raida_id]
-            err_proto, peek_req, _, _ = build_peek_locker_request(
-                raida_id, locker_id)
+            # Build PEEK LOCKER packet (Command 0x53)
+            locker_id = locker_ids[raida_id]
+            err_proto, peek_req, _, _ = build_peek_locker_request(raida_id, locker_id)
+            if err_proto != ProtocolErrorCode.SUCCESS: return
 
-            if err_proto != ProtocolErrorCode.SUCCESS:
-                log_debug(logger, "Beacon",
-                          f"RAIDA{raida_id}: Failed to build PEEK request")
-                return
+            server_info = ServerInfo(address=server['ip_address'], port=server['port'], index=raida_id)
+            
+            # Connect to RAIDA (Locker PEEK doesn't require identity authentication)
+            err_conn, conn = connect(server_info, encryption_key=None, denomination=0, 
+                                     serial_number=0, config=net_config, logger_handle=logger)
+            
+            if err_conn != NetworkErrorCode.SUCCESS: return
 
-            server_info = ServerInfo(
-                host=server['ip_address'],
-                port=server['port'],
-                index=raida_id
-            )
-
-            err_conn, conn = connect(
-                server_info, timeout_ms=5000, logger_handle=logger)
-            if err_conn != NetworkErrorCode.SUCCESS:
-                log_debug(logger, "Beacon",
-                          f"RAIDA{raida_id}: Connection failed")
-                return
-
-            net_err, resp_h, resp_b = send_raw_request(
-                conn,
-                peek_req,
-                timeout_ms=5000,
-                config=net_config,
-                logger_handle=logger
-            )
+            # Send Request and get Response
+            net_err, resp_h, resp_b = send_raw_request(conn, peek_req, timeout_ms=5000, 
+                                                      config=net_config, logger_handle=logger)
             disconnect(conn, logger)
 
-            if net_err != NetworkErrorCode.SUCCESS:
-                log_debug(logger, "Beacon", f"RAIDA{raida_id}: Request failed")
-                return
-
-            if resp_h.status != 241:
-                log_debug(logger, "Beacon",
-                          f"RAIDA{raida_id}: Status {resp_h.status}")
-                return
-
-            coin_count, coins = parse_peek_locker_response(resp_b)
-
-            if coin_count == 0:
+            # Process Status 241 (Standard PEEK success code)
+            if net_err == NetworkErrorCode.SUCCESS and resp_h.status == 241:
+                coin_count, coins = parse_peek_locker_response(resp_b)
+                total_value = sum(coin['value'] for coin in coins) if coin_count > 0 else 0.0
                 with results_lock:
-                    peek_results[raida_id] = 0.0
-                return
+                    peek_results[raida_id] = total_value
+        except Exception:
+            pass
 
-            total_value: float = sum(coin['value'] for coin in coins)
+    # 5. Parallel Execution: Query all 25 RAIDAs at once
+    log_debug(logger, "Beacon", f"Validating {required_payment} CC payment for user {recipient_user_id}...")
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        futures = [executor.submit(peek_single_raida, i) for i in range(25)]
+        for f in as_completed(futures, timeout=12):
+            try: f.result()
+            except: pass
 
-            log_debug(logger, "Beacon",
-                      f"RAIDA{raida_id}: {coin_count} coins, {total_value} CC")
-
-            with results_lock:
-                peek_results[raida_id] = total_value
-
-        except Exception as e:
-            log_debug(logger, "Beacon", f"RAIDA{raida_id}: Exception - {e}")
-
-    # Query all 25 RAIDAs in parallel
-    try:
-        with ThreadPoolExecutor(max_workers=25) as executor:
-            futures = [executor.submit(peek_single_raida, i)
-                       for i in range(RAIDA_COUNT)]
-
-            for future in as_completed(futures, timeout=10):
-                try:
-                    future.result()
-                except Exception as e:
-                    log_debug(logger, "Beacon", f"Worker exception: {e}")
-    except Exception as e:
-        log_error(logger, "Beacon", f"ThreadPool exception: {e}")
-        return False, 0.0, "Cannot verify payment - threading error"
-
-    # Check quorum
-    response_count: int = len(peek_results)
-
+    # 6. Consensus Check (13/25 Quorum)
+    response_count = len(peek_results)
     if response_count < MINIMUM_QUORUM:
-        log_error(logger, "Beacon",
-                  f"Insufficient RAIDA responses ({response_count}/{RAIDA_COUNT} < {MINIMUM_QUORUM})")
-        return False, 0.0, f"Cannot verify payment - insufficient responses ({response_count}/{MINIMUM_QUORUM})"
+        log_error(logger, "Beacon", f"Quorum failure: Only {response_count}/25 RAIDAs responded.")
+        return False, 0.0, "Consensus quorum not met"
 
-    log_info(logger, "Beacon",
-             f"Received {response_count}/{RAIDA_COUNT} responses (quorum: {MINIMUM_QUORUM})")
+    # Use Consensus to determine the actual amount (Majority vote)
+    val_counts = {}
+    for val in peek_results.values():
+        val_counts[val] = val_counts.get(val, 0) + 1
+    
+    consensus_amt = max(val_counts.items(), key=lambda x: x[1])[0]
 
-    # Use consensus
-    value_counts: Dict[float, int] = {}
-    for value in peek_results.values():
-        value_counts[value] = value_counts.get(value, 0) + 1
-
-    if not value_counts:
-        log_error(logger, "Beacon", "No values to determine consensus")
-        return False, 0.0, "Cannot verify payment - no consensus data"
-
-    consensus_value = max(value_counts.items(), key=lambda x: x[1])
-    actual_amount: float = consensus_value[0]
-    vote_count: int = consensus_value[1]
-
-    log_info(logger, "Beacon",
-             f"Consensus: {actual_amount} CC ({vote_count}/{response_count} RAIDAs agree)")
-
-    # Check if meets minimum
-    if actual_amount >= required_payment:
-        log_info(logger, "Beacon",
-                 f"✓ Payment validated: {actual_amount} CC >= {required_payment} CC required")
-        return True, actual_amount, f"Payment verified: {actual_amount} CC"
+    # Final Verification
+    if consensus_amt >= required_payment:
+        log_info(logger, "Beacon", f"✓ Payment verified: {consensus_amt} CC (Min: {required_payment} CC)")
+        return True, consensus_amt, f"Valid: {consensus_amt} CC"
     else:
-        log_warning(logger, "Beacon",
-                    f"✗ Insufficient payment: {actual_amount} CC < {required_payment} CC required")
-        return False, actual_amount, f"Insufficient payment: {actual_amount} CC < {required_payment} CC"
+        log_warning(logger, "Beacon", f"✗ Insufficient payment: {consensus_amt} CC < {required_payment} CC")
+        return False, consensus_amt, f"Insufficient: {consensus_amt} CC"
 
 
 def start_periodic_healer(wallet_path: str, logger: Any, interval_hours: int = 1):
