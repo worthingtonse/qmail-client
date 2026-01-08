@@ -3073,45 +3073,6 @@ def get_pending_download_count(handle: DatabaseHandle) -> Tuple[DatabaseErrorCod
 # SENT EMAIL FUNCTIONS (for email_sender module)
 # ============================================================================
 
-def store_sent_email_metadata(
-    db_handle,
-    file_guid: str,
-    subject: str,
-    recipients: str,
-    body: str,
-    timestamp: int,
-    stripe_count: int
-) -> DatabaseErrorCode:
-    """
-    Store sent email metadata in Mailbox/Sent folder (file-based, not DB).
-    """
-    import json
-    
-    try:
-        # Create Sent folder
-        sent_folder = "Data/Wallets/Mailbox/Sent"
-        os.makedirs(sent_folder, exist_ok=True)
-        
-        # Create metadata
-        metadata = {
-            "file_guid": file_guid,
-            "subject": subject,
-            "recipients": recipients.split(',') if recipients else [],
-            "body_preview": body[:200] if body else "",
-            "timestamp": timestamp,
-            "stripe_count": stripe_count
-        }
-        
-        # Save as JSON file
-        metadata_file = os.path.join(sent_folder, f"{file_guid}.json")
-        with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        return DatabaseErrorCode.SUCCESS
-        
-    except Exception as e:
-        print(f"[ERROR] [DatabaseMod] Failed to store sent email: {e}")
-        return DatabaseErrorCode.ERR_IO_ERROR
 
 
 
@@ -3762,7 +3723,7 @@ def delete_email_locally(handle, file_guid):
     return DatabaseErrorCode.SUCCESS
 
 def store_sent_email_metadata(
-    db_handle,
+    handle: DatabaseHandle, # Corrected type hint
     file_guid: str,
     subject: str,
     recipients: str,
@@ -3770,22 +3731,34 @@ def store_sent_email_metadata(
     timestamp: int,
     stripe_count: int
 ) -> DatabaseErrorCode:
-    """Store sent email metadata."""
+    """
+    Store sent email metadata in the SQL database.
+    FIXED: Uses handle.connection and correct logger API.
+    """
+    import sqlite3
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error
+
+    if handle is None or handle.connection is None:
+        return DatabaseErrorCode.ERR_INVALID_PARAM
+
     try:
-        cursor = db_handle.cursor()
+        cursor = handle.connection.cursor() # <--- FIXED: Added .connection
         
+        # We store the first 200 chars as body_preview in the sent table
+        body_preview = body[:200] if body else ""
+
         cursor.execute("""
             INSERT INTO sent_emails 
             (file_guid, subject, recipients, body_preview, timestamp, stripe_count)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (file_guid, subject, recipients, body, timestamp, stripe_count))
+        """, (file_guid, subject, recipients, body_preview, timestamp, stripe_count))
         
-        db_handle.commit()
+        handle.connection.commit()
         return DatabaseErrorCode.SUCCESS
         
     except sqlite3.Error as e:
-        logger_log_error(None, "DatabaseMod",
-                        f"Failed to store sent email: {e}")
+        log_error(handle.logger, "DatabaseMod", "Failed to store sent email metadata", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED
 
 
