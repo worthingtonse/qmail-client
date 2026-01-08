@@ -134,91 +134,87 @@ def handle_version_check(request_handler, request_context):
 
 def handle_ping(request_handler, context):
     """
-    GET /api/qmail/ping - Beacon check for new mail.
-    FIXED: Decodes SN to integer before building protocol request to ensure RAIDA auth passes.
+    GET /api/qmail/ping - Manual deep-level Beacon check.
+    FIXED: Corrects 'NoneType' errors and removes stale imports.
     """
     import asyncio
-    from protocol import build_complete_ping_request, parse_tell_response, custom_sn_to_int # <--- Added custom_sn_to_int
-    from network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
-    from network import ServerInfo
-    from logger import log_error
+    import time
+    # Internal imports to avoid start-up crashes
+    from src.protocol import build_complete_ping_request, parse_tell_response, custom_sn_to_int
+    from src.network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
+    from src.network import ServerInfo
+    from src.logger import log_error, log_info
 
     app_ctx = getattr(request_handler.server_instance, 'app_context', None)
     if not app_ctx:
         return request_handler.send_json_response(500, {"error": "context_not_found"})
 
+    logger = app_ctx.logger
     identity = getattr(app_ctx.config, 'identity', None)
     if not identity:
         return request_handler.send_json_response(401, {"error": "no_identity_found"})
 
-    # --- FIXED: Decode Identity SN to integer for the binary packet ---
+    # 1. RESOLVE SN (C23 -> 2841)
     numeric_sn = custom_sn_to_int(identity.serial_number) 
     target_raida_index = 11
 
     try:
+        # 2. GET AN BLOCK
         an_block = _get_an_for_download(app_ctx)
         
-        if len(an_block) >= 400:
-            start = target_raida_index * 16
-            an_bytes = an_block[start : start + 16]
-        else:
-            an_bytes = an_block[:16]
+        # Safe Slicing
+        start = target_raida_index * 16
+        an_bytes = an_block[start : start + 16] if len(an_block) >= (start + 16) else an_block[:16]
             
     except Exception as e:
         from src.app import move_identity_to_fracked
-        log_error(app_ctx.logger, "API", f"Identity AN load failure: {e}. Moving to Fracked.")
-        move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
-        
-        return request_handler.send_json_response(401, {
-            "status": "healing", 
-            "message": "identity_an_missing",
-            "details": f"Identity coin AN could not be loaded: {str(e)}"
-        })
+        log_error(logger, "API", f"Identity AN load failure: {str(e)}. Moving to Fracked.")
+        move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
+        return request_handler.send_json_response(401, {"status": "healing", "details": str(e)})
 
     async def perform_ping_task():
         raida_servers = getattr(app_ctx.config, 'raida_servers', [])
-        server_entry = next(
-            (s for s in raida_servers if getattr(s, 'index', -1) == target_raida_index), None)
-        if not server_entry:
-            return {"status": "error", "message": "raida_11_not_found"}
-
-        server_info = ServerInfo(host=getattr(server_entry, 'address', ''),
-                                 port=getattr(server_entry, 'port', 50011), raida_id=target_raida_index)
+        server_entry = next((s for s in raida_servers if getattr(s, 'index', -1) == target_raida_index), None)
+        
+        host = getattr(server_entry, 'address', f"raida{target_raida_index}.cloudcoin.global")
+        port = getattr(server_entry, 'port', 50011)
+        server_info = ServerInfo(host=host, port=port, raida_id=target_raida_index)
 
         err_conn, conn = await connect_async(server_info, config=app_ctx.config)
         if err_conn != NetworkErrorCode.SUCCESS:
-            return {"status": "error", "message": "offline"}
+            return {"status": "error", "message": "raida_offline"}
 
         try:
-            # --- FIXED: Pass numeric_sn instead of identity.serial_number ---
+            # Command 62 - PING
             err_proto, req, _, _ = build_complete_ping_request(
                 target_raida_index, identity.denomination, numeric_sn, 0, an_bytes, 0)
 
             net_err, resp_h, resp_b = await send_raw_request_async(conn, req)
 
             if net_err != NetworkErrorCode.SUCCESS:
-                return {"status": "error", "message": "net_failure"}
+                return {"status": "error", "message": "network_failure"}
 
             if resp_h.status == 200:
                 from src.app import move_identity_to_fracked
-                log_error(app_ctx.logger, "API", "RAIDA reported Invalid AN (200). Initiating healing.")
-                move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
-                return {"status": "healing", "message": "coin_fracked"}
+                move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
+                return {"status": "healing", "message": "auth_failed"}
 
-            err_parse, notifications = parse_tell_response(resp_b, app_ctx.logger)
+            # Parse 
+            err_parse, notifications = parse_tell_response(resp_b, logger)
             return {
                 "status": "ok",
-                "has_mail": len(notifications) > 0,
-                "message_count": len(notifications),
-                "messages": [n.to_dict() if hasattr(n, 'to_dict') else str(n) for n in notifications]
+                "notification_count": len(notifications),
+                "messages": [n.to_dict() if hasattr(n, 'to_dict') else str(n) for n in notifications],
+                "timestamp": int(time.time())
             }
         finally:
             await disconnect_async(conn)
 
     try:
         result = asyncio.run(perform_ping_task())
-        request_handler.send_json_response(200, result if result else {"status": "error"})
+        request_handler.send_json_response(200, result)
     except Exception as e:
+        log_error(logger, "API", f"Ping crash: {e}")
         request_handler.send_json_response(500, {"error": str(e)})
 # ============================================================================
 
@@ -541,49 +537,39 @@ def handle_mail_payment_download(request_handler, context):
 
 def _get_an_for_download(app_ctx):
     """
-    Get the full 400-byte Authenticity Number (AN) block.
-    FIXED: Handles Base32 (C23) decoding before scanning for coins.
+    FIXED: Added Non-empty checks to prevent 'NoneType' subscript errors.
     """
-    from src.logger import log_error, log_debug, log_warning
     from src.coin_scanner import find_identity_coin
-    from src.protocol import custom_sn_to_int # <--- Zaroori import
-    import os
+    from src.protocol import custom_sn_to_int
 
     identity = app_ctx.config.identity
-    
-    # FIXED: Ensure SN is an integer (e.g., "C23" -> 2841) before using it in scanner
     numeric_sn = custom_sn_to_int(identity.serial_number)
 
-    # 1. Try loaded identity object
+    # 1. Loaded Identity check
     if hasattr(identity, 'authenticity_number') and identity.authenticity_number:
         an_data = identity.authenticity_number
         an_bytes = bytes.fromhex(an_data) if isinstance(an_data, str) else an_data
-        if len(an_bytes) >= 400:
+        if an_bytes and len(an_bytes) >= 400:
             return an_bytes[:400]
 
-    # 2. Content-based search using the numeric_sn
-    mailbox_bank = "Data/Wallets/Mailbox/Bank"
-    default_bank = "Data/Wallets/Default/Bank"
-    
-    # Yahan numeric_sn pass kar rahe hain taaki coin_scanner crash na ho
-    identity_coin = find_identity_coin(mailbox_bank, numeric_sn)
-    if not identity_coin:
-        identity_coin = find_identity_coin(default_bank, numeric_sn)
-        
-    if identity_coin:
-        # Convert 25 ANs to 400-byte block
-        an_block = b''.join(identity_coin['ans'][:25])
-        if len(an_block) == 400:
-            log_debug(app_ctx.logger, "API",
-                      f"Successfully loaded AN from {os.path.basename(identity_coin['file_path'])}")
-            return an_block
+    # 2. Scanner check
+    for bank in ["Data/Wallets/Mailbox/Bank", "Data/Wallets/Default/Bank"]:
+        coin = find_identity_coin(bank, numeric_sn)
+        if coin:
+            # Standardize based on what scanner returns (dict or object)
+            raw_ans = coin.get('ans') if isinstance(coin, dict) else getattr(coin, 'ans', None)
+            
+            # FIXED: Prevent NoneType is not subscriptable
+            if raw_ans is not None and len(raw_ans) >= 25:
+                an_block = b''.join(raw_ans[:25])
+                if len(an_block) >= 400:
+                    return an_block
 
-    # 3. Fallback: Beacon handle
+    # 3. Beacon Fallback
     if app_ctx.beacon_handle and hasattr(app_ctx.beacon_handle, 'encryption_key'):
-        log_warning(app_ctx.logger, "API", "Using single-RAIDA AN for multi-stripe download.")
         return app_ctx.beacon_handle.encryption_key
 
-    raise ValueError(f"Full 400-byte AN not found for SN {numeric_sn} ({identity.serial_number})")
+    raise ValueError(f"Could not find valid 400-byte AN for SN {numeric_sn}")
 
 def handle_mail_list(request_handler, context):
     """
