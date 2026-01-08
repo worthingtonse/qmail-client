@@ -1111,29 +1111,28 @@ def main():
             for notification in notifications:
 
 
-                sender_sn = getattr(notification, 'sender_sn', 0)
-                err_db, s_info = get_contact_by_id(app_context.db_handle, sender_sn)
-                
-                # Agar DB mein mila toh Pretty Address dikhao, warna sirf SN
-                sender_display = s_info['auto_address'] if err_db == 0 else f"SN {sender_sn}"
-                log_info(logger, "BeaconLoop", f"✓ New mail from: {sender_display}")
+    
                 try:
                     # 1. EXTRACT & VALIDATE GUID
                     if not hasattr(notification, 'file_guid') or not notification.file_guid:
-                        log_warning(
-                            logger, "Beacon", "Received notification with missing or empty file_guid.")
-                        failed_count += 1
                         continue
 
-                    file_guid = notification.file_guid.hex() if hasattr(
-                        notification.file_guid, 'hex') else str(notification.file_guid)
+                    file_guid = notification.file_guid.hex() if hasattr(notification.file_guid, 'hex') else str(notification.file_guid)
 
-                    # 2. DOWNLOAD ONCE CHECK (Policy enforcement)
-                    # We check the database to see if we've already stored this GUID.
+                    # 2. DOWNLOAD ONCE CHECK (Database check)
+                    # Agar mail pehle se DB mein hai toh yahan se loop skip ho jayega
                     if is_guid_in_database(app_context.db_handle, file_guid):
-                        log_debug(
-                            logger, "Beacon", f"Email {file_guid[:8]} already exists in local database. Skipping redundant processing.")
                         continue
+
+                    # 3. IT'S NEW: Ab log karein aur memory mein add karein
+                    sender_sn = getattr(notification, 'sender_sn', 0)
+                    err_db, s_info = get_contact_by_id(app_context.db_handle, sender_sn)
+                    sender_display = s_info['auto_address'] if err_db == 0 else f"SN {sender_sn}"
+                    
+                    log_info(logger, "BeaconLoop", f"✓ New mail from: {sender_display}")
+                    
+                    # Memory mein sirf naye notifications add karein
+                    app_context.add_notifications([notification])
 
                     # 3. LOCKER CODE CLEANING (Format: AS8D-HJL -> AS8DHJL)
                     locker_code = getattr(notification, 'locker_code', None)

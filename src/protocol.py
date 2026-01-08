@@ -201,26 +201,40 @@ def custom_sn_to_int(custom_sn: Any) -> int:
     except ValueError:
         return 0
 
-def build_ping_body(denomination: int, serial_number: int, device_id: int, an: bytes) -> Tuple[bytes, bytes]:
-    """Builds the 50-byte PING body with CRC-32 preamble and identity block."""
-    body = bytearray(50)
-    # 1. 48-byte Preamble (Identity Block)
-    # bytes 0-11: random, bytes 12-15: CRC32
+def build_ping_body(denomination: int, serial_number: int, device_id: int, an: bytes, since_timestamp: int = 0) -> Tuple[bytes, bytes]:
+    """
+    Builds the PING body. 
+    FIXED: Now supports optional 54-byte body for timestamp filtering.
+    """
+    import os, struct, zlib
+    
+    # RAIDA logic: Agar timestamp hai toh body 54 bytes ki hogi, warna 50
+    size = 54 if since_timestamp > 0 else 50
+    body = bytearray(size)
+    
+    # 1. Identity Block Preamble (48 bytes)
     challenge_data = os.urandom(12)
     crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
     body[0:12] = challenge_data
     struct.pack_into('>I', body, 12, crc) 
     
     challenge = bytes(body[0:16])
-    body[16:24] = bytes(8) # Session ID zeros
-    struct.pack_into('>H', body, 24, 0x0006) # Coin Type 
+    body[16:24] = bytes(8) 
+    struct.pack_into('>H', body, 24, 0x0006) 
     body[26] = denomination & 0xFF
     struct.pack_into('>I', body, 27, serial_number)
     body[31] = device_id & 0xFF
-    body[32:48] = an[:16] # AN at Offset 32
+    body[32:48] = an[:16]
     
-    # 2. Terminator (Strict Placement)
-    body[48:50] = b'\x3e\x3e'
+    # 2. Payload Extension (Bytes 48-51)
+    if since_timestamp > 0:
+        struct.pack_into('>I', body, 48, since_timestamp)
+        # Terminator at the end of 54 bytes
+        body[52:54] = b'\x3e\x3e'
+    else:
+        # Terminator at the end of 50 bytes
+        body[48:50] = b'\x3e\x3e'
+        
     return bytes(body), challenge
 
 def build_peek_body(denomination: int, serial_number: int, device_id: int, an: bytes, since_timestamp: int) -> Tuple[bytes, bytes]:
@@ -667,35 +681,35 @@ def build_complete_peek_request(
 def build_complete_ping_request(
     raida_id: int,
     denomination: int,
-    serial_number: Union[int, str], # UPDATED: Accepts Pretty/Base32
+    serial_number: Union[int, str],
     device_id: int,
     an: bytes,
+    since_timestamp: int = 0, # <--- FIXED: Explicitly handle timestamp
     encryption_type: int = 0,
     **kwargs
 ) -> Tuple[int, bytes, bytes, bytes]:
     """
     Build a complete PING request (header + payload).
-    FIXED: Uses custom_sn_to_int to ensure RAIDA receives an integer ID.
+    FIXED: Correctly passes timestamp to body builder and avoids header crash.
     """
-    # Resolve 'C23' or Pretty Address to 2841
+    from src.protocol import custom_sn_to_int
     numeric_sn = custom_sn_to_int(serial_number)
 
-    # 1. Build the 50-byte PING body
-    payload, challenge = build_ping_body(denomination, numeric_sn, device_id, an)
+    # 1. Build body with timestamp (54 bytes)
+    payload, challenge = build_ping_body(denomination, numeric_sn, device_id, an, since_timestamp)
 
-    # 2. Build the Header using the correct PING command code (62)
+    # 2. Build Header (Pass only what build_ping_header expects)
     err, header = build_ping_header(
         raida_id=raida_id,
         an=an,
         body_length=len(payload),
         denomination=denomination,
         serial_number=numeric_sn,
-        encryption_type=encryption_type,
-        **kwargs
+        encryption_type=encryption_type
+        # kwargs yahan nahi bhejenge kyunki header builder ko since_timestamp nahi chahiye
     )
     
-    if err != 0: 
-        return err, b'', b'', b''
+    if err != 0: return err, b'', b'', b''
     
     return 0, header + payload, challenge, header[24:32]
 # ============================================================================

@@ -168,7 +168,7 @@ CREATE TABLE IF NOT EXISTS QMailServers (
 -- ==========================================
 -- 2. Users (Contacts)
 -- ==========================================
-CREATE TABLE Users (
+CREATE TABLE IF NOT EXISTS Users (
     SerialNumber INTEGER PRIMARY KEY,    -- Decoded integer (e.g., 2841)
     CustomSerialNumber TEXT UNIQUE,      -- Original Base32 string (e.g., 'C23')
     FirstName TEXT,
@@ -432,41 +432,130 @@ CREATE INDEX IF NOT EXISTS idx_received_stripes_tell_id ON received_stripes(tell
 #         log_error(logger, DB_CONTEXT, "Database initialization failed", str(e))
 #         return DatabaseErrorCode.ERR_OPEN_FAILED, None
 
+# def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
+#     """
+#     Initialize database connection and create/upgrade schema safely.
+#     SAFE VERSION: No DROP TABLE. Uses migration logic for existing databases.
+#     """
+#     import sqlite3
+#     import os
+#     from src.database import DatabaseErrorCode, DatabaseHandle
+#     from src.logger import log_info, log_error
+
+#     if not db_path: return DatabaseErrorCode.ERR_INVALID_PARAM, None
+
+#     try:
+#         connection = sqlite3.connect(db_path, check_same_thread=False)
+#         connection.row_factory = sqlite3.Row
+#         connection.execute("PRAGMA foreign_keys = ON")
+#         cursor = connection.cursor()
+
+#         # 1. CREATE CORE TABLES (IF NOT EXISTS)
+#         cursor.execute("""
+#             CREATE TABLE IF NOT EXISTS Users (
+#                 SerialNumber INTEGER PRIMARY KEY,
+#                 Denomination INTEGER DEFAULT 0,
+#                 CustomSerialNumber TEXT UNIQUE,
+#                 FirstName TEXT,
+#                 LastName TEXT,
+#                 auto_address TEXT UNIQUE,
+#                 Description TEXT,
+#                 InboxFee REAL DEFAULT 0.0,
+#                 Class TEXT,
+#                 Beacon TEXT
+#             )
+#         """)
+
+#         # 2. AUTO-MIGRATION: Add missing columns if they don't exist
+#         cursor.execute("PRAGMA table_info(Users)")
+#         existing_cols = [col[1] for col in cursor.fetchall()]
+        
+#         if 'contact_count' not in existing_cols:
+#             log_info(logger, "Database", "Upgrading Users table: adding contact_count")
+#             cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
+        
+#         if 'last_contacted_timestamp' not in existing_cols:
+#             cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp TEXT")
+
+#         # 3. EMAILS & JUNCTION (Safe Creation)
+#         cursor.execute("""
+#             CREATE TABLE IF NOT EXISTS Emails (
+#                 EmailID BLOB PRIMARY KEY,
+#                 Subject TEXT,
+#                 Body TEXT,
+#                 ReceivedTimestamp INTEGER,
+#                 SentTimestamp INTEGER,
+#                 is_read INTEGER DEFAULT 0,
+#                 is_starred INTEGER DEFAULT 0,
+#                 is_trashed INTEGER DEFAULT 0,
+#                 folder TEXT DEFAULT 'inbox',
+#                 Meta BLOB,
+#                 Style BLOB
+#             )
+#         """)
+
+#         cursor.execute("""
+#             CREATE TABLE IF NOT EXISTS Junction_Email_Users (
+#                 EmailID BLOB,
+#                 SerialNumber INTEGER,
+#                 user_type TEXT CHECK(user_type IN ('TO', 'CC', 'BC', 'MASS', 'FROM')),
+#                 PRIMARY KEY (EmailID, SerialNumber, user_type),
+#                 FOREIGN KEY(EmailID) REFERENCES Emails(EmailID) ON DELETE CASCADE
+#             )
+#         """)
+
+#         # 4. TELLS & INDEXES
+#         cursor.execute("CREATE TABLE IF NOT EXISTS received_tells (file_guid TEXT PRIMARY KEY, locker_code BLOB, tell_type INTEGER DEFAULT 0, download_status INTEGER DEFAULT 0, created_at INTEGER DEFAULT (strftime('%s','now')))")
+#         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_pretty ON Users(auto_address)")
+
+#         connection.commit()
+#         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
+#         return DatabaseErrorCode.SUCCESS, handle
+
+#     except sqlite3.Error as e:
+#         if logger: log_error(logger, "Database", "Initialization failed", str(e))
+#         return DatabaseErrorCode.ERR_OPEN_FAILED, None
+
 def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
     """
-    Initialize database connection and create/upgrade schema safely.
-    SAFE VERSION: No DROP TABLE. Uses migration logic for existing databases.
+    Initialize database connection and create all 13 tables from SCHEMA_SQL.
+    PERFECT VERSION: Uses executescript for the full schema and handles column migrations.
     """
     import sqlite3
     import os
-    from src.database import DatabaseErrorCode, DatabaseHandle
+    # Note: Ye variables isi file (database.py) mein defined hain
+    from src.database import DatabaseErrorCode, DatabaseHandle, SCHEMA_SQL
     from src.logger import log_info, log_error
 
-    if not db_path: return DatabaseErrorCode.ERR_INVALID_PARAM, None
+    if not db_path: 
+        return DatabaseErrorCode.ERR_INVALID_PARAM, None
+
+    # 1. Directory Safety: Ensure 'Data/' folder exists
+    db_dir = os.path.dirname(db_path)
+    if db_dir and not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            log_info(logger, "Database", f"Created database directory: {db_dir}")
+        except OSError as e:
+            if logger: log_error(logger, "Database", "Directory creation failed", str(e))
+            return DatabaseErrorCode.ERR_IO, None
 
     try:
+        # 2. Connection Setup
         connection = sqlite3.connect(db_path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
+        
+        # Enable Foreign Keys (Critical for Junction and Attachment tables)
         connection.execute("PRAGMA foreign_keys = ON")
         cursor = connection.cursor()
 
-        # 1. CREATE CORE TABLES (IF NOT EXISTS)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Users (
-                SerialNumber INTEGER PRIMARY KEY,
-                Denomination INTEGER DEFAULT 0,
-                CustomSerialNumber TEXT UNIQUE,
-                FirstName TEXT,
-                LastName TEXT,
-                auto_address TEXT UNIQUE,
-                Description TEXT,
-                InboxFee REAL DEFAULT 0.0,
-                Class TEXT,
-                Beacon TEXT
-            )
-        """)
+        # 3. EXECUTE FULL SCHEMA (Creates all 13 tables, Triggers, and Indexes)
+        # 'executescript' will run your entire SCHEMA_SQL block at once.
+        # It is now safe because you added IF NOT EXISTS to the Users table.
+        cursor.executescript(SCHEMA_SQL)
 
-        # 2. AUTO-MIGRATION: Add missing columns if they don't exist
+        # 4. AUTO-MIGRATION: Add columns if upgrading an existing database
+        # This ensures 'Users' has the extra fields needed for contacts popularity.
         cursor.execute("PRAGMA table_info(Users)")
         existing_cols = [col[1] for col in cursor.fetchall()]
         
@@ -475,40 +564,12 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
             cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
         
         if 'last_contacted_timestamp' not in existing_cols:
+            log_info(logger, "Database", "Upgrading Users table: adding last_contacted_timestamp")
             cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp TEXT")
 
-        # 3. EMAILS & JUNCTION (Safe Creation)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Emails (
-                EmailID BLOB PRIMARY KEY,
-                Subject TEXT,
-                Body TEXT,
-                ReceivedTimestamp INTEGER,
-                SentTimestamp INTEGER,
-                is_read INTEGER DEFAULT 0,
-                is_starred INTEGER DEFAULT 0,
-                is_trashed INTEGER DEFAULT 0,
-                folder TEXT DEFAULT 'inbox',
-                Meta BLOB,
-                Style BLOB
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Junction_Email_Users (
-                EmailID BLOB,
-                SerialNumber INTEGER,
-                user_type TEXT CHECK(user_type IN ('TO', 'CC', 'BC', 'MASS', 'FROM')),
-                PRIMARY KEY (EmailID, SerialNumber, user_type),
-                FOREIGN KEY(EmailID) REFERENCES Emails(EmailID) ON DELETE CASCADE
-            )
-        """)
-
-        # 4. TELLS & INDEXES
-        cursor.execute("CREATE TABLE IF NOT EXISTS received_tells (file_guid TEXT PRIMARY KEY, locker_code BLOB, tell_type INTEGER DEFAULT 0, download_status INTEGER DEFAULT 0, created_at INTEGER DEFAULT (strftime('%s','now')))")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_pretty ON Users(auto_address)")
-
         connection.commit()
+        log_info(logger, "Database", f"Full database schema (13 tables) initialized: {db_path}")
+        
         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
         return DatabaseErrorCode.SUCCESS, handle
 
@@ -647,56 +708,28 @@ def store_email(handle: Any, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, 
 
 def update_draft(handle: DatabaseHandle, email_id: bytes, draft_data: Dict[str, Any]) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
-    Update a draft email's content and recipients.
-
-    Uses JSON Merge Patch semantics:
-    - Key present with value: replace field with new value
-    - Key present with []: clear the field (e.g., remove all TO recipients)
-    - Key absent: leave existing value unchanged
-
-    Args:
-        handle: Database handle
-        email_id: Email GUID (bytes or hex string)
-        draft_data: Dictionary with optional fields:
-            - subject: str (replaces if present)
-            - body: str (replaces if present)
-            - recipient_ids: List[int] (replaces TO recipients if key present)
-            - cc_ids: List[int] (replaces CC recipients if key present)
-
-    Returns:
-        Tuple of (error_code, updated_draft_dict or None)
-
-    C signature: DatabaseErrorCode update_draft(DatabaseHandle* handle, const uint8_t* email_id, const DraftData* data, Draft* out_draft);
+    Update a draft email.
+    FIXED: Uses 'SerialNumber' instead of 'UserID' to match the active schema.
+    FIXED: Uses integer timestamps for consistency.
     """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, None
+    import time
+    import sqlite3
 
-    if email_id is None:
+    if handle is None or handle.connection is None or email_id is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-    # Convert string to bytes if needed
-    if isinstance(email_id, str):
-        success, email_id_bytes, err_msg = _safe_hex_to_bytes(email_id, handle.logger)
-        if not success:
-            log_error(handle.logger, DB_CONTEXT, "Invalid email_id format in update_draft", err_msg)
-            return DatabaseErrorCode.ERR_INVALID_PARAM, None
-        email_id = email_id_bytes
 
     try:
         cursor = handle.connection.cursor()
+        now_ts = int(time.time())
 
-        # Verify email exists, is a draft, and is not trashed
-        cursor.execute("""
-            SELECT EmailID FROM Emails
-            WHERE EmailID = ? AND folder = 'drafts' AND is_trashed = 0
-        """, (email_id,))
-
+        # 1. Verify existence in drafts folder
+        cursor.execute("SELECT 1 FROM Emails WHERE EmailID = ? AND folder = 'drafts'", (email_id,))
         if cursor.fetchone() is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, None
 
-        # Build dynamic UPDATE for subject/body
-        set_parts = ["SentTimestamp = datetime('now')"]  # Always update last_modified
-        params = []
+        # 2. Update core fields (Subject, Body, SentTimestamp)
+        set_parts = ["SentTimestamp = ?"]
+        params = [now_ts]
 
         if 'subject' in draft_data:
             set_parts.append("Subject = ?")
@@ -707,49 +740,34 @@ def update_draft(handle: DatabaseHandle, email_id: bytes, draft_data: Dict[str, 
             params.append(draft_data['body'])
 
         params.append(email_id)
-
-        # Update email content
         query = f"UPDATE Emails SET {', '.join(set_parts)} WHERE EmailID = ?"
         cursor.execute(query, params)
 
-        # Update TO recipients if key is present
+        # 3. Update Recipients (TO) - Fixed to use SerialNumber
         if 'recipient_ids' in draft_data:
-            # Delete existing TO recipients
-            cursor.execute("""
-                DELETE FROM Junction_Email_Users
-                WHERE EmailID = ? AND user_type = 'TO'
-            """, (email_id,))
-
-            # Insert new TO recipients
-            for recipient_id in draft_data['recipient_ids']:
+            cursor.execute("DELETE FROM Junction_Email_Users WHERE EmailID = ? AND user_type = 'TO'", (email_id,))
+            for sn in draft_data['recipient_ids']:
                 cursor.execute("""
-                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, UserID, user_type)
+                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
                     VALUES (?, ?, 'TO')
-                """, (email_id, recipient_id))
+                """, (email_id, sn))
 
-        # Update CC recipients if key is present
+        # 4. Update Recipients (CC) - Fixed to use SerialNumber
         if 'cc_ids' in draft_data:
-            # Delete existing CC recipients
-            cursor.execute("""
-                DELETE FROM Junction_Email_Users
-                WHERE EmailID = ? AND user_type = 'CC'
-            """, (email_id,))
-
-            # Insert new CC recipients
-            for cc_id in draft_data['cc_ids']:
+            cursor.execute("DELETE FROM Junction_Email_Users WHERE EmailID = ? AND user_type = 'CC'", (email_id,))
+            for sn in draft_data['cc_ids']:
                 cursor.execute("""
-                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, UserID, user_type)
+                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
                     VALUES (?, ?, 'CC')
-                """, (email_id, cc_id))
+                """, (email_id, sn))
 
         handle.connection.commit()
-        log_debug(handle.logger, DB_CONTEXT, f"Updated draft: {email_id.hex()}")
-
-        # Return the updated draft
+        
+        # 5. Return fresh data
+        from src.database import retrieve_email
         return retrieve_email(handle, email_id)
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to update draft", str(e))
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
 
@@ -1985,34 +2003,50 @@ def list_emails(
         return DatabaseErrorCode.ERR_INTERNAL, []
 
 def list_drafts(
-    handle: DatabaseHandle,
-    page: int = 1,
+    handle, 
+    page: int = 1, 
     limit: int = 50
-) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]], int]:
+) -> Tuple[Any, List[Dict[str, Any]], int]:
     """
     List drafts with pagination and Pretty Name preview.
-    FIXED: References SerialNumber instead of UserID.
+    FIXED: Robust EmailID hex conversion and key-name alignment with API handlers.
     """
+    from src.database import DatabaseErrorCode
+    from src.logger import log_error
+
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, [], 0
 
+    # 1. PARAMETER NORMALIZATION
     page = max(1, page)
     limit = max(1, min(limit, 200))
     offset = (page - 1) * limit
 
     try:
+        # Dictionary format mein results lene ke liye
         handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
 
-        # Get total count
-        cursor.execute("SELECT COUNT(*) as total FROM Emails WHERE folder = 'drafts' AND is_trashed = 0")
-        total_count = cursor.fetchone()['total']
+        # 2. GET TOTAL COUNT (Excluding trashed)
+        cursor.execute("""
+            SELECT COUNT(*) as total 
+            FROM Emails 
+            WHERE folder = 'drafts' AND is_trashed = 0
+        """)
+        row = cursor.fetchone()
+        total_count = row['total'] if row else 0
 
-        # Get drafts with JOIN on SerialNumber for recipient preview
+        # 3. FETCH DRAFTS WITH RECIPIENT PREVIEW
+        # SerialNumber join ensures we get names for the 'To' field
         cursor.execute("""
             SELECT
-                e.EmailID, e.Subject, e.ReceivedTimestamp, e.SentTimestamp,
-                e.Body, e.is_starred, e.is_read,
+                e.EmailID, 
+                e.Subject, 
+                e.ReceivedTimestamp, 
+                e.SentTimestamp,
+                e.Body, 
+                e.is_starred, 
+                e.is_read,
                 (SELECT COUNT(*) FROM Junction_Email_Users j
                  WHERE j.EmailID = e.EmailID AND j.user_type = 'TO') as recipient_count,
                 (SELECT u.FirstName || ' ' || COALESCE(u.LastName, '')
@@ -2028,19 +2062,33 @@ def list_drafts(
 
         drafts = []
         for row in cursor.fetchall():
+            # --- THE HEX BRIDGE: Robust Conversion ---
+            raw_id = row['EmailID']
+            email_id_hex = ""
+            if isinstance(raw_id, bytes):
+                email_id_hex = raw_id.hex()
+            elif isinstance(raw_id, str):
+                email_id_hex = raw_id
+            
+            # API Handler ki umeed ke mutabiq keys set karna
             drafts.append({
-                'email_id': row['EmailID'].hex(),
-                'subject': row['Subject'],
-                'date_created': row['ReceivedTimestamp'],
-                'last_modified': row['SentTimestamp'],
-                'has_body': bool(row['Body']),
+                'email_id': email_id_hex,
+                'subject': row['Subject'] if row['Subject'] else "(No Subject)",
+                'body': row['Body'] if row['Body'] else "",
+                'received_timestamp': row['ReceivedTimestamp'],
+                'sent_timestamp': row['SentTimestamp'],
+                'is_read': row['is_read'],
+                'is_starred': row['is_starred'],
                 'recipient_count': row['recipient_count'],
-                'first_recipient': row['first_recipient_name'] # Pretty Name
+                'first_recipient': row['first_recipient_name'] if row['first_recipient_name'] else "No Recipient"
             })
 
         return DatabaseErrorCode.SUCCESS, drafts, total_count
+
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Draft list failed", str(e))
+        # ERROR_CONTEXT define karna zaroori hai (e.g., "DATABASE")
+        if hasattr(handle, 'logger'):
+            log_error(handle.logger, "DATABASE", "Draft list query failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, [], 0
 
 def search_emails(

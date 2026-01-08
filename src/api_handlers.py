@@ -73,7 +73,8 @@ from network import NetworkErrorCode
 
 # Download imports
 from download_handler import download_file_sync
-from database import get_received_tell_by_guid
+from database import get_received_tell_by_guid 
+from database import DatabaseErrorCode
 from logger import log_info, log_error
 import os
 
@@ -2216,385 +2217,191 @@ def handle_contacts_delete(request_handler, context):
 # ============================================================================
 # DRAFT MANAGEMENT HANDLERS
 # ============================================================================
-
 def handle_drafts_list(request_handler, context):
     """
     GET /api/mail/drafts - List all drafts with pagination.
-
-    Query Parameters:
-        page: int (default 1, min 1)
-        limit: int (default 50, max 200)
-
-    Response (200):
-    {
-        "drafts": [...],
-        "pagination": {
-            "page": 1,
-            "limit": 50,
-            "total": 15,
-            "total_pages": 1
-        }
-    }
+    FIXED: Uses context.query_params (dot notation) for RequestContext dataclass.
     """
-    db_handle = context.get('db_handle')
-    if db_handle is None:
-        request_handler.send_json_response(500, {
-            "error": "Database not available",
-            "status": "error"
-        })
-        return
+    import math
+    from src.database import DatabaseErrorCode, list_drafts
+    from src.logger import log_info, log_error
 
-    # Parse query parameters
-    query_params = context.get('query_params', {})
+    app_ctx = getattr(request_handler.server_instance, 'app_context', None)
+    if not app_ctx:
+        return request_handler.send_json_response(500, {"error": "Internal context missing"})
 
-    # Parse page
-    page = 1
-    page_str = query_params.get('page', ['1'])[0]
+    db_handle = app_ctx.db_handle
+    logger = app_ctx.logger
+    
+    # RequestContext is a dataclass, use dot notation
+    q_params = context.query_params 
+
     try:
-        page = int(page_str)
-        if page < 1:
-            request_handler.send_json_response(400, {
-                "error": "page must be a positive integer",
-                "status": "error"
-            })
-            return
-    except ValueError:
-        request_handler.send_json_response(400, {
-            "error": "page must be a valid integer",
-            "status": "error"
+        # 1. Parse pagination parameters from query_params dictionary
+        try:
+            # query_params values are lists
+            page_val = q_params.get('page', ['1'])[0]
+            limit_val = q_params.get('limit', ['50'])[0]
+            page = max(1, int(page_val))
+            limit = max(1, min(int(limit_val), 200))
+        except (ValueError, IndexError, KeyError):
+            page, limit = 1, 50
+
+        log_info(logger, "API", f"Listing drafts: Page {page}, Limit {limit}")
+
+        # 2. Database Fetch
+        err, drafts, total = list_drafts(db_handle, page=page, limit=limit)
+
+        if err != DatabaseErrorCode.SUCCESS:
+            log_error(logger, "API", f"Database error in list_drafts: {err}")
+            return request_handler.send_json_response(500, {"error": "Database retrieval failed"})
+
+        # 3. Final Response
+        return request_handler.send_json_response(200, {
+            "status": "success",
+            "drafts": drafts,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "total_pages": math.ceil(total / limit) if total > 0 else 1
+            }
         })
-        return
 
-    # Parse limit
-    limit = 50
-    limit_str = query_params.get('limit', ['50'])[0]
-    try:
-        limit = int(limit_str)
-        if limit < 1 or limit > MAX_DRAFTS_LIMIT:
-            request_handler.send_json_response(400, {
-                "error": f"limit must be between 1 and {MAX_DRAFTS_LIMIT}",
-                "status": "error"
-            })
-            return
-    except ValueError:
-        request_handler.send_json_response(400, {
-            "error": "limit must be a valid integer",
-            "status": "error"
-        })
-        return
-
-    # Get drafts
-    err, drafts, total = list_drafts(db_handle, page=page, limit=limit)
-
-    if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
-            "error": "Database error",
-            "status": "error"
-        })
-        return
-
-    # Calculate total pages
-    total_pages = (total + limit - 1) // limit if total > 0 else 1
-
-    request_handler.send_json_response(200, {
-        "drafts": drafts,
-        "pagination": {
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "total_pages": total_pages
-        }
-    })
-
-
+    except Exception as e:
+        log_error(logger, "API", f"Draft list crash: {str(e)}")
+        return request_handler.send_json_response(500, {"error": "Internal Server Error", "details": str(e)})
+    
 def handle_draft_save(request_handler, context):
     """
     POST /api/mail/draft - Save a new draft.
-
-    Request Body:
-    {
-        "subject": "Draft subject",
-        "body": "Draft content...",
-        "recipient_ids": [1, 2, 3],
-        "cc_ids": [4]
-    }
-
-    Response (201):
-    {
-        "status": "created",
-        "draft": {...}
-    }
+    PROFESSIONAL VERSION: Uses pre-parsed context to avoid blocking hangs.
     """
-    db_handle = context.get('db_handle')
-    if db_handle is None:
-        request_handler.send_json_response(500, {
-            "error": "Database not available",
-            "status": "error"
-        })
-        return
+    import os
+    import time
+    from src.database import DatabaseErrorCode, store_email
+    from src.logger import log_info, log_error
 
-    # Parse request body
+    # 1. Access Shared Resources
+    app_ctx = getattr(request_handler.server_instance, 'app_context', None)
+    if not app_ctx:
+        return request_handler.send_json_response(500, {"error": "Internal context missing"})
+
+    db_handle = app_ctx.db_handle
+    logger = app_ctx.logger
+
     try:
-        body = request_handler.get_json_body()
-        if body is None:
-            body = {}
-    except Exception:
-        request_handler.send_json_response(400, {
-            "error": "Invalid JSON body",
-            "status": "error"
-        })
-        return
+        # 2. DATA SOURCE: Framework already parsed the body into context.json
+        # Reading rfile again here causes the Postman hang!
+        body = context.json if context.json else {}
+        
+        # 3. Metadata Generation
+        # EmailID must be 16 bytes for the BLOB primary key in SQLite
+        email_id_bytes = os.urandom(16)
+        email_id_hex = email_id_bytes.hex()
+        now_ts = int(time.time())
 
-    # Validate subject (optional per feedback)
-    subject = body.get('subject', '')
-    valid, err_msg = _validate_draft_subject(subject)
-    if not valid:
-        request_handler.send_json_response(400, {
-            "error": err_msg,
-            "status": "error"
-        })
-        return
+        # 4. Construct Email Object
+        # Aligns with store_email() requirements in database.py
+        email_data = {
+            'email_id': email_id_bytes,
+            'subject': body.get('subject', '(No Subject)'),
+            'body': body.get('body', ''),
+            'received_timestamp': now_ts,
+            'sent_timestamp': now_ts,
+            'recipient_sns': body.get('recipient_ids', []), # List of SN integers
+            'cc_sns': body.get('cc_ids', []),
+            'folder': 'drafts',
+            'is_read': 1 # Drafts are marked as read by default
+        }
 
-    # Validate body
-    draft_body = body.get('body', '')
-    valid, err_msg = _validate_draft_body(draft_body)
-    if not valid:
-        request_handler.send_json_response(400, {
-            "error": err_msg,
-            "status": "error"
-        })
-        return
+        # 5. Database Execution
+        # store_email handles the 'Emails' and 'Junction_Email_Users' tables
+        err, _ = store_email(db_handle, email_data)
 
-    # Validate recipient_ids
-    recipient_ids = body.get('recipient_ids', [])
-    valid, err_msg = _validate_recipient_ids(recipient_ids, 'recipient_ids')
-    if not valid:
-        request_handler.send_json_response(400, {
-            "error": err_msg,
-            "status": "error"
-        })
-        return
+        if err == DatabaseErrorCode.SUCCESS:
+            log_info(logger, "API", f"Draft saved successfully: {email_id_hex}")
+            
+            # 6. RETURN RESPONSE: send_json_response handles socket flushing correctly
+            return request_handler.send_json_response(201, {
+                "status": "success",
+                "id": email_id_hex,
+                "message": "Draft created successfully",
+                "draft": {
+                    "subject": email_data['subject'],
+                    "timestamp": now_ts
+                }
+            })
+        else:
+            log_error(logger, "API", f"Database error during draft save: {err}")
+            return request_handler.send_json_response(500, {
+                "error": "Failed to save to database",
+                "code": int(err)
+            })
 
-    # Validate cc_ids
-    cc_ids = body.get('cc_ids', [])
-    valid, err_msg = _validate_recipient_ids(cc_ids, 'cc_ids')
-    if not valid:
-        request_handler.send_json_response(400, {
-            "error": err_msg,
-            "status": "error"
-        })
-        return
-
-    # Prepare email dict for store_email
-    from datetime import datetime
-    now = datetime.now().isoformat()
-
-    email_data = {
-        'subject': subject,
-        'body': draft_body,
-        'received_timestamp': now,  # Creation time
-        'sent_timestamp': now,      # Last modified time
-        'recipient_ids': recipient_ids,
-        'cc_ids': cc_ids,
-        'folder': 'drafts',         # Set folder atomically
-        'is_read': 1                # Mark as read to avoid unread count pollution
-    }
-
-    # Store the draft atomically with folder='drafts' and is_read=1
-    err, email_id = store_email(db_handle, email_data)
-
-    if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
-            "error": "Failed to create draft",
-            "status": "error"
-        })
-        return
-
-    # Retrieve the created draft
-    err, draft = retrieve_email(db_handle, email_id)
-
-    if err != DatabaseErrorCode.SUCCESS:
-        # Draft was created but retrieval failed
-        request_handler.send_json_response(201, {
-            "status": "created",
-            "draft": {
-                "email_id": email_id.hex() if email_id else None
-            }
-        })
-        return
-
-    # Format response
-    response_draft = {
-        "email_id": draft.get('email_id'),
-        "subject": draft.get('subject'),
-        "body": draft.get('body'),
-        "recipient_ids": [r['user_id'] for r in draft.get('recipients', [])],
-        "cc_ids": [c['user_id'] for c in draft.get('cc', [])],
-        "folder": draft.get('folder'),
-        "date_created": draft.get('received_timestamp'),
-        "last_modified": draft.get('sent_timestamp')
-    }
-
-    request_handler.send_json_response(201, {
-        "status": "created",
-        "draft": response_draft
-    })
+    except Exception as e:
+        log_error(logger, "API", f"Critical crash in handle_draft_save: {str(e)}")
+        return request_handler.send_json_response(500, {"error": "Internal Server Error", "details": str(e)})
 
 
 def handle_draft_update(request_handler, context):
     """
     PUT /api/mail/draft/{id} - Update an existing draft.
-
-    Uses JSON Merge Patch semantics:
-    - Key present with value: replace field
-    - Key present with []: clear field
-    - Key absent: leave unchanged
-
-    Request Body (all fields optional):
-    {
-        "subject": "Updated subject",
-        "body": "Updated body",
-        "recipient_ids": [5, 6],
-        "cc_ids": []
-    }
-
-    Response (200):
-    {
-        "status": "updated",
-        "draft": {...}
-    }
+    FIXED: Uses correct case-sensitive keys (Subject, Body) from database response.
     """
-    db_handle = context.get('db_handle')
-    if db_handle is None:
-        request_handler.send_json_response(500, {
-            "error": "Database not available",
-            "status": "error"
-        })
-        return
+    import time
+    from src.database import DatabaseErrorCode, update_draft
+    from src.logger import log_info, log_error
 
-    # Get email_id from path
-    path_params = context.get('path_params', {})
-    email_id_str = path_params.get('id')
+    app_ctx = getattr(request_handler.server_instance, 'app_context', None)
+    db_handle = app_ctx.db_handle
+    logger = app_ctx.logger
 
+    # 1. Get ID from path
+    email_id_str = context.path_params.get('id')
     if not email_id_str:
-        request_handler.send_json_response(400, {
-            "error": "email_id is required",
-            "status": "error"
-        })
-        return
+        return request_handler.send_json_response(400, {"error": "Missing email ID in path"})
 
-    # Validate email_id format (32 hex chars or UUID with dashes)
-    clean_id = email_id_str.replace('-', '')
-    if len(clean_id) != 32 or not all(c in '0123456789abcdefABCDEF' for c in clean_id):
-        request_handler.send_json_response(400, {
-            "error": "Invalid email_id format",
-            "status": "error"
-        })
-        return
-
-    # Parse request body
     try:
-        body = request_handler.get_json_body()
-        if body is None:
-            body = {}
-    except Exception:
-        request_handler.send_json_response(400, {
-            "error": "Invalid JSON body",
-            "status": "error"
-        })
-        return
+        # 2. Convert Hex to Binary for DB
+        clean_id_hex = email_id_str.replace('-', '').strip()
+        email_id_bytes = bytes.fromhex(clean_id_hex)
 
-    # Build draft_data with only present keys (JSON Merge Patch semantics)
-    draft_data = {}
+        # 3. Get update data from body
+        body = context.json if context.json else {}
+        
+        update_data = {}
+        if 'subject' in body: update_data['subject'] = body['subject']
+        if 'body' in body: update_data['body'] = body['body']
+        if 'recipient_ids' in body: update_data['recipient_ids'] = body['recipient_ids']
+        if 'cc_ids' in body: update_data['cc_ids'] = body['cc_ids']
 
-    # Validate and add subject if present
-    if 'subject' in body:
-        valid, err_msg = _validate_draft_subject(body['subject'])
-        if not valid:
-            request_handler.send_json_response(400, {
-                "error": err_msg,
-                "status": "error"
+        # 4. Database execution
+        err, updated_raw = update_draft(db_handle, email_id_bytes, update_data)
+
+        if err == DatabaseErrorCode.SUCCESS and updated_raw:
+            log_info(logger, "API", f"Updated draft: {clean_id_hex}")
+
+            # --- THE FIX: Match database column case (Subject, Body, SentTimestamp) ---
+            response_draft = {
+                "id": clean_id_hex,
+                "subject": updated_raw.get('Subject') or "(No Subject)", # Capital 'S'
+                "body": updated_raw.get('Body') or "",                   # Capital 'B'
+                "last_modified": updated_raw.get('SentTimestamp'),       # Capital 'S'
+                "folder": updated_raw.get('folder', 'drafts')
+            }
+
+            return request_handler.send_json_response(200, {
+                "status": "success",
+                "message": "Draft updated",
+                "draft": response_draft
             })
-            return
-        draft_data['subject'] = body['subject']
+        else:
+            return request_handler.send_json_response(404, {"error": "Draft not found or update failed"})
 
-    # Validate and add body if present
-    if 'body' in body:
-        valid, err_msg = _validate_draft_body(body['body'])
-        if not valid:
-            request_handler.send_json_response(400, {
-                "error": err_msg,
-                "status": "error"
-            })
-            return
-        draft_data['body'] = body['body']
-
-    # Validate and add recipient_ids if present
-    if 'recipient_ids' in body:
-        valid, err_msg = _validate_recipient_ids(
-            body['recipient_ids'], 'recipient_ids')
-        if not valid:
-            request_handler.send_json_response(400, {
-                "error": err_msg,
-                "status": "error"
-            })
-            return
-        draft_data['recipient_ids'] = body['recipient_ids']
-
-    # Validate and add cc_ids if present
-    if 'cc_ids' in body:
-        valid, err_msg = _validate_recipient_ids(body['cc_ids'], 'cc_ids')
-        if not valid:
-            request_handler.send_json_response(400, {
-                "error": err_msg,
-                "status": "error"
-            })
-            return
-        draft_data['cc_ids'] = body['cc_ids']
-
-    # Update the draft
-    err, updated_draft = update_draft(db_handle, clean_id, draft_data)
-
-    if err == DatabaseErrorCode.ERR_NOT_FOUND:
-        request_handler.send_json_response(404, {
-            "error": "Draft not found",
-            "email_id": email_id_str,
-            "status": "error"
-        })
-        return
-
-    if err == DatabaseErrorCode.ERR_INVALID_PARAM:
-        request_handler.send_json_response(400, {
-            "error": "Invalid email_id format",
-            "status": "error"
-        })
-        return
-
-    if err != DatabaseErrorCode.SUCCESS:
-        request_handler.send_json_response(500, {
-            "error": "Database error",
-            "status": "error"
-        })
-        return
-
-    # Format response
-    response_draft = {
-        "email_id": updated_draft.get('email_id'),
-        "subject": updated_draft.get('subject'),
-        "body": updated_draft.get('body'),
-        "recipient_ids": [r['user_id'] for r in updated_draft.get('recipients', [])],
-        "cc_ids": [c['user_id'] for c in updated_draft.get('cc', [])],
-        "folder": updated_draft.get('folder'),
-        "date_created": updated_draft.get('received_timestamp'),
-        "last_modified": updated_draft.get('sent_timestamp')
-    }
-
-    request_handler.send_json_response(200, {
-        "status": "updated",
-        "draft": response_draft
-    })
-
-
+    except Exception as e:
+        log_error(logger, "API", f"Draft update crash: {str(e)}")
+        return request_handler.send_json_response(400, {"error": "Invalid request format", "details": str(e)})
 # ============================================================================
 # WALLET BALANCE ENDPOINTS
 # ============================================================================
@@ -2949,6 +2756,7 @@ def register_all_routes(server):
     # Email management endpoints
     server.register_route('GET', '/api/mail/folders', handle_mail_folders)
     server.register_route('GET', '/api/mail/count', handle_mail_count)
+    server.register_route('GET', '/api/mail/drafts', handle_drafts_list)
     server.register_route('GET', '/api/mail/{id}', handle_mail_get)
     server.register_route('DELETE', '/api/mail/{id}', handle_mail_delete)
     server.register_route('PUT', '/api/mail/{id}/move', handle_mail_move)
@@ -2993,7 +2801,6 @@ def register_all_routes(server):
         'DELETE', '/api/contacts/{id}', handle_contacts_delete)
 
     # Draft management endpoints
-    server.register_route('GET', '/api/mail/drafts', handle_drafts_list)
     server.register_route('POST', '/api/mail/draft', handle_draft_save)
     server.register_route('PUT', '/api/mail/draft/{id}', handle_draft_update)
     
