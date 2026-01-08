@@ -229,11 +229,11 @@ END;
 -- ==========================================
 CREATE TABLE IF NOT EXISTS Junction_Email_Users (
     EmailID BLOB,
-    UserID INTEGER,
+    SerialNumber INTEGER, -- FIXED: Changed from UserID
     user_type TEXT CHECK(user_type IN ('TO', 'CC', 'BC', 'MASS', 'FROM')),
-    PRIMARY KEY (EmailID, UserID, user_type),
+    PRIMARY KEY (EmailID, SerialNumber, user_type),
     FOREIGN KEY(EmailID) REFERENCES Emails(EmailID) ON DELETE CASCADE,
-    FOREIGN KEY(UserID) REFERENCES Users(UserID) ON DELETE CASCADE
+    FOREIGN KEY(SerialNumber) REFERENCES Users(SerialNumber) ON DELETE CASCADE -- FIXED
 );
 
 -- ==========================================
@@ -347,8 +347,8 @@ CREATE TABLE IF NOT EXISTS received_stripes (
     server_ip TEXT,
     stripe_id INTEGER,
     is_parity BOOLEAN,
-    port INTEGER,
-    stripe_hash TEXT,  -- ADD THIS LINE
+    port INTEGER, -- FIXED: Added missing column
+    stripe_hash TEXT,
     FOREIGN KEY(tell_id) REFERENCES received_tells(id) ON DELETE CASCADE
 );
 
@@ -708,8 +708,7 @@ def store_email(handle: Any, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, 
 def update_draft(handle: DatabaseHandle, email_id: bytes, draft_data: Dict[str, Any]) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
     Update a draft email.
-    FIXED: Uses 'SerialNumber' instead of 'UserID' to match the active schema.
-    FIXED: Uses integer timestamps for consistency.
+    FIXED: Uses 'SerialNumber' and integer timestamps.
     """
     import time
     import sqlite3
@@ -721,19 +720,18 @@ def update_draft(handle: DatabaseHandle, email_id: bytes, draft_data: Dict[str, 
         cursor = handle.connection.cursor()
         now_ts = int(time.time())
 
-        # 1. Verify existence in drafts folder
+        # 1. Verify existence
         cursor.execute("SELECT 1 FROM Emails WHERE EmailID = ? AND folder = 'drafts'", (email_id,))
         if cursor.fetchone() is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, None
 
-        # 2. Update core fields (Subject, Body, SentTimestamp)
+        # 2. Update core fields
         set_parts = ["SentTimestamp = ?"]
         params = [now_ts]
 
         if 'subject' in draft_data:
             set_parts.append("Subject = ?")
             params.append(draft_data['subject'])
-
         if 'body' in draft_data:
             set_parts.append("Body = ?")
             params.append(draft_data['body'])
@@ -742,31 +740,19 @@ def update_draft(handle: DatabaseHandle, email_id: bytes, draft_data: Dict[str, 
         query = f"UPDATE Emails SET {', '.join(set_parts)} WHERE EmailID = ?"
         cursor.execute(query, params)
 
-        # 3. Update Recipients (TO) - Fixed to use SerialNumber
+        # 3. Update Recipients (TO) - FIXED to SerialNumber
         if 'recipient_ids' in draft_data:
             cursor.execute("DELETE FROM Junction_Email_Users WHERE EmailID = ? AND user_type = 'TO'", (email_id,))
             for sn in draft_data['recipient_ids']:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
-                    VALUES (?, ?, 'TO')
-                """, (email_id, sn))
-
-        # 4. Update Recipients (CC) - Fixed to use SerialNumber
-        if 'cc_ids' in draft_data:
-            cursor.execute("DELETE FROM Junction_Email_Users WHERE EmailID = ? AND user_type = 'CC'", (email_id,))
-            for sn in draft_data['cc_ids']:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
-                    VALUES (?, ?, 'CC')
-                """, (email_id, sn))
+                cursor.execute("INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type) VALUES (?, ?, 'TO')", (email_id, sn))
 
         handle.connection.commit()
         
-        # 5. Return fresh data
+        # 4. Return fresh data with Case-Sensitive keys
         from src.database import retrieve_email
         return retrieve_email(handle, email_id)
 
-    except sqlite3.Error as e:
+    except sqlite3.Error:
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
 
@@ -2001,14 +1987,11 @@ def list_emails(
     except sqlite3.Error as e:
         return DatabaseErrorCode.ERR_INTERNAL, []
 
-def list_drafts(
-    handle, 
-    page: int = 1, 
-    limit: int = 50
-) -> Tuple[Any, List[Dict[str, Any]], int]:
+def list_drafts(handle, page: int = 1, limit: int = 50) -> Tuple[Any, List[Dict[str, Any]], int]:
     """
-    List drafts with pagination and Pretty Name preview.
-    FIXED: Robust EmailID hex conversion and key-name alignment with API handlers.
+    List drafts with pagination and recipient preview.
+    FIXED: Corrected JOIN logic to use 'SerialNumber' instead of 'UserID'.
+    FIXED: Robust EmailID hex conversion for API handlers.
     """
     from src.database import DatabaseErrorCode
     from src.logger import log_error
@@ -2036,7 +2019,7 @@ def list_drafts(
         total_count = row['total'] if row else 0
 
         # 3. FETCH DRAFTS WITH RECIPIENT PREVIEW
-        # SerialNumber join ensures we get names for the 'To' field
+        # FIXED: Joined on 'SerialNumber' to match the active schema
         cursor.execute("""
             SELECT
                 e.EmailID, 
@@ -2062,6 +2045,7 @@ def list_drafts(
         drafts = []
         for row in cursor.fetchall():
             # --- THE HEX BRIDGE: Robust Conversion ---
+            # EmailID BLOB ko string mein badalna laazmi hai JSON ke liye
             raw_id = row['EmailID']
             email_id_hex = ""
             if isinstance(raw_id, bytes):
@@ -2071,13 +2055,13 @@ def list_drafts(
             
             # API Handler ki umeed ke mutabiq keys set karna
             drafts.append({
-                'email_id': email_id_hex,
+                'id': email_id_hex,
                 'subject': row['Subject'] if row['Subject'] else "(No Subject)",
                 'body': row['Body'] if row['Body'] else "",
                 'received_timestamp': row['ReceivedTimestamp'],
                 'sent_timestamp': row['SentTimestamp'],
-                'is_read': row['is_read'],
-                'is_starred': row['is_starred'],
+                'is_read': bool(row['is_read']),
+                'is_starred': bool(row['is_starred']),
                 'recipient_count': row['recipient_count'],
                 'first_recipient': row['first_recipient_name'] if row['first_recipient_name'] else "No Recipient"
             })
@@ -2085,7 +2069,6 @@ def list_drafts(
         return DatabaseErrorCode.SUCCESS, drafts, total_count
 
     except sqlite3.Error as e:
-        # ERROR_CONTEXT define karna zaroori hai (e.g., "DATABASE")
         if hasattr(handle, 'logger'):
             log_error(handle.logger, "DATABASE", "Draft list query failed", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, [], 0
