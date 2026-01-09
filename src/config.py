@@ -163,6 +163,7 @@ def load_config(config_path: str) -> Optional[QMailConfig]:
             serial_number=i.get("serial_number", 0),
             device_id=i.get("device_id", 1),
             authenticity_number=i.get("authenticity_number"),
+            email_address=i.get("email_address"),
         )
 
     # Parse encryption section
@@ -309,6 +310,7 @@ def _config_to_dict(config: QMailConfig) -> dict:
             "denomination": config.identity.denomination,
             "serial_number": config.identity.serial_number,
             "device_id": config.identity.device_id,
+            "email_address": config.identity.email_address,
         },
         "encryption": {
             "enabled": config.encryption.enabled,

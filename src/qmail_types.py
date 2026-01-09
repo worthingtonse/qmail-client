@@ -407,6 +407,7 @@ class IdentityConfig:
     serial_number: int = 0
     device_id: int = 0
     authenticity_number: Optional[str] = None
+    email_address: Optional[str] = None  # Pretty format: Sean.Worthington@CEO#C23.Giga
 
 @dataclass
 class EncryptionConfig:

@@ -108,6 +108,45 @@ def handle_health(request_handler, context):
     request_handler.send_json_response(200, response)
 
 
+def handle_account_identity(request_handler, context):
+    """
+    GET /api/account/identity - Get the user's own identity/email address
+
+    Returns the configured identity including the pretty email address.
+    """
+    app_ctx = request_handler.server_instance.app_context
+    identity = app_ctx.config.identity
+
+    # Check if identity is configured
+    if not identity.serial_number:
+        return request_handler.send_json_response(404, {
+            "error": "Identity not configured",
+            "message": "Use POST /api/setup/import-credentials to set up your identity"
+        })
+
+    # If email_address is not set, try to look it up from the database
+    email_address = identity.email_address
+    if not email_address and identity.serial_number:
+        from src.database import execute_query
+        err, rows = execute_query(
+            app_ctx.db_handle,
+            "SELECT auto_address FROM Users WHERE SerialNumber = ?",
+            (identity.serial_number,)
+        )
+        if err == 0 and rows:
+            email_address = rows[0]['auto_address']
+            # Update runtime config
+            identity.email_address = email_address
+
+    return request_handler.send_json_response(200, {
+        "serial_number": identity.serial_number,
+        "denomination": identity.denomination,
+        "email_address": email_address,
+        "device_id": identity.device_id,
+        "configured": True
+    })
+
+
 def handle_version_check(request_handler, request_context):
     """
     GET /api/admin/version-check - Check if a new client version is available.
@@ -703,8 +742,7 @@ def handle_import_credentials(request_handler, request_context):
             # Update runtime config
             app_ctx.config.identity.serial_number = sn
             app_ctx.config.identity.denomination = dn
-            if hasattr(app_ctx.config.identity, 'email_address'):
-                app_ctx.config.identity.email_address = email_address
+            app_ctx.config.identity.email_address = email_address
 
             # Save config to file using config module's save_config
             from src.config import save_config
@@ -2767,8 +2805,11 @@ def register_all_routes(server):
     """
     # Health / Status
     server.register_route('GET', '/api/health', handle_health)
-    server.register_route("GET", '/api/admin/version-check', handle_version_check) 
+    server.register_route("GET", '/api/admin/version-check', handle_version_check)
     server.register_route('GET', '/api/qmail/ping', handle_ping)
+
+    # Account / Identity
+    server.register_route('GET', '/api/account/identity', handle_account_identity)
 
     # Mail operations
     server.register_route('POST', '/api/mail/send', handle_mail_send)
