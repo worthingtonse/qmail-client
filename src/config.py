@@ -99,6 +99,11 @@ MIN_RAIDA_SERVERS = 25
 CLIENT_VERSION = "2026-01-07"  # Aapka current hardcoded version
 VERSION_URL = "https://raida11.cloudcoin.global/service/qmail_client_version"
 
+# Download URLs for each platform
+DOWNLOAD_URL_WINDOWS = "https://www.distributedmailsystem.com/downloads/qmail.for.windows.zip"
+DOWNLOAD_URL_MAC = "https://www.distributedmailsystem.com/downloads/qmail.for.macs.zip"
+DOWNLOAD_URL_LINUX = "https://www.distributedmailsystem.com/downloads/qmail.for.linux.zip"
+
 # ============================================================================
 # LOAD CONFIG
 # ============================================================================

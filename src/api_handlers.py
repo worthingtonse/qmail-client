@@ -112,8 +112,13 @@ def handle_version_check(request_handler, request_context):
     """
     GET /api/admin/version-check - Check if a new client version is available.
     """
-    # Import CLIENT_VERSION from config.py - single source of truth
-    from config import CLIENT_VERSION
+    # Import from config.py - single source of truth
+    from config import (
+        CLIENT_VERSION,
+        DOWNLOAD_URL_WINDOWS,
+        DOWNLOAD_URL_MAC,
+        DOWNLOAD_URL_LINUX
+    )
 
     app_ctx = request_handler.server_instance.app_context
     logger = app_ctx.logger
@@ -127,7 +132,10 @@ def handle_version_check(request_handler, request_context):
             "current_version": CLIENT_VERSION,
             "latest_version": latest,
             "update_available": update_needed,
-            "message": "Mandatory update available!" if update_needed else "Up to date"
+            "message": "Mandatory update available!" if update_needed else "Up to date",
+            "download_url_windows": DOWNLOAD_URL_WINDOWS,
+            "download_url_mac": DOWNLOAD_URL_MAC,
+            "download_url_linux": DOWNLOAD_URL_LINUX
         })
     except Exception as e:
         return request_handler.send_json_response(500, {"error": str(e)})
