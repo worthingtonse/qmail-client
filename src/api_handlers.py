@@ -618,35 +618,58 @@ def handle_mail_list(request_handler, context):
 
 # src/api_handlers.py
 
-def handle_create_mailbox(request_handler, request_context):
+def handle_import_credentials(request_handler, request_context):
     """
-    POST /api/mail/create-mailbox - Establish identity by staking a locker code.
-    FIXED: Resolves Identity to Pretty Address format after staking.
+    POST /api/setup/import-credentials - Establish identity by staking a locker code.
+    First-time setup: Downloads user credentials from RAIDA using a locker key.
+
+    Request body:
+        {"locker_code": "ABC-1234"}
+
+    The locker code must be exactly 8 characters in format XXX-XXXX (hyphen at index 3).
     """
     from src.task_manager import stake_locker_identity
     from src.coin_scanner import find_identity_coin
     from src.logger import log_info, log_error
-    import re, os, toml, json
+    import re, os, json
 
     app_ctx = request_handler.server_instance.app_context
     logger = app_ctx.logger
 
+    # Parse JSON body
     try:
         data = json.loads(request_context.body.decode('utf-8'))
         raw_code = data.get('locker_code', '').strip()
     except Exception as e:
-        log_error(logger, "CreateMailbox", f"Failed to parse JSON body: {e}")
+        log_error(logger, "ImportCredentials", f"Failed to parse JSON body: {e}")
         return request_handler.send_json_response(400, {"error": "Invalid JSON payload"})
 
-    locker_code = raw_code.replace('-', '').replace('_', '').upper()
-    if len(locker_code) != 8 or not re.match(r'^[A-Z0-9]{8}$', locker_code):
-        return request_handler.send_json_response(400, {"error": "Invalid locker code format"})
+    # Uppercase the code
+    locker_code = raw_code.upper()
+
+    # Validate format: exactly 8 chars, hyphen at index 3 (XXX-XXXX)
+    if len(locker_code) != 8:
+        return request_handler.send_json_response(400, {
+            "error": "Invalid locker code format. Must be exactly 8 characters (e.g., ABC-1234)"
+        })
+
+    if locker_code[3] != '-':
+        return request_handler.send_json_response(400, {
+            "error": "Invalid locker code format. Hyphen must be at position 4 (e.g., ABC-1234)"
+        })
+
+    # Validate alphanumeric parts (XXX and XXXX)
+    parts = locker_code.split('-')
+    if len(parts) != 2 or not re.match(r'^[A-Z0-9]{3}$', parts[0]) or not re.match(r'^[A-Z0-9]{4}$', parts[1]):
+        return request_handler.send_json_response(400, {
+            "error": "Invalid locker code format. Must be alphanumeric XXX-XXXX (e.g., ABC-1234)"
+        })
 
     try:
-        # 1. EXECUTE STAKING
-        log_info(logger, "CreateMailbox", f"Establishing identity from code: {locker_code}")
+        # 1. EXECUTE STAKING - pass the code WITH hyphen
+        log_info(logger, "ImportCredentials", f"Importing credentials from locker code: {locker_code}")
         success = stake_locker_identity(
-            locker_code_bytes=locker_code.encode('ascii'),
+            locker_code_bytes=locker_code,  # Pass as string with hyphen
             app_context=app_ctx,
             target_wallet="Mailbox",
             logger=logger
@@ -663,50 +686,46 @@ def handle_create_mailbox(request_handler, request_context):
             return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
 
         sn = int(identity_coin['sn'])
-        dn = int(identity_coin['dn']) # Offset 34 logic
+        dn = int(identity_coin['dn'])
 
         # 3. PRETTY IDENTITY RESOLUTION (Lookup in Directory)
-        # Hum database mein is SerialNumber ko dhoondenge jo sync se aaya hai
         from src.database import execute_query
         err, rows = execute_query(app_ctx.db_handle, "SELECT auto_address FROM Users WHERE SerialNumber = ?", (sn,))
-        
+
         if err == 0 and rows:
-            # Format: Sean.Worthington@CEO#C23.Giga (Stored in auto_address)
             email_address = rows[0]['auto_address']
         else:
-            # Fallback agar sync abhi nahi hua: standard format
+            # Fallback if sync hasn't happened yet
             email_address = f"0006.{dn}.{sn}"
 
-        # 4. AUTO-UPDATE CONFIG FILE
-        config_path = "config/qmail.toml"
+        # 4. UPDATE RUNTIME CONFIG AND SAVE TO FILE
         try:
-            config_data = toml.load(config_path) if os.path.exists(config_path) else {}
-            if 'identity' not in config_data: config_data['identity'] = {}
-
-            config_data['identity']['serial_number'] = sn
-            config_data['identity']['denomination'] = dn
-            config_data['identity']['email_address'] = email_address # Save Pretty Address
-
-            with open(config_path, 'w') as f: toml.dump(config_data, f)
-            
+            # Update runtime config
             app_ctx.config.identity.serial_number = sn
             app_ctx.config.identity.denomination = dn
-            app_ctx.config.identity.email_address = email_address
-            
-            log_info(logger, "CreateMailbox", f"✓ Config updated for pretty identity: {email_address}")
+            if hasattr(app_ctx.config.identity, 'email_address'):
+                app_ctx.config.identity.email_address = email_address
+
+            # Save config to file using config module's save_config
+            from src.config import save_config
+            config_path = "config/qmail.toml"
+            if save_config(app_ctx.config, config_path):
+                log_info(logger, "ImportCredentials", f"Config saved with identity: {email_address}")
+            else:
+                log_error(logger, "ImportCredentials", "Failed to save config to file")
         except Exception as e:
-            log_error(logger, "CreateMailbox", f"Failed to auto-update qmail.toml: {e}")
+            log_error(logger, "ImportCredentials", f"Failed to update config: {e}")
 
         return request_handler.send_json_response(200, {
             "status": "success",
-            "message": "Mailbox established successfully.",
+            "message": "Credentials imported successfully.",
             "email_address": email_address,
             "serial_number": sn,
             "denomination": dn
         })
 
     except Exception as e:
-        log_error(logger, "CreateMailbox", f"Staking process crashed: {e}")
+        log_error(logger, "ImportCredentials", f"Import process failed: {e}")
         return request_handler.send_json_response(500, {"error": str(e)})
 # ============================================================================
 # DATA ENDPOINTS
@@ -2759,7 +2778,7 @@ def register_all_routes(server):
         'GET', '/api/mail/payment/{id}', handle_mail_payment_download)
     server.register_route('GET', '/api/mail/list', handle_mail_list)
     server.register_route(
-        'POST', '/api/mail/create-mailbox', handle_create_mailbox)
+        'POST', '/api/setup/import-credentials', handle_import_credentials)
 
     # Email management endpoints
     server.register_route('GET', '/api/mail/folders', handle_mail_folders)
@@ -2832,7 +2851,7 @@ if __name__ == "__main__":
     print("  POST /api/mail/send             - Send email")
     print("  GET  /api/mail/download/{id}    - Download email")
     print("  GET  /api/mail/list             - List emails")
-    print("  POST /api/mail/create-mailbox   - Create mailbox")
+    print("  POST /api/setup/import-credentials - Import credentials")
     print("  GET  /api/data/contacts/popular - Get contacts")
     print("  GET  /api/data/emails/search    - Search emails")
     print("  GET  /api/data/users/search     - Search users")

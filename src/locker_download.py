@@ -659,20 +659,50 @@ async def download_from_locker(
     return LockerDownloadResult.SUCCESS, saved_coins
 
 
-def derive_locker_keys(locker_code: bytes) -> list:
+def derive_locker_keys(locker_code: str) -> list:
     """
-    Derive 25 locker IDs (one per RAIDA) from an 8-byte locker code.
-    Formula: MD5(str(raida_id) + locker_code)
+    Derive 25 locker IDs (one per RAIDA) from a locker code in "XXX-XXXX" format.
+
+    Algorithm (matches Go GetLockerIDsFromTransmitCode):
+    1. Split code by hyphen: "ABC-1234" -> parts[0]="ABC", parts[1]="1234"
+    2. For each RAIDA i: MD5("{i}{parts[0]}-{parts[1]}") e.g., MD5("0ABC-1234")
+    3. Set bytes 12-15 to 0xFF
+
+    Args:
+        locker_code: String in "XXX-XXXX" format (8 chars with hyphen at index 3)
+
+    Returns:
+        List of 25 locker keys (16 bytes each)
     """
-    # Normalize to 8 bytes
-    code = locker_code[:8] if len(locker_code) >= 8 else locker_code.ljust(8, b'\x00')
-    
+    # Handle bytes input for backwards compatibility
+    if isinstance(locker_code, bytes):
+        locker_code = locker_code.decode('ascii', errors='ignore')
+
+    # Uppercase and validate format
+    locker_code = locker_code.strip().upper()
+
+    # Split by hyphen
+    parts = locker_code.split('-')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid locker code format: expected 'XXX-XXXX', got '{locker_code}'")
+
     locker_ids = []
     for raida_id in range(25):
-        # Derive unique locker ID for this specific RAIDA shard
-        key_material = str(raida_id).encode() + code
-        locker_ids.append(hashlib.md5(key_material).digest())
-    
+        # Build string exactly as Go does: "{raida_id}{parts[0]}-{parts[1]}"
+        key_material = f"{raida_id}{parts[0]}-{parts[1]}"
+
+        # MD5 hash
+        md5_hash = hashlib.md5(key_material.encode('ascii')).digest()
+
+        # Convert to bytearray to modify last 4 bytes
+        locker_key = bytearray(md5_hash)
+        locker_key[12] = 0xFF
+        locker_key[13] = 0xFF
+        locker_key[14] = 0xFF
+        locker_key[15] = 0xFF
+
+        locker_ids.append(bytes(locker_key))
+
     return locker_ids
 
 

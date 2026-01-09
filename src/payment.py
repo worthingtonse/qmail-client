@@ -290,11 +290,14 @@ def request_locker_code(
                 return ErrorCode.ERR_NOT_FOUND, b''
             return ErrorCode.SUCCESS, locker_code
         else:
-            # Fallback: generate a dummy locker code for testing
+            # Fallback: generate a dummy locker code for testing in XXX-XXXX format
             log_warning(logger_handle, PAYMENT_CONTEXT,
                         "CloudCoin module not available, generating test locker code")
-            import os
-            test_locker = os.urandom(8)
+            import secrets
+            import string
+            random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits)
+                                   for _ in range(7))
+            test_locker = (random_chars[:3] + '-' + random_chars[3:]).encode('ascii')
             return ErrorCode.SUCCESS, test_locker
 
     except Exception as e:

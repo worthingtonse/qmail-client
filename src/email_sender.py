@@ -242,9 +242,11 @@ async def create_recipient_locker(
             # Should not happen if get_coins_by_value logic is sound
             return 1, None
 
-        # 3. Generate random 8-char locker code
-        locker_code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) 
-                              for _ in range(8))
+        # 3. Generate random locker code in XXX-XXXX format (matches Go GenerateTransmitCode)
+        # Generate 7 random alphanumeric chars, insert hyphen at position 3
+        random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits)
+                               for _ in range(7))
+        locker_code = random_chars[:3] + '-' + random_chars[3:]  # e.g., "ABC-1234"
         
         # 4. Get 25 locker keys from code (MD5(raida_id + code))
         locker_keys_25 = get_keys_from_locker_code(locker_code)

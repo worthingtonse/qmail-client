@@ -189,7 +189,7 @@ API Endpoints:
     POST /api/mail/send             - Send email
     GET  /api/mail/download/{id}    - Download email
     GET  /api/mail/list             - List emails in folder
-    POST /api/mail/create-mailbox   - Create new mailbox
+    POST /api/setup/import-credentials - Import credentials (first-time setup)
     GET  /api/data/contacts/popular - Get frequent contacts
     GET  /api/data/emails/search    - Search emails
     GET  /api/data/users/search     - Search users
@@ -1186,7 +1186,7 @@ def main():
     print(
         f"  GET  {base_url}/api/mail/list             - List emails (inbox, sent, etc.)")
     print(
-        f"  POST {base_url}/api/mail/create-mailbox   - Create new mailbox (Stake)")
+        f"  POST {base_url}/api/setup/import-credentials - Import credentials (first-time setup)")
     print(
         f"  GET  {base_url}/api/mail/folders          - List available mail folders")
     print(
