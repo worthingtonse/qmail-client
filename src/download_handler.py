@@ -111,7 +111,8 @@ async def download_file(
 
     locker_code = tell_info['locker_code']
     if isinstance(locker_code, str):
-        locker_code = locker_code.replace('-', '').strip().upper().encode('ascii').ljust(8, b'\x00')
+        # Preserve case and hyphen for Go compatibility
+        locker_code = locker_code.strip().encode('ascii')
 
     err, stripes_info = database.get_stripes_for_tell(db_handle, tell_info['id'])
 

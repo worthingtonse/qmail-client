@@ -678,8 +678,8 @@ def derive_locker_keys(locker_code: str) -> list:
     if isinstance(locker_code, bytes):
         locker_code = locker_code.decode('ascii', errors='ignore')
 
-    # Uppercase and validate format
-    locker_code = locker_code.strip().upper()
+    # Strip whitespace but preserve case to match Go implementation
+    locker_code = locker_code.strip()
 
     # Split by hyphen
     parts = locker_code.split('-')

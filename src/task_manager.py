@@ -1115,49 +1115,116 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
     Aligned with cmd_locker.c and your write_coin_file logic.
     """
     from src.protocol import build_complete_locker_download_request, ProtocolErrorCode
-    from src.locker_download import derive_locker_keys
-    
+
+    # Convert bytes to string if needed - preserve case for Go compatibility
+    if isinstance(locker_code_bytes, bytes):
+        locker_code_str = locker_code_bytes.decode('ascii', errors='ignore').strip()
+    else:
+        locker_code_str = str(locker_code_bytes).strip()
+
     log_info(logger, "Staking", f"Staking coins into {target_wallet} wallet via Command 91...")
-    
-    # 1. Derive MD5 keys for each RAIDA
-    locker_keys = derive_locker_keys(locker_code_bytes)
-    seeds = {} 
-    responses = {} 
+    log_debug(logger, "Staking", f"Locker code: {locker_code_str}")
+
+    # Hardcoded RAIDA IP addresses as fallback (from config.py)
+    RAIDA_IPS_FALLBACK = [
+        "78.46.170.45",      # RAIDA 0
+        "47.229.9.94",       # RAIDA 1
+        "209.46.126.167",    # RAIDA 2
+        "116.203.157.233",   # RAIDA 3
+        "95.183.51.104",     # RAIDA 4
+        "31.163.201.90",     # RAIDA 5
+        "52.14.83.91",       # RAIDA 6
+        "161.97.169.229",    # RAIDA 7
+        "13.234.55.11",      # RAIDA 8
+        "124.187.106.233",   # RAIDA 9
+        "94.130.179.247",    # RAIDA 10
+        "67.181.90.11",      # RAIDA 11
+        "3.16.169.178",      # RAIDA 12
+        "113.30.247.109",    # RAIDA 13
+        "168.220.219.199",   # RAIDA 14
+        "185.37.61.73",      # RAIDA 15
+        "193.7.195.250",     # RAIDA 16
+        "5.161.63.179",      # RAIDA 17
+        "76.114.47.144",     # RAIDA 18
+        "190.105.235.113",   # RAIDA 19
+        "184.18.166.118",    # RAIDA 20
+        "125.236.210.184",   # RAIDA 21
+        "5.161.123.254",     # RAIDA 22
+        "130.255.77.156",    # RAIDA 23
+        "209.205.66.24",     # RAIDA 24
+    ]
+
+    seeds = {}
+    responses = {}
 
     # 2. Parallel Network Requests (Command 91)
     with ThreadPoolExecutor(max_workers=25) as executor:
         future_to_raida = {}
+        servers_used = 0
+
         for raida_id in range(25):
-            ip = app_context.get_server_ip(raida_id)
-            if not ip: continue
-            
+            # Try app_context first, then use fallback hardcoded IPs
+            ip = None
+            if app_context:
+                ip = app_context.get_server_ip(raida_id)
+
+            if not ip:
+                # Fallback to hardcoded IPs
+                ip = RAIDA_IPS_FALLBACK[raida_id]
+                log_debug(logger, "Staking", f"RAIDA {raida_id}: Using fallback IP {ip}")
+            else:
+                log_debug(logger, "Staking", f"RAIDA {raida_id}: Using cached IP {ip}")
+
+            servers_used += 1
+
             # Seed required for AN derivation formula in cmd_locker.c
             seed = os.urandom(16)
             seeds[raida_id] = seed
 
-            srv_cfg = type('Srv', (), {'ip_address': ip, 'port': 50000 + raida_id, 'index': raida_id})
-            
+            srv_cfg = type('Srv', (), {'host': ip, 'port': 50000 + raida_id, 'raida_id': raida_id})()
+
+            # build_complete_locker_download_request takes the locker code string
+            # and derives the key internally: MD5(raida_id + locker_code_str) + 0xFFFFFFFF
             err_p, packet, _, _ = build_complete_locker_download_request(
-                raida_id=raida_id, 
-                locker_key=locker_keys[raida_id], 
-                seed=seed, 
+                raida_id=raida_id,
+                locker_code_str=locker_code_str,
+                seed=seed,
                 logger_handle=logger
             )
-            
+
+            if err_p != ProtocolErrorCode.SUCCESS:
+                log_warning(logger, "Staking", f"RAIDA {raida_id}: Failed to build request packet")
+                continue
+
             # Note: execute_single_stake remains as you defined it earlier
-            future = executor.submit(execute_single_stake, srv_cfg, packet, logger)
+            future = executor.submit(execute_single_stake, srv_cfg, packet, logger, raida_id)
             future_to_raida[future] = raida_id
 
+        log_info(logger, "Staking", f"Sending requests to {servers_used} RAIDA servers...")
+
+        success_count = 0
+        error_count = 0
         for future in as_completed(future_to_raida):
             try:
                 rid = future_to_raida[future]
                 err, coins_found = future.result(timeout=5.0)
                 if err == 0 and coins_found:
-                    responses[rid] = coins_found 
-            except Exception: continue
+                    responses[rid] = coins_found
+                    success_count += 1
+                    log_debug(logger, "Staking", f"RAIDA {rid}: Found {len(coins_found)} coins")
+                else:
+                    error_count += 1
+                    if err != 0:
+                        log_debug(logger, "Staking", f"RAIDA {rid}: Error {err}")
+            except Exception as e:
+                error_count += 1
+                log_warning(logger, "Staking", f"RAIDA {future_to_raida.get(future, '?')}: Exception {e}")
+                continue
+
+        log_info(logger, "Staking", f"Results: {success_count} success, {error_count} errors")
 
     if not responses:
-        log_error(logger, "Staking", "Consensus failed: Locker is empty.")
+        log_error(logger, "Staking", "Consensus failed: Locker is empty or all servers failed.")
         return False
 
     # 3. Identify Unique Coins (DN, SN pairs)
@@ -1206,22 +1273,52 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
 
     return True
 
-def execute_single_stake(srv_cfg, packet, logger):
+def execute_single_stake(srv_cfg, packet, logger, raida_id=None):
     """Network worker for Command 91"""
     from src.network import connect_to_server, disconnect, send_raw_request
     from src.protocol import parse_locker_download_response
-    
-    conn_err, conn = connect_to_server(srv_cfg)
-    if conn_err != 0: return 1, None
-    
-    # Aggressive timeout for responsive staking
-    net_err, resp_h, resp_b = send_raw_request(conn, packet, timeout_ms=2500, logger_handle=logger)
-    disconnect(conn)
-    
-    # Server returns Status 250 on successful Download (Command 91) update
-    if net_err == 0 and resp_h.status == 250:
-        return parse_locker_download_response(resp_b, logger)
-    return 1, None
+
+    rid_str = f"RAIDA {raida_id}" if raida_id is not None else "RAIDA ?"
+
+    try:
+        conn_err, conn = connect_to_server(srv_cfg)
+        if conn_err != 0:
+            log_info(logger, "Staking", f"{rid_str}: Connection failed (error {conn_err})")
+            return 1, None
+
+        # Aggressive timeout for responsive staking
+        net_err, resp_h, resp_b = send_raw_request(conn, packet, timeout_ms=5000, logger_handle=logger)
+        disconnect(conn)
+
+        if net_err != 0:
+            log_info(logger, "Staking", f"{rid_str}: Network error {net_err}")
+            return 2, None
+
+        if resp_h is None:
+            log_info(logger, "Staking", f"{rid_str}: No response header")
+            return 3, None
+
+        # Server returns Status 250 on successful Download (Command 91)
+        # Status 251 = Locker not found/empty
+        if resp_h.status == 250:
+            err, coins = parse_locker_download_response(resp_b, logger)
+            if err == 0:
+                log_info(logger, "Staking", f"{rid_str}: Status 250, found {len(coins) if coins else 0} coins")
+            return err, coins
+        else:
+            # Log the actual status for debugging (INFO level so user can see)
+            status_meaning = {
+                251: "Locker not found/empty",
+                252: "Invalid key",
+                253: "Locker expired",
+                200: "OK but no coins",
+            }.get(resp_h.status, f"Unknown status")
+            log_info(logger, "Staking", f"{rid_str}: Status {resp_h.status} ({status_meaning})")
+            return 4, None
+
+    except Exception as e:
+        log_warning(logger, "Staking", f"{rid_str}: Exception: {e}")
+        return 5, None
 # ============================================================================
 # MAIN (for testing)
 # ============================================================================

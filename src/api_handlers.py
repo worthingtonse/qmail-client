@@ -683,8 +683,8 @@ def handle_import_credentials(request_handler, request_context):
         log_error(logger, "ImportCredentials", f"Failed to parse JSON body: {e}")
         return request_handler.send_json_response(400, {"error": "Invalid JSON payload"})
 
-    # Uppercase the code
-    locker_code = raw_code.upper()
+    # Preserve original case to match Go implementation
+    locker_code = raw_code
 
     # Validate format: exactly 8 chars, hyphen at index 3 (XXX-XXXX)
     if len(locker_code) != 8:
@@ -2601,8 +2601,9 @@ def handle_stake_mailbox(request_handler, context):
     if not raw_code:
         return request_handler.send_json_response(400, {"error": "Locker code required."})
 
-    clean_code = raw_code.replace('-', '').strip().upper()
-    locker_bytes = clean_code.encode('ascii')[:8]
+    # Preserve case and hyphen for Go compatibility
+    clean_code = raw_code.strip()
+    locker_bytes = clean_code.encode('ascii')
 
     # 2. Call Command 91 (Download)
     # NOTE: If this fails with insufficient responses, it confirms servers lack CCV3.

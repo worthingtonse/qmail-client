@@ -2261,30 +2261,39 @@ def parse_locker_download_response(
 ) -> Tuple[ProtocolErrorCode, List[Tuple[int, int]]]:
     """
     Parse the decrypted response from Locker DOWNLOAD command.
-    
-    Response format:
-        [Status (1 byte)] + Repeating: [DN (1 byte) + SN (4 bytes)] + [Terminator (2 bytes)]
+
+    Response format (per RAIDAX protocol fix):
+        [Challenge (16 bytes)] + [Status (1 byte)] + Repeating: [DN (1 byte) + SN (4 bytes)] + [Terminator (2 bytes)]
+
+    FIX: Always skip 16-byte challenge at the beginning of response body.
+    This aligns with the server's get_body_payload() fix which always skips
+    the challenge regardless of encryption type.
     """
     coins = []
 
-    if not decrypted_body or len(decrypted_body) < 2:
+    # FIX: Minimum size is 16 (challenge) + 1 (status) + 2 (terminator) = 19 bytes
+    if not decrypted_body or len(decrypted_body) < 19:
         log_warning(logger_handle, PROTOCOL_CONTEXT,
-                    "Empty or too short locker download response")
+                    f"Empty or too short locker download response: {len(decrypted_body) if decrypted_body else 0} bytes")
         return ProtocolErrorCode.SUCCESS, coins
 
+    # FIX: Always skip the 16-byte challenge at the beginning of the response body
+    # This matches the server-side fix to get_body_payload() which always returns
+    # ci->body + 16, regardless of encryption type
+    body_after_challenge = decrypted_body[16:]
+
     # 1. Strip the terminator 0x3E 0x3E (>>)
-    # Check the end of the body for the terminator
-    if decrypted_body.endswith(TERMINATOR):
-        coin_data = decrypted_body[:-2]
-    elif b'>>' in decrypted_body:
+    if body_after_challenge.endswith(TERMINATOR):
+        coin_data = body_after_challenge[:-2]
+    elif b'>>' in body_after_challenge:
         # Fallback: find it if it's earlier in the buffer
-        pos = decrypted_body.find(b'>>')
-        coin_data = decrypted_body[:pos]
+        pos = body_after_challenge.find(b'>>')
+        coin_data = body_after_challenge[:pos]
     else:
-        coin_data = decrypted_body
+        coin_data = body_after_challenge
 
     # 2. Handle the 1-byte Status Byte
-    # If the length is not a multiple of 5 (5 bytes per coin), 
+    # If the length is not a multiple of 5 (5 bytes per coin),
     # the first byte is almost certainly the status code (e.g., 250 / 0xFA).
     offset = 0
     if len(coin_data) % 5 == 1:
@@ -2336,7 +2345,9 @@ def build_complete_locker_download_request(
     """
     # 1. DERIVE THE LOCKER ACCESS KEY (PAN)
     # The server expects the MD5 of the RAIDA number + the human code
-    raw_input = f"{raida_id}{locker_code_str.strip().upper()}"
+    # IMPORTANT: Preserve original case to match Go implementation
+    # Go: obj := strconv.Itoa(i) + parts[0] + "-" + parts[1]
+    raw_input = f"{raida_id}{locker_code_str.strip()}"
     hasher = hashlib.md5(raw_input.encode('ascii'))
     key_bytes = bytearray(hasher.digest())
     
