@@ -109,27 +109,27 @@ def handle_health(request_handler, context):
 
 
 def handle_version_check(request_handler, request_context):
-     """
+    """
     GET /api/admin/version-check - Check if a new client version is available.
     """
-    # Hardcoded local version for comparison
-     LOCAL_VERSION = "2026-01-05"
-    
-     app_ctx = request_handler.server_instance.app_context
-     logger = app_ctx.logger
-    
-     try:
+    # Import CLIENT_VERSION from config.py - single source of truth
+    from config import CLIENT_VERSION
+
+    app_ctx = request_handler.server_instance.app_context
+    logger = app_ctx.logger
+
+    try:
         # data_sync.py wala helper call karo
         update_needed, latest = check_client_version(logger)
-        
+
         return request_handler.send_json_response(200, {
             "status": "success",
-            "current_version": LOCAL_VERSION,
+            "current_version": CLIENT_VERSION,
             "latest_version": latest,
             "update_available": update_needed,
             "message": "Mandatory update available!" if update_needed else "Up to date"
         })
-     except Exception as e:
+    except Exception as e:
         return request_handler.send_json_response(500, {"error": str(e)})
 
 

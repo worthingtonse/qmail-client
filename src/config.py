@@ -95,6 +95,7 @@ MIN_QMAIL_SERVERS = 5
 MIN_RAIDA_SERVERS = 25
 
 # Version aur URL define karo
+# NOTE: This is the single source of truth for client version (used by api_handlers.py and data_sync.py)
 CLIENT_VERSION = "2026-01-07"  # Aapka current hardcoded version
 VERSION_URL = "https://raida11.cloudcoin.global/service/qmail_client_version"
 
