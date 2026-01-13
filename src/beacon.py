@@ -388,7 +388,7 @@ def _save_state(handle: BeaconHandle):
 def _monitor_loop(handle: BeaconHandle):
     """
     The main loop for the background thread.
-    FIXED: Uses PEEK-Flush to clear RAIDA notification queue and prevent infinite loops.
+    FIXED: Triggers healing callback when PING returns ERR_INVALID_AN.
     """
     import time
     from src.logger import log_info, log_error, log_warning, log_debug
@@ -414,7 +414,6 @@ def _monitor_loop(handle: BeaconHandle):
             if tells:
                 log_info(handle.logger_handle, "BeaconLoop", f"Catchup: Received {len(tells)} pending notifications")
                 
-                # Advance timestamp to the latest notification found
                 latest_ts = max(t.timestamp for t in tells)
                 handle.last_tell_timestamp = latest_ts
                 _save_state(handle)
@@ -428,6 +427,12 @@ def _monitor_loop(handle: BeaconHandle):
             else:
                 log_info(handle.logger_handle, "BeaconLoop", "Catchup complete.")
                 catchup_complete = True
+        
+        elif err == NetworkErrorCode.ERR_INVALID_AN:
+            # do_peek already handles the callback logic internally, so we just exit.
+            log_error(handle.logger_handle, "BeaconLoop", "Catchup detected Fracked Identity. Exiting loop.")
+            return
+
         else:
             log_warning(handle.logger_handle, "BeaconLoop", f"Catchup failed: {err.name}. Retrying...")
             handle.shutdown_event.wait(timeout=2.0)
@@ -481,8 +486,24 @@ def _monitor_loop(handle: BeaconHandle):
                     log_debug(handle.logger_handle, "BeaconLoop", "Long-poll timeout - no mail.")
                 
             elif err == NetworkErrorCode.ERR_INVALID_AN:
-                log_error(handle.logger_handle, "BeaconLoop", "Identity fracked. Stopping monitor.")
+                # --- CRITICAL FIX START ---
+                log_error(handle.logger_handle, "BeaconLoop", "Identity fracked (Invalid AN). Triggering auto-heal...")
+                
+                # 1. Stop the loop logically
+                handle.is_running = False
+                
+                # 2. Trigger the healing orchestrator in app.py
+                if hasattr(handle, 'on_an_invalid') and handle.on_an_invalid:
+                    try:
+                        handle.on_an_invalid(handle.identity)
+                    except Exception as e:
+                        log_error(handle.logger_handle, "BeaconLoop", f"Healing callback crashed: {e}")
+                else:
+                    log_error(handle.logger_handle, "BeaconLoop", "No healing callback registered!")
+                
+                # 3. Exit the thread
                 break
+                # --- CRITICAL FIX END ---
                 
             else:
                 # Network error backoff

@@ -201,33 +201,46 @@ def convert_from_custom_base32(encoded_str: str) -> int:
 # ============================================================================
 def parse_users_csv(csv_text: str, logger_handle=None) -> list:
     """
-    FIXED: Corrected column indices based on RAIDA11 log output.
+    Parses users CSV with robust error handling for empty fields.
     """
     import csv, io
+    from src.logger import log_warning
+    
     users = []
+    if not csv_text:
+        return users
+
     f = io.StringIO(csv_text.strip())
     reader = csv.reader(f)
     
     class_map = {'bit': 0, 'byte': 1, 'kilo': 2, 'mega': 3, 'giga': 4}
     
     for row in reader:
-        # Skip header intelligently
-        if not row or row[0].strip() == 'CustomSerialNumber': continue
+        # Skip header or empty rows
+        if not row or len(row) < 1 or row[0].strip() == 'CustomSerialNumber': 
+            continue
         
         try:
             # RAIDA11 Format: [0:SN, 1:First, 2:Last, 3:Desc, 4:Fee, 5:Class, 6:Beacon]
+            # Ensure row has enough columns
+            if len(row) < 7:
+                log_warning(logger_handle, "DataSync", f"Skipping incomplete row: {row}")
+                continue
+
             raw_base32 = row[0].strip()
             first = row[1].strip()
             last = row[2].strip()
             desc = row[3].strip()
-            fee = float(row[4].strip())
+            
+            # SAFE FLOAT PARSING: Handle empty string '' by defaulting to 0.0
+            fee_str = row[4].strip()
+            fee = float(fee_str) if fee_str else 0.0
+            
             raw_class = row[5].strip().lower()
             
-            # Use fixed helper from previous turn
             numeric_sn = convert_from_custom_base32(raw_base32)
             denom = class_map.get(raw_class, 0)
             
-            # Generate Pretty Address
             pretty_address = f"{first}.{last}@{desc}#{raw_base32}.{raw_class.capitalize()}"
             
             users.append({
@@ -243,7 +256,6 @@ def parse_users_csv(csv_text: str, logger_handle=None) -> list:
                 'beacon': row[6].strip()
             })
         except Exception as e:
-            from src.logger import log_warning
             log_warning(logger_handle, "DataSync", f"Row parse failed: {e}")
             
     return users

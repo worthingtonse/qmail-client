@@ -45,7 +45,7 @@ try:
 except ImportError:
     # Fallback for standalone testing - define complete classes
     from dataclasses import dataclass, field
-    from typing import List
+    from typing import List, Optional, Tuple, Any, Dict, Union
 
     @dataclass
     class ServerLocation:
@@ -2254,74 +2254,80 @@ def decrypt_locker_response(
                   "Failed to decrypt locker response", str(e))
         return ProtocolErrorCode.ERR_DECRYPTION_FAILED, b''
 
-
 def parse_locker_download_response(
     decrypted_body: bytes,
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, List[Tuple[int, int]]]:
     """
     Parse the decrypted response from Locker DOWNLOAD command.
-
-    Response format (per RAIDAX protocol fix):
-        [Challenge (16 bytes)] + [Status (1 byte)] + Repeating: [DN (1 byte) + SN (4 bytes)] + [Terminator (2 bytes)]
-
-    FIX: Always skip 16-byte challenge at the beginning of response body.
-    This aligns with the server's get_body_payload() fix which always skips
-    the challenge regardless of encryption type.
+    
+    Robust Version: Handles "Raw Coins" (5 bytes) which the server sends for Type 0,
+    as well as "Challenge + Coins" formats.
     """
+    import struct
+    
     coins = []
-
-    # FIX: Minimum size is 16 (challenge) + 1 (status) + 2 (terminator) = 19 bytes
-    if not decrypted_body or len(decrypted_body) < 19:
-        log_warning(logger_handle, PROTOCOL_CONTEXT,
-                    f"Empty or too short locker download response: {len(decrypted_body) if decrypted_body else 0} bytes")
+    
+    if not decrypted_body:
         return ProtocolErrorCode.SUCCESS, coins
 
-    # FIX: Always skip the 16-byte challenge at the beginning of the response body
-    # This matches the server-side fix to get_body_payload() which always returns
-    # ci->body + 16, regardless of encryption type
-    body_after_challenge = decrypted_body[16:]
+    # The server logic (cmd_locker.c) writes raw coins directly to the buffer.
+    # It might append a terminator (>>) depending on the path.
+    # We detect the format based on alignment with 5-byte coin records.
+    
+    body_to_parse = decrypted_body
+    
+    # Check 1: Is it exactly multiples of 5? (Raw Coins)
+    if len(decrypted_body) % 5 == 0:
+        body_to_parse = decrypted_body
+        
+    # Check 2: Is it Coins + 2-byte Terminator?
+    elif len(decrypted_body) % 5 == 2:
+        # Check if it ends with '>>' (0x3E3E)
+        if decrypted_body.endswith(b'\x3e\x3e'):
+            body_to_parse = decrypted_body[:-2]
+        else:
+            # Fallback: Assume the last 2 bytes are junk or terminator
+            body_to_parse = decrypted_body[:-2]
 
-    # 1. Strip the terminator 0x3E 0x3E (>>)
-    if body_after_challenge.endswith(TERMINATOR):
-        coin_data = body_after_challenge[:-2]
-    elif b'>>' in body_after_challenge:
-        # Fallback: find it if it's earlier in the buffer
-        pos = body_after_challenge.find(b'>>')
-        coin_data = body_after_challenge[:pos]
-    else:
-        coin_data = body_after_challenge
+    # Check 3: Does it look like it has a 16-byte Challenge header?
+    elif len(decrypted_body) > 16:
+        remaining = len(decrypted_body) - 16
+        if remaining % 5 == 0:
+             body_to_parse = decrypted_body[16:]
+        elif remaining % 5 == 2:
+             body_to_parse = decrypted_body[16:-2]
 
-    # 2. Handle the 1-byte Status Byte
-    # If the length is not a multiple of 5 (5 bytes per coin),
-    # the first byte is almost certainly the status code (e.g., 250 / 0xFA).
+    # Parse the identified body
     offset = 0
-    if len(coin_data) % 5 == 1:
-        # Skip the status byte to align with the coin data
-        offset = 1
-
-    # 3. Parse coins (5 bytes each: 1 signed denom + 4 unsigned SN)
-    # Using '>bI' handles Big-Endian, signed denomination, and serial number correctly
+    total_len = len(body_to_parse)
+    
     try:
-        while offset + 5 <= len(coin_data):
-            # b: signed char (1 byte) for denomination (-8 to 11)
-            # I: unsigned int (4 bytes) for serial number
-            denomination, serial_number = struct.unpack('>bI', coin_data[offset : offset + 5])
+        while offset + 5 <= total_len:
+            # Format: [Denom (1 byte)][Serial Number (4 bytes, Big Endian)]
+            # b: signed char, I: unsigned int
+            denomination, serial_number = struct.unpack('>bI', body_to_parse[offset : offset + 5])
             
-            # Validation: CloudCoin denominations are between -8 and 11
-            if -8 <= denomination <= 11:
+            # Sanity Check: CloudCoin denominations are usually small integers (-5 to 25)
+            # This helps filter out garbage if we parsed the wrong offset
+            if -128 <= denomination <= 127: 
                 coins.append((denomination, serial_number))
             else:
-                log_warning(logger_handle, PROTOCOL_CONTEXT,
-                            f"Invalid denomination {denomination} for SN {serial_number} - skipping")
+                log_warning(logger_handle, PROTOCOL_CONTEXT, 
+                           f"Skipping invalid coin record at offset {offset}: den={denomination} sn={serial_number}")
             
             offset += 5
+            
     except struct.error as e:
         log_error(logger_handle, PROTOCOL_CONTEXT, f"Failed to unpack coin data: {e}")
         return ProtocolErrorCode.ERR_INVALID_BODY, coins
 
+    if not coins and len(decrypted_body) > 0:
+        log_warning(logger_handle, PROTOCOL_CONTEXT, 
+                   f"Parsed 0 coins from {len(decrypted_body)} bytes. Raw: {decrypted_body.hex()}")
+
     log_debug(logger_handle, PROTOCOL_CONTEXT,
-              f"Parsed {len(coins)} coins from locker download response")
+              f"Parsed {len(coins)} coins from locker response ({len(decrypted_body)} bytes)")
 
     return ProtocolErrorCode.SUCCESS, coins
 

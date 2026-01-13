@@ -20,7 +20,7 @@ import json
 import re
 import socket
 from math import ceil
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Dict, Union
 from task_manager import create_task, start_task, TaskErrorCode
 # from aiohttp import web
 import os
@@ -272,11 +272,11 @@ def handle_mail_send(request_handler, context):
     POST /api/mail/send - Send an email
     RESOLVES: Pretty Addresses (Sean.Worthington@CEO#C23.Giga) to numeric IDs for binary protocol.
     """
-    from src.email_sender import send_email_async, SendEmailErrorCode, validate_request
-    from src.qmail_types import SendEmailRequest
-    from src.task_manager import create_task, start_task, update_task_progress, complete_task, fail_task
-    from src.logger import log_info, log_error
-    from src.database import get_user_by_address, DatabaseErrorCode
+    from email_sender import send_email_async, SendEmailErrorCode, validate_request
+    from qmail_types import SendEmailRequest
+    from task_manager import create_task, start_task, update_task_progress, complete_task, fail_task
+    from logger import log_info, log_error
+    from database import get_user_by_address, DatabaseErrorCode
 
     app_ctx = request_handler.server_instance.app_context
     content_type = context.headers.get('Content-Type', '')
@@ -311,8 +311,9 @@ def handle_mail_send(request_handler, context):
         # DB lookup for Sean.Worthington@CEO#C23.Giga
         err, user_info = get_user_by_address(app_ctx.db_handle, addr)
         if err == DatabaseErrorCode.SUCCESS and user_info:
-            # We store the user info; sender logic will extract SN/Denom later
-            resolved_to.append(user_info['auto_address'])
+            # Pass Technical Address (0006.D.SN) so email_sender can parse it easily
+            tech_addr = f"0006.{user_info['Denomination']}.{user_info['SerialNumber']}"
+            resolved_to.append(tech_addr)
         else:
             resolved_to.append(addr) # Fallback to raw string
     
@@ -724,8 +725,9 @@ def handle_import_credentials(request_handler, request_context):
         if not identity_coin:
             return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
 
-        sn = int(identity_coin['sn'])
-        dn = int(identity_coin['dn'])
+       # FIX: Use .get() with fallback or correct key names
+        sn = int(identity_coin.get('serial_number', identity_coin.get('sn', 0)))
+        dn = int(identity_coin.get('denomination', identity_coin.get('dn', 0)))
 
         # 3. PRETTY IDENTITY RESOLUTION (Lookup in Directory)
         from src.database import execute_query

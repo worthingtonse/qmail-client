@@ -34,7 +34,7 @@ import os
 import argparse
 import time
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Any, List, Optional, Tuple, Dict, Union
 import struct
 
 # Detect if running as a bundled EXE or as a script
@@ -605,7 +605,7 @@ def validate_tell_payment_sync(
     """
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from typing import Tuple, Optional, Dict, Any
+    
 
     try:
         # Internal imports to ensure consistency

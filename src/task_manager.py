@@ -1298,12 +1298,12 @@ def execute_single_stake(srv_cfg, packet, logger, raida_id=None):
             log_info(logger, "Staking", f"{rid_str}: No response header")
             return 3, None
 
-        # Server returns Status 250 on successful Download (Command 91)
-        # Status 251 = Locker not found/empty
-        if resp_h.status == 250:
+        # FIX: Accept both 250 (OK) and 241 (ALL_PASS) as success
+        # RAIDA uses 241 to mean "Validation Passed & Coins Returned"
+        if resp_h.status == 250 or resp_h.status == 241:
             err, coins = parse_locker_download_response(resp_b, logger)
             if err == 0:
-                log_info(logger, "Staking", f"{rid_str}: Status 250, found {len(coins) if coins else 0} coins")
+                log_info(logger, "Staking", f"{rid_str}: Status {resp_h.status}, found {len(coins) if coins else 0} coins")
             return err, coins
         else:
             # Log the actual status for debugging (INFO level so user can see)
@@ -1312,6 +1312,7 @@ def execute_single_stake(srv_cfg, packet, logger, raida_id=None):
                 252: "Invalid key",
                 253: "Locker expired",
                 200: "OK but no coins",
+                241: "All Checks Passed" 
             }.get(resp_h.status, f"Unknown status")
             log_info(logger, "Staking", f"{rid_str}: Status {resp_h.status} ({status_meaning})")
             return 4, None

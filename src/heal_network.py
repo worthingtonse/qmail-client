@@ -266,34 +266,69 @@ def get_raida_endpoint(raida_id: int) -> Tuple[str, int]:
 # ============================================================================
 # LOW-LEVEL NETWORK OPERATIONS
 # ============================================================================
-
 def send_request(
     raida_id: int,
     request_data: bytes,
-    timeout: float = RAIDA_TIMEOUT
+    timeout: float = None  # CHANGED: Default to None to force dynamic lookup
 ) -> Tuple[HealErrorCode, bytes]:
     """
     Send a request to a RAIDA server and receive response.
-
-    Uses TCP socket for reliable communication.
-
-    Args:
-        raida_id: Target RAIDA server ID (0-24)
-        request_data: Complete request (header + body)
-        timeout: Socket timeout in seconds
-
-    Returns:
-        Tuple of (error_code, response_bytes)
+    Includes KeepAlive and Dynamic Timeout to prevent 30s disconnects.
     """
+    import select
+    import errno
+    
+    # DYNAMIC LOOKUP: Ensures we use the latest 120s value from protocol
+    if timeout is None:
+        from heal_protocol import RAIDA_TIMEOUT
+        timeout = RAIDA_TIMEOUT
+
     host, port = get_raida_endpoint(raida_id)
+    sock = None
 
     try:
         # Create TCP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        # CRITICAL FIX: Enable KeepAlive.
+        # This prevents routers/firewalls from killing the connection 
+        # while we wait 120s for the Server to fix the coins.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
+        # Set non-blocking mode for connect to respect timeout
+        sock.setblocking(False)
+        
+        # Try to connect (will raise error immediately for non-blocking)
+        try:
+            sock.connect((host, port))
+            # If we get here, connection succeeded immediately (localhost/fast)
+        except socket.error as e:
+            # Check if it's "in progress" error (expected for non-blocking connect)
+            if e.errno not in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+                # Real error, not just "in progress"
+                logger.warning(f"RAIDA{raida_id} connection error ({host}:{port}): {e}")
+                return HealErrorCode.ERR_NETWORK_ERROR, b''
+        
+        # Wait for connection with timeout using select
+        _, writable, exceptional = select.select([], [sock], [sock], timeout)
+        
+        if exceptional:
+            logger.warning(f"RAIDA{raida_id} connection error ({host}:{port})")
+            return HealErrorCode.ERR_NETWORK_ERROR, b''
+        
+        if not writable:
+            logger.warning(f"RAIDA{raida_id} connection timeout ({host}:{port}) - Waited {timeout}s")
+            return HealErrorCode.ERR_NETWORK_ERROR, b''
+        
+        # Check if connection actually succeeded
+        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if err != 0:
+            logger.warning(f"RAIDA{raida_id} connection failed ({host}:{port}): error {err}")
+            return HealErrorCode.ERR_NETWORK_ERROR, b''
+        
+        # Connection successful, set blocking mode for I/O operations
+        sock.setblocking(True)
         sock.settimeout(timeout)
-
-        # Connect to RAIDA
-        sock.connect((host, port))
 
         # Send request
         sock.sendall(request_data)
@@ -303,7 +338,6 @@ def send_request(
         while len(response_header) < RESPONSE_HEADER_SIZE:
             chunk = sock.recv(RESPONSE_HEADER_SIZE - len(response_header))
             if not chunk:
-                sock.close()
                 return HealErrorCode.ERR_NETWORK_ERROR, b''
             response_header += chunk
 
@@ -319,11 +353,10 @@ def send_request(
                     break
                 response_body += chunk
 
-        sock.close()
         return HealErrorCode.SUCCESS, response_header + response_body
 
     except socket.timeout:
-        logger.warning(f"RAIDA{raida_id} timeout ({host}:{port})")
+        logger.warning(f"RAIDA{raida_id} timeout ({host}:{port}) - Waited {timeout}s")
         return HealErrorCode.ERR_NETWORK_ERROR, b''
     except socket.error as e:
         logger.warning(f"RAIDA{raida_id} socket error: {e}")
@@ -331,8 +364,13 @@ def send_request(
     except Exception as e:
         logger.error(f"RAIDA{raida_id} unexpected error: {e}")
         return HealErrorCode.ERR_INTERNAL, b''
-
-
+    finally:
+        # RESOURCE FIX: Always close socket to prevent 'Too many open files'
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
 # ============================================================================
 # GET TICKET OPERATIONS
 # ============================================================================
@@ -510,8 +548,20 @@ def fix_on_raida(
         tickets: List of 25 ticket IDs from other RAIDA
         result_dict: Shared dict to store results {raida_id: [passed_list]}
     """
+    # Log detailed ticket information
+    valid_ticket_raida = [i for i, t in enumerate(tickets) if t != 0]
+    failed_ticket_raida = [i for i, t in enumerate(tickets) if t == 0]
+    
+    logger.info(f"RAIDA{raida_id}: Starting Fix for {len(coins)} coin(s)")
+    logger.info(f"RAIDA{raida_id}: Valid tickets from {len(valid_ticket_raida)} RAIDA: {valid_ticket_raida}")
+    logger.info(f"RAIDA{raida_id}: Failed tickets from {len(failed_ticket_raida)} RAIDA: {failed_ticket_raida}")
+    logger.info(f"RAIDA{raida_id}: PG = {pg.hex()}")
+    
     coin_data = [(c.denomination, c.serial_number) for c in coins]
+    logger.info(f"RAIDA{raida_id}: Coin data = {coin_data}")
+    
     body = build_fix_body(coin_data, pg, tickets)
+    logger.info(f"RAIDA{raida_id}: Fix body size = {len(body)} bytes")
 
     # Build header
     header = build_request_header(
@@ -522,23 +572,31 @@ def fix_on_raida(
     )
 
     request = header + body
+    logger.info(f"RAIDA{raida_id}: Sending Fix request ({len(request)} bytes)...")
+    
     err, response = send_request(raida_id, request)
 
     if err != HealErrorCode.SUCCESS:
-        logger.warning(f"RAIDA{raida_id} FIX command failed: error={err}")
+        logger.warning(f"RAIDA{raida_id}: FIX command failed with error={err}")
         result_dict[raida_id] = [False] * len(coins)
         return
 
+    logger.info(f"RAIDA{raida_id}: Received response ({len(response)} bytes)")
+    
+    # Parse response
+    err, fix_results = parse_fix_response(response, len(coins))
     if err == HealErrorCode.SUCCESS:
-        err, fix_results = parse_fix_response(response, len(coins))
-        if err == HealErrorCode.SUCCESS:
-            result_dict[raida_id] = fix_results
-            logger.debug(f"RAIDA{raida_id}: fix results = {fix_results}")
+        result_dict[raida_id] = fix_results
+        success_count = sum(fix_results)
+        if success_count > 0:
+            logger.info(f"RAIDA{raida_id}: ✓ Successfully fixed {success_count}/{len(coins)} coin(s)")
         else:
-            result_dict[raida_id] = [False] * len(coins)
+            logger.warning(f"RAIDA{raida_id}: ✗ Fix completed but no coins were fixed (0/{len(coins)})")
+            logger.warning(f"RAIDA{raida_id}: Server validation failed - got fewer than 14 votes")
+            logger.warning(f"RAIDA{raida_id}: This happened because {len(failed_ticket_raida)} RAIDA didn't respond during ticket validation")
     else:
+        logger.warning(f"RAIDA{raida_id}: Failed to parse fix response, error={err}")
         result_dict[raida_id] = [False] * len(coins)
-
 
 def fix_coins_parallel(
     coins: List[CloudCoinBin],

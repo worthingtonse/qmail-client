@@ -13,10 +13,9 @@ Changes in v1.2.0:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import List, Optional, Dict, Union, Any, Callable
 from enum import IntEnum
 from threading import Thread, Event
-from typing import Callable
 
 
 # ============================================================================
@@ -247,24 +246,30 @@ class LockerStatus(IntEnum):
 class User:
     """
     Represents a user/contact from the 'Users' table.
-    C: typedef struct User { ... } User;
+    Aligned with SQL: 
+    SerialNumber, Denomination, CustomSerialNumber, FirstName, LastName, 
+    auto_address, Description, InboxFee, Class, Beacon
     """
-    user_id: Optional[int] = None
-    first_name: Optional[str] = None
-    middle_name: Optional[str] = None
-    last_name: Optional[str] = None
-    auto_address: Optional[str] = None      # QMail address
-    description: Optional[str] = None
-    avatar: Optional[bytes] = None          # Avatar image data
-    streak: int = 0
-    sending_fee: Optional[str] = None
-    contact_count: int = 0
-    last_contacted_timestamp: Optional[str] = None
+    serial_number: int = 0              # DB: SerialNumber (PK)
+    denomination: int = 0               # DB: Denomination
+    custom_serial_number: Optional[str] = None # DB: CustomSerialNumber
+    first_name: Optional[str] = None    # DB: FirstName
+    last_name: Optional[str] = None     # DB: LastName
+    auto_address: Optional[str] = None  # DB: auto_address
+    description: Optional[str] = None   # DB: Description
+    inbox_fee: float = 0.0              # DB: InboxFee
+    coin_class: Optional[str] = None    # DB: Class
+    beacon: Optional[str] = "raida11"   # DB: Beacon
+    contact_count: int = 0              # DB: contact_count
+    last_contacted_timestamp: int = 0   # DB: last_contacted_timestamp
 
+    @property
     def display_name(self) -> str:
         """Get formatted display name."""
-        parts = [p for p in [self.first_name, self.middle_name, self.last_name] if p]
-        return " ".join(parts) if parts else self.auto_address or "Unknown"
+        parts = [p for p in [self.first_name, self.last_name] if p]
+        if parts:
+            return " ".join(parts)
+        return self.custom_serial_number or str(self.serial_number)
 
 
 @dataclass

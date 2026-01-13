@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 # RAIDA Network Configuration
 RAIDA_COUNT = 25
-RAIDA_TIMEOUT = 120  # seconds per request
+RAIDA_TIMEOUT = 300  # seconds per request
 
 # Coin identifier for CloudCoin
 COIN_ID = 0x0006
