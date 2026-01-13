@@ -364,45 +364,38 @@ def generate_coin_filename(coin: CloudCoinBin) -> str:
 
 def move_coin_file(coin: CloudCoinBin, dest_folder: str) -> HealErrorCode:
     """
-    Move a coin file to a new folder.
-
-    Writes the coin with updated POWN to the new location,
-    then removes the old file. Updates coin.file_path.
-
-    Args:
-        coin: CloudCoinBin with source file_path
-        dest_folder: Destination folder path
-
-    Returns:
-        HealErrorCode
+    Move a coin file to a new folder while PRESERVING its original filename.
+    FIXED: Uses the original filename instead of generating a new one based on SN.
     """
     if not coin.file_path or not os.path.exists(coin.file_path):
         return HealErrorCode.ERR_FILE_NOT_FOUND
-
+ 
     try:
-        # Generate new filename with updated POWN
-        new_filename = generate_coin_filename(coin)
-        new_path = os.path.join(dest_folder, new_filename)
-
+        # FIXED: Capture the original filename from the existing path
+        # Taaki Tabeen.bin heal hone ke baad bhi Tabeen.bin hi rahe
+        original_filename = os.path.basename(coin.file_path)
+        new_path = os.path.join(dest_folder, original_filename)
+ 
         # Ensure destination folder exists
         if not os.path.exists(dest_folder):
             os.makedirs(dest_folder, exist_ok=True)
-
-        # Write coin to new location (to update POWN in file)
+ 
+        # Write coin to new location (to update the internal POWN bytes)
         err = write_coin_file(new_path, coin, include_pans=coin.has_pans)
         if err != HealErrorCode.SUCCESS:
             return err
-
-        # Remove old file
+ 
+        # Remove the old file only if the path has actually changed
         if os.path.exists(coin.file_path) and coin.file_path != new_path:
             os.remove(coin.file_path)
-
+ 
+        # Update the object's path reference
         coin.file_path = new_path
         return HealErrorCode.SUCCESS
-
+ 
     except IOError as e:
+        logger.error(f"IO Error moving coin file {coin.serial_number}: {e}")
         return HealErrorCode.ERR_IO_ERROR
-
 
 def load_coins_from_folder(folder_path: str) -> Tuple[HealErrorCode, List[CloudCoinBin]]:
     """

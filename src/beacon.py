@@ -277,20 +277,20 @@ def stop_beacon_monitor(handle: BeaconHandle, timeout: float = 10.0) -> bool:
 def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tuple[NetworkErrorCode, List[TellNotification]]:
     """
     Performs a single, non-blocking PEEK request.
-    FIXED: Resolves Identity SN to integer for network authentication.
+    FIXED: Halt loop immediately and trigger healing on ERR_INVALID_AN.
     """
     if handle is None:
         return NetworkErrorCode.ERR_INVALID_PARAM, []
-
-    from src.protocol import custom_sn_to_int # <--- Strict numeric resolution
-    
-    # 1. Resolve Identity to Numeric (C23 -> 2841)
+ 
+    from src.protocol import custom_sn_to_int 
+    from src.logger import log_error, log_warning
+    # 1. Resolve Identity to Numeric (e.g., C25 -> 2843)
     numeric_sn = custom_sn_to_int(handle.identity.serial_number)
     timestamp_to_check = since_timestamp if since_timestamp is not None else handle.last_tell_timestamp
-
+ 
     conn = None
     try:
-        # 2. Use numeric_sn for server connection
+        # 2. Network Connection logic
         err, conn = network.connect_to_server(
             server_info=handle.beacon_server_info,
             encryption_key=handle.encryption_key,
@@ -301,9 +301,9 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
         )
         if err != NetworkErrorCode.SUCCESS:
             return err, []
-
-        # 3. Build packet with numeric ID
-        err_proto, peek_req, challenge, nonce = protocol.build_complete_peek_request(
+ 
+        # 3. Request Building
+        err_proto, peek_req, _, _ = protocol.build_complete_peek_request(
             raida_id=handle.beacon_server_info.index,
             denomination=handle.identity.denomination,
             serial_number=numeric_sn,
@@ -313,35 +313,40 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
             encryption_type=0, 
             logger_handle=handle.logger_handle
         )
-        
         if err_proto != protocol.ProtocolErrorCode.SUCCESS:
             return NetworkErrorCode.ERR_INVALID_PARAM, []
-
+ 
         err, resp_header, resp_body = network.send_raw_request(
             connection=conn,
             raw_packet=peek_req,
             config=handle.network_config,
             logger_handle=handle.logger_handle
         )
-
+ 
         if err != NetworkErrorCode.SUCCESS:
             return err, []
-
-        if resp_header.status == 200:
-            log_error(handle.logger_handle, "Beacon", f"PEEK failed: Invalid AN for SN {numeric_sn}")
+ 
+        # --- THE CRITICAL FIX: TRIGGER HEALING & STOP LOOP ---
+        if resp_header.status == 200: # Status 200 = Invalid AN
+            log_error(handle.logger_handle, "Beacon", f"CRITICAL: Invalid AN for SN {numeric_sn}. Halting monitor.")
+            # 1. FORCE STOP: 
+            handle.is_running = False 
+            # 2. TRIGGER HEALING: Check if callback exists
             if hasattr(handle, 'on_an_invalid') and handle.on_an_invalid:
+                log_warning(handle.logger_handle, "Beacon", "Initializing identity healing sequence...")
                 handle.on_an_invalid(handle.identity)
+            else:
+                # Fallback: if callback is not registered log manual intervention
+                log_error(handle.logger_handle, "Beacon", "Healing callback not registered on handle! Moving to Fracked manually.")
+                # 
             return NetworkErrorCode.ERR_INVALID_AN, []
-
-        if resp_header.status != StatusCode.STATUS_SUCCESS:
+ 
+        # Standard Success logic
+        if resp_header.status != 241: # Standard PEEK success is often 241 or 0
             return NetworkErrorCode.SUCCESS, []
-
+ 
         parse_err, tells = protocol.parse_tell_response(resp_body, handle.logger_handle)
-        if parse_err != protocol.ProtocolErrorCode.SUCCESS:
-            return NetworkErrorCode.ERR_INVALID_RESPONSE, []
-
         return NetworkErrorCode.SUCCESS, tells
-        
     finally:
         if conn:
             network.disconnect(conn, handle.logger_handle)

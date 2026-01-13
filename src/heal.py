@@ -481,6 +481,12 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
         err, fixes_applied = fix_with_tickets(
             coins_to_fix, tickets, fracked_raida)
 
+        # CRITICAL FIX: Abort on Network Error to prevent infinite loops
+        if err == HealErrorCode.ERR_NETWORK_ERROR:
+             logger.error("Critical Network Timeout during Fix. Aborting to prevent infinite loops.")
+             result.errors.append("Network Timeout - Server took too long to synchronize")
+             break
+
         # Count fracked positions after fix
         fracked_after = sum(coin.count_fracked() for coin in coins_to_fix)
 
@@ -525,7 +531,6 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
     logger.info("=" * 60)
 
     return result
-
 
 # ============================================================================
 # CLI INTERFACE

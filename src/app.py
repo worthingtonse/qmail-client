@@ -34,7 +34,7 @@ import os
 import argparse
 import time
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any
 import struct
 
 # Detect if running as a bundled EXE or as a script
@@ -307,107 +307,67 @@ def initialize_application(args):
     # =========================================================================
     beacon_handle = None
     state_file_path = "Data/beacon_state.json"
-
+ 
+    # Zaroori imports (Ensure src package access)
     from coin_scanner import find_identity_coin, load_coin_metadata
+    from data_sync import convert_to_custom_base32
     import shutil
-
+ 
     key_file_to_use = None
     identity_coin = None
-    
-    # Priority: Mailbox/Bank > Mailbox/Fracked > Default/Bank (migrate)
+    # Priority folders: Mailbox/Bank > Mailbox/Fracked > Default/Bank
     mailbox_bank = "Data/Wallets/Mailbox/Bank"
     mailbox_fracked = "Data/Wallets/Mailbox/Fracked"
     default_bank = "Data/Wallets/Default/Bank"
-    
-    # 1. Check Mailbox/Bank (correct location)
+    # 1. Scan for identity coin
     if os.path.exists(mailbox_bank):
-        all_coins = []
         for filename in os.listdir(mailbox_bank):
-            if not filename.endswith('.bin'):
-                continue
-            filepath = os.path.join(mailbox_bank, filename)
-            coin = load_coin_metadata(filepath)
-            if coin:
-                all_coins.append(coin)
-        
-        if all_coins:
-            identity_coin = all_coins[0]
-            key_file_to_use = identity_coin['file_path']
-            log_info(logger, "App",
-                     f"Identity found in Mailbox/Bank: SN={identity_coin['serial_number']}, DN={identity_coin['denomination']}")
-    
-    # 2. Check Mailbox/Fracked (needs healing)
+            if filename.endswith('.bin'):
+                filepath = os.path.join(mailbox_bank, filename)
+                coin = load_coin_metadata(filepath) #
+                if coin:
+                    identity_coin = coin
+                    key_file_to_use = filepath
+                    break
+    # 2. Check Fracked if Bank is empty
     if not identity_coin and os.path.exists(mailbox_fracked):
-        all_coins = []
         for filename in os.listdir(mailbox_fracked):
-            if not filename.endswith('.bin'):
-                continue
-            filepath = os.path.join(mailbox_fracked, filename)
-            coin = load_coin_metadata(filepath)
-            if coin:
-                all_coins.append(coin)
-        
-        if all_coins:
-            identity_coin = all_coins[0]
-            key_file_to_use = identity_coin['file_path']
-            log_warning(logger, "App",
-                       f"Identity found in Mailbox/Fracked (needs healing): SN={identity_coin['serial_number']}")
-    
-    # 3. Legacy: Check Default/Bank (migrate to Mailbox)
-    if not identity_coin and os.path.exists(default_bank):
-        all_coins = []
-        for filename in os.listdir(default_bank):
-            if not filename.endswith('.bin'):
-                continue
-            filepath = os.path.join(default_bank, filename)
-            coin = load_coin_metadata(filepath)
-            if coin:
-                all_coins.append(coin)
-        
-        if all_coins:
-            identity_coin = all_coins[0]
-            old_path = identity_coin['file_path']
-            
-            log_info(logger, "App",
-                     f"Legacy identity found in Default/Bank: SN={identity_coin['serial_number']}")
-            log_info(logger, "App", "Migrating identity to Mailbox/Bank...")
-            
-            # Migrate to Mailbox/Bank
-            try:
-                os.makedirs(mailbox_bank, exist_ok=True)
-                new_filename = os.path.basename(old_path)
-                new_path = os.path.join(mailbox_bank, new_filename)
-                shutil.move(old_path, new_path)
-                
-                # Update identity coin with new path
-                identity_coin['file_path'] = new_path
-                key_file_to_use = new_path
-                
-                log_info(logger, "App", f"Identity migrated successfully to Mailbox/Bank")
-            except Exception as e:
-                log_error(logger, "App", f"Failed to migrate identity: {e}")
-                key_file_to_use = old_path
-    
+            if filename.endswith('.bin'):
+                filepath = os.path.join(mailbox_fracked, filename)
+                coin = load_coin_metadata(filepath)
+                if coin:
+                    identity_coin = coin
+                    key_file_to_use = filepath
+                    log_warning(logger, "App", f"Identity found in Fracked: SN={identity_coin['serial_number']}")
+                    break
+ 
+    # --- THE CRITICAL FIX: OVERRIDE STALE CONFIG WITH DISK REALITY ---
     if identity_coin:
-        log_info(logger, "App",
-                 f"Identity coin ready: SN={identity_coin['serial_number']}, "
-                 f"DN={identity_coin['denomination']}, file={os.path.basename(key_file_to_use)}")
+        detected_sn = identity_coin['serial_number']
+        detected_dn = identity_coin.get('denomination', 0)
+ 
+        # Agar config mein purana SN (9405) hai toh usey 2843 se badlein
+        if config.identity.serial_number != detected_sn:
+            log_info(logger, "App", f"Personality Fix: Updating Config SN from {config.identity.serial_number} to {detected_sn}")
+            config.identity.serial_number = detected_sn
+            # Pretty Address update karein (e.g., C23/C25)
+            config.identity.email_address = f"User#{convert_to_custom_base32(detected_sn)}"
+            # CLEAR STALE STATE: Purani identity ka state naye SN par nahi chal sakta
+            if os.path.exists(state_file_path):
+                try:
+                    os.remove(state_file_path)
+                    log_info(logger, "App", "Deleted stale beacon_state.json to force fresh sync for new identity.")
+                except Exception as e:
+                    log_error(logger, "App", f"Failed to clear state file: {e}")
+ 
+        log_info(logger, "App", f"Identity ready: SN={detected_sn}, file={os.path.basename(key_file_to_use)}")
     else:
-        log_warning(logger, "App", "No identity coin found in any wallet")
-
-    # Fallback to legacy keys.txt if no .bin/.key file was found
-    if not key_file_to_use:
-        legacy_path = "Data/keys.txt"
-        if os.path.exists(legacy_path):
-            key_file_to_use = legacy_path
-            log_info(logger, "App",
-                     "No .bin identity found; falling back to keys.txt")
-
-    # 2. Initialize Beacon
+        log_warning(logger, "App", "No identity coin found on disk. Beacon will use config defaults.")
+ 
+    # 3. Initialize Beacon with the FIXED Config
     if key_file_to_use and os.path.exists(key_file_to_use):
-        print(f"[INIT] Initializing beacon monitor using: {key_file_to_use}")
         beacon_handle = init_beacon(
-            identity_config=config.identity,
+            identity_config=config.identity, # Ab isme SN 2843 hi jayega
             beacon_config=config.beacon,
             network_config=config.network,
             key_file_path=key_file_to_use,
@@ -417,14 +377,10 @@ def initialize_application(args):
         if beacon_handle:
             log_info(logger, "App", "Beacon initialized successfully")
         else:
-            log_warning(
-                logger, "App", "Beacon initialization failed - mail notifications disabled")
-            print(
-                "[WARNING] Beacon initialization failed - mail notifications disabled")
+            log_error(logger, "App", "Beacon initialization failed")
     else:
         log_warning(logger, "App", "No identity file found - beacon disabled")
-        print("[WARNING] No identity file found - beacon disabled")
-
+ 
     # Create app context and API server
     app_context = AppContext(
         config=config,
@@ -434,7 +390,7 @@ def initialize_application(args):
         task_manager=task_manager,
         beacon_handle=beacon_handle
     )
-
+ 
     try:
         server = APIServer(logger=logger, host=config.api.host, port=args.port)
         server.app_context = app_context
@@ -442,7 +398,7 @@ def initialize_application(args):
     except Exception as e:
         log_error(logger, "App", "Failed to create API server", str(e))
         return None, None
-
+ 
     return app_context, server
 
 
@@ -516,11 +472,10 @@ def find_identity_coin_for_beacon(logger_handle=None):
 
 def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     """
-    Move identity coin to Fracked folder and rename it to reflect failure.
-    FIXED: Updates POWN string and uses Go-style naming helper.
+    Move identity coin to Fracked folder WITHOUT changing its filename.
+    FIXED: Preserves original filename, strictly uses Mailbox, and limits to 3 retries.
     """
-    from coin_scanner import find_identity_coin , load_coin_metadata
-    from cloudcoin import get_int_name, write_coin_file
+    from coin_scanner import find_identity_coin, load_coin_metadata
     import shutil
     import os
     import threading
@@ -528,23 +483,22 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     from beacon import stop_beacon_monitor, start_beacon_monitor, init_beacon
     from heal import heal_wallet
     from logger import log_info, log_error, log_warning
-
+ 
     # 1. STOP THE MONITOR IMMEDIATELY
     if beacon_handle and beacon_handle.is_running:
         log_info(logger, "App", f"Stopping beacon for SN {identity_config.serial_number} (repairing identity)")
         stop_beacon_monitor(beacon_handle)
-
-    # 2. IDENTIFY ACTIVE WALLET
+ 
+    # 2. IDENTIFY ACTIVE WALLET (Strict Mailbox Priority)
     locations = [
         ("Data/Wallets/Mailbox", "Data/Wallets/Mailbox/Bank", "Data/Wallets/Mailbox/Fracked"),
         ("Data/Wallets/Default", "Data/Wallets/Default/Bank", "Data/Wallets/Default/Fracked")
     ]
-    
     identity_coin_data = None
     active_wallet_path = None
     target_fracked_dir = None
     target_bank_dir = None
-
+ 
     for wallet_path, bank_dir, fracked_dir in locations:
         if os.path.exists(bank_dir):
             identity_coin_data = find_identity_coin(bank_dir, identity_config.serial_number)
@@ -552,70 +506,60 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
                 active_wallet_path = wallet_path
                 target_fracked_dir = fracked_dir
                 target_bank_dir = bank_dir
-                break
-
+                break # Mailbox mil gaya toh Default check nahi karenge
+ 
     if not identity_coin_data:
-        # Check if already in Fracked... (same as your logic)
-        for _, _, fracked_dir in locations:
+        # Check if already in Fracked (already failed case)
+        for wallet_path, bank_dir, fracked_dir in locations:
             if os.path.exists(fracked_dir):
                 identity_coin_data = find_identity_coin(fracked_dir, identity_config.serial_number)
                 if identity_coin_data:
-                    active_wallet_path = os.path.dirname(fracked_dir)
-                    target_bank_dir = os.path.join(active_wallet_path, "Bank")
+                    active_wallet_path = wallet_path
+                    target_bank_dir = bank_dir
+                    target_fracked_dir = fracked_dir
                     break
-        
         if not identity_coin_data:
             log_error(logger, "App", "Critical: Identity coin not found. Manual intervention required.")
             return
-
-    # 3. UPDATE POWN AND RENAME (The "Go Alignment" Fix)
+ 
+    # 3. INTERNAL POWN UPDATE & FILE MOVE (Same Name logic)
     if "Bank" in identity_coin_data['file_path']:
         os.makedirs(target_fracked_dir, exist_ok=True)
-        
-        # Mark RAIDA 11 as 'f' (failed)
+        # Mark RAIDA 11 as 'f' (failed) internally for protocol logic
         pown_list = list(identity_config.pown_string if hasattr(identity_config, 'pown_string') else 'p' * 25)
         if len(pown_list) >= 12:
             pown_list[11] = 'f'
-        new_pown = "".join(pown_list)
-        identity_config.pown_string = new_pown
-
-        # Generate the correct Go-style name
-        new_filename = get_int_name(identity_config.denomination, identity_config.serial_number, new_pown)
-        dst_path = os.path.join(target_fracked_dir, new_filename)
-        
+        identity_config.pown_string = "".join(pown_list)
+ 
+        # FIXED: Use original filename, do NOT use get_int_name
+        original_filename = os.path.basename(identity_coin_data['file_path'])
+        dst_path = os.path.join(target_fracked_dir, original_filename)
         try:
-            # We move the file then update its internal header if necessary, 
-            # but usually, just moving it is enough if heal_wallet handles the rest.
             shutil.move(identity_coin_data['file_path'], dst_path)
-            log_info(logger, "App", f"Moved identity to Fracked as: {new_filename}")
+            log_info(logger, "App", f"Moved identity to Fracked: {original_filename}")
         except Exception as e:
             log_error(logger, "App", f"Failed to move identity: {e}")
             return
-
-    # 4. TRIGGER RECOVERY LOOP
+ 
+    # 4. TRIGGER RECOVERY LOOP (FIXED: Added Max 3 Retries)
     def identity_recovery_loop():
         """
         Background task: repeatedly attempt to heal the identity until it's back in Bank.
         """
+        max_retries = 3
         retry_count = 0
-        retry_delay = 300 # 5 minutes
-        
-        while True:
+        retry_delay = 300 # 5 Minutes (300 seconds)
+        while retry_count < max_retries:
             try:
                 retry_count += 1
-                log_info(logger, "IdentityHeal", f"Attempt {retry_count}: Healing identity in {active_wallet_path}")
-                
-                # Execute healing
+                log_info(logger, "IdentityHeal", f"Attempt {retry_count}/{max_retries}: Healing identity in {active_wallet_path}")
+                # Execute healing logic
                 heal_wallet(active_wallet_path)
-                
                 time.sleep(2) # Settle filesystem
-                
-                # Check if coin returned to Bank
+                # Check if coin returned to Bank folder
                 identity_coin_fixed = find_identity_coin(target_bank_dir, identity_config.serial_number)
-                
                 if identity_coin_fixed:
-                    log_info(logger, "IdentityHeal", f"✓ Success! Identity SN {identity_config.serial_number} recovered to Bank.")
-                    
+                    log_info(logger, "IdentityHeal", f"✓ Success! SN {identity_config.serial_number} recovered to Bank.")
                     # RE-START BEACON
                     new_handle = init_beacon(
                         identity_config=identity_config,
@@ -625,27 +569,27 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
                         state_file_path="Data/beacon_state.json",
                         logger_handle=logger
                     )
-                    
                     if new_handle:
                         if start_beacon_monitor(new_handle, beacon_handle.on_mail_received):
                             log_info(logger, "IdentityHeal", "✓ Beacon monitor restarted successfully.")
                             if hasattr(beacon_handle, 'on_restart_callback') and beacon_handle.on_restart_callback:
                                 beacon_handle.on_restart_callback(new_handle)
-                            return # EXIT THE LOOP - Recovery complete
-                    
+                            return # SUCCESS: Exit thread
                     log_error(logger, "IdentityHeal", "Healed but failed to restart Beacon monitor.")
-                    return # Exit loop since coin is fixed even if beacon failed
-                
+                    return 
                 else:
-                    log_warning(logger, "IdentityHeal", 
-                               f"Attempt {retry_count} failed (Network issue). Retrying in {retry_delay/60} minutes...")
-                    time.sleep(retry_delay)
-            
+                    log_warning(logger, "IdentityHeal", f"Attempt {retry_count} failed to recover the coin.")
+                    if retry_count < max_retries:
+                        log_info(logger, "IdentityHeal", f"Waiting {retry_delay // 60} mins for next try...")
+                        time.sleep(retry_delay)
             except Exception as e:
                 log_error(logger, "IdentityHeal", f"Unexpected error in recovery loop: {e}")
-                time.sleep(retry_delay)
-
-    # Start the persistent recovery loop
+                if retry_count < max_retries:
+                    time.sleep(retry_delay)
+ 
+        log_error(logger, "App", f"CRITICAL: Identity recovery failed after {max_retries} attempts.")
+ 
+    # Start the recovery thread
     thread = threading.Thread(target=identity_recovery_loop, name="IdentityRecovery", daemon=True)
     thread.start()
 
@@ -785,13 +729,12 @@ def validate_tell_payment_sync(
         return False, consensus_amt, f"Insufficient: {consensus_amt} CC"
 
 
-def start_periodic_healer(wallet_path: str, logger: Any, interval_hours: int = 1):
+def start_periodic_healer(wallet_paths: List[str], logger: Any, interval_hours: int = 1):
     """
-   Background task that periodically ensures the entire wallet is healthy.
-   Runs in a separate thread to avoid blocking the main application.
-   """
+    Background task that periodically ensures the entire wallet is healthy.
+    FIXED: Now iterates through ALL provided wallets (Default + Mailbox).
+    """
     import time
-    # This import must be here or at the top of app.py
     from heal import heal_wallet
 
     def healer_loop():
@@ -799,22 +742,20 @@ def start_periodic_healer(wallet_path: str, logger: Any, interval_hours: int = 1
         time.sleep(30)
 
         while True:
-            log_info(logger, "PeriodicHeal",
-                     "Starting scheduled wallet health check.")
-            try:
-                # The yellow line appeared here because 'wallet_path'
-                # wasn't in the function arguments or scope.
-                heal_wallet(wallet_path)
-                log_info(logger, "PeriodicHeal",
-                         "Scheduled health check completed.")
-            except Exception as e:
-                log_error(logger, "PeriodicHeal",
-                          f"Scheduled heal failed: {e}")
+            log_info(logger, "PeriodicHeal", "Starting scheduled wallet health check.")
+            
+            # ITERATE OVER ALL WALLETS
+            for path in wallet_paths:
+                if os.path.exists(path):
+                    try:
+                        log_info(logger, "PeriodicHeal", f"Healing wallet: {path}")
+                        heal_wallet(path)
+                    except Exception as e:
+                        log_error(logger, "PeriodicHeal", f"Failed to heal {path}: {e}")
+                else:
+                    log_warning(logger, "PeriodicHeal", f"Skipping missing wallet: {path}")
 
-            # The yellow line appeared here because 'interval_hours'
-            # wasn't defined in the function signature.
-            log_info(logger, "PeriodicHeal",
-                     f"Next check in {interval_hours} hours.")
+            log_info(logger, "PeriodicHeal", f"Next check in {interval_hours} hours.")
             time.sleep(interval_hours * 3600)
 
     # Starts the healer in the background immediately
@@ -864,12 +805,15 @@ def main():
     if app_context is None:
         return 1
 
-    default_wallet_path = "Data/Wallets/Default"
+    wallets_to_heal = [
+        "Data/Wallets/Default",
+        "Data/Wallets/Mailbox"
+    ]
 
     start_periodic_healer(
-        wallet_path=default_wallet_path,
+        wallet_paths=wallets_to_heal,
         logger=app_context.logger,
-        interval_hours=24
+        interval_hours=1
     )
 
     # Shortcuts for common context items
@@ -1138,29 +1082,25 @@ def main():
             # If any payments or staking coins were found, we need to fix them.
             if new_locker_found:
                 def run_batch_heal():
-                    # Import inside the thread to avoid circular dependencies
                     from heal import heal_wallet
-
-                    # 10-second delay to allow background download tasks to settle
-                    # before the healing orchestrator locks the wallet files.
                     time.sleep(10)
 
-                    log_info(
-                        logger, "HealTask", "Starting background batch healing pass for 'Default' wallet.")
-                    try:
-                        # Points to your standard CloudCoin wallet path
-                        heal_wallet("Data/Wallets/Default")
-                        log_info(
-                            logger, "HealTask", "Background batch healing pass completed successfully.")
-                    except Exception as he:
-                        log_error(logger, "HealTask",
-                                  f"Batch healing pass failed: {he}")
+                    # List of wallets to check
+                    wallets = ["Data/Wallets/Default", "Data/Wallets/Mailbox"]
+                    
+                    log_info(logger, "HealTask", "Starting background batch healing pass.")
+                    for w_path in wallets:
+                        if os.path.exists(w_path):
+                            try:
+                                log_info(logger, "HealTask", f"Healing wallet: {w_path}")
+                                heal_wallet(w_path)
+                            except Exception as he:
+                                log_error(logger, "HealTask", f"Healing failed for {w_path}: {he}")
 
-                # Daemon thread ensures the healing process doesn't hang the app shutdown
                 heal_thread = threading.Thread(
                     target=run_batch_heal, name="BatchHealWorker", daemon=True)
                 heal_thread.start()
-
+                
         if start_beacon_monitor(app_context.beacon_handle, on_mail_received):
             log_info(logger, "App",
                      "Beacon monitor started - watching for new mail")
@@ -1267,7 +1207,17 @@ def main():
     # Stop beacon monitor
     if app_context.beacon_handle:
         log_info(logger, "App", "Stopping beacon monitor...")
+        
+        # Pehle monitor ko stop signal bhejte hain
         stop_beacon_monitor(app_context.beacon_handle)
+        
+       
+        # Beacon thread 10 seconds tak wait karta hai, agar na ruke toh ye logic chalegi
+        if hasattr(app_context.beacon_handle, 'monitor_thread') and \
+           app_context.beacon_handle.monitor_thread.is_alive():
+            log_warning(logger, "App", "Beacon thread hanging (Network call stuck), forcing context cleanup.")
+            # Handle ko invalidate kar dete hain taaki callbacks crash na karein
+            app_context.beacon_handle.is_running = False
 
     # Shutdown task manager
     if app_context.task_manager:
