@@ -15,8 +15,21 @@ Functions:
     weeks_to_duration_code() - Convert weeks to protocol duration code
 """
 
-from typing import Dict, List, Optional, Tuple
+import asyncio
+import math
+import os
+import secrets
+import string
+from typing import Dict, List, Optional, Tuple, Any  # 
 from dataclasses import dataclass
+
+from qmail_types import ErrorCode
+from logger import log_error, log_info, log_warning, log_debug
+from coin_scanner import  parse_denomination_code , get_coins_by_value
+from coin_break import break_coin
+from locker_put import put_to_locker, CoinForPut, PutResult
+from key_manager import get_keys_from_locker_code
+
 
 try:
     from qmail_types import ErrorCode, StorageDuration
@@ -91,12 +104,11 @@ NUM_SERVERS = 5                  # Number of servers (4 data + 1 parity)
 class ServerFees:
     """
     Fee structure for a single server.
-    UPDATED: Matches the 8-week block model from RAIDA11 Server Service.
+    Matches RAIDA11 8-week block model.
     """
     server_id: str
-    cost_per_mb: float = DEFAULT_COST_PER_MB
-    # Change this field name to match your calculation logic
-    cost_per_8_weeks: float = 1.0  
+    cost_per_mb: float = 1.0
+    cost_per_8_weeks: float = 1.0  # <--- FIXED FIELD NAME
     is_available: bool = True
 
 @dataclass
@@ -122,21 +134,25 @@ class PaymentCalculation:
 def calculate_storage_cost(
     total_file_size_bytes: int,
     storage_weeks: int,
-    server_fees: List[Any] # Objects containing cost_per_mb and cost_per_8_weeks
+    server_fees: List[ServerFees] 
 ) -> float:
     """
-    NEW: Uses the 8-week block math from the qmail_servers service.
+    Uses the 8-week block math from the qmail_servers service.
     Formula: (MB * cost_per_mb) + ((weeks / 8) * cost_per_8_weeks)
     """
     size_mb = total_file_size_bytes / (1024 * 1024)
     total_storage_cost = 0.0
     
-    # Calculate for the 5 servers (4 data + 1 parity)
-    for fee in server_fees[:5]:
+    # Calculate for the first 5 servers (4 data + 1 parity)
+    # We use min() to avoid crashing if fewer than 5 servers exist
+    servers_to_pay = server_fees[:5]
+    
+    for fee in servers_to_pay:
         # MB component
         mb_cost = size_mb * fee.cost_per_mb
         
         # Duration component (normalized to 8-week blocks)
+        # e.g., 4 weeks = 0.5 blocks cost
         duration_blocks = storage_weeks / 8.0
         time_cost = duration_blocks * fee.cost_per_8_weeks
         
@@ -181,14 +197,7 @@ def get_server_fees(
 ) -> Tuple[ErrorCode, List[ServerFees]]:
     """
     Get fee structures for servers from the database.
-
-    Args:
-        db_handle: Database handle
-        server_ids: Optional list of specific server IDs to query
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ErrorCode, list of ServerFees)
+    Updated to read 'cost_per_8_weeks' correctly.
     """
     try:
         # Try to import database module
@@ -198,14 +207,14 @@ def get_server_fees(
             import database
 
         # Get servers from database
+        # database.py now returns dicts with 'cost_per_8_weeks'
         err, servers = database.get_all_servers(db_handle, available_only=True)
 
-        if err != 0:  # Database error
+        if err != 0:
             log_error(logger_handle, PAYMENT_CONTEXT, "get_server_fees failed",
                       "Database query failed")
             return ErrorCode.ERR_INTERNAL, []
 
-        # Convert to ServerFees objects
         fees = []
         for server in servers:
             server_id = server.get('server_id', '')
@@ -214,26 +223,33 @@ def get_server_fees(
             if server_ids and server_id not in server_ids:
                 continue
 
-            # Parse cost_per_mb (stored as string in database)
+            # 1. Parse cost_per_mb
             cost_per_mb = DEFAULT_COST_PER_MB
-            if server.get('cost_per_mb'):
+            if server.get('cost_per_mb') is not None:
                 try:
                     cost_per_mb = float(server['cost_per_mb'])
                 except (ValueError, TypeError):
                     pass
 
-            # Parse cost_per_week (if available)
-            cost_per_week = DEFAULT_COST_PER_WEEK
-            if server.get('cost_per_week'):
+            # 2. Parse cost_per_8_weeks (The Fix)
+            # We default to 1.0 based on your JSON, but fall back safely
+            cost_per_8_weeks = 1.0 
+            if server.get('cost_per_8_weeks') is not None:
                 try:
-                    cost_per_week = float(server['cost_per_week'])
+                    cost_per_8_weeks = float(server['cost_per_8_weeks'])
+                except (ValueError, TypeError):
+                    pass
+            elif server.get('cost_per_week') is not None:
+                # Legacy fallback: if DB has old data, convert week -> 8 weeks
+                try:
+                    cost_per_8_weeks = float(server['cost_per_week']) * 8.0
                 except (ValueError, TypeError):
                     pass
 
             fees.append(ServerFees(
                 server_id=server_id,
                 cost_per_mb=cost_per_mb,
-                cost_per_week=cost_per_week,
+                cost_per_8_weeks=cost_per_8_weeks, # <--- Correct field assignment
                 is_available=server.get('is_available', True)
             ))
 
@@ -245,141 +261,216 @@ def get_server_fees(
     except Exception as e:
         log_error(logger_handle, PAYMENT_CONTEXT, "get_server_fees failed", str(e))
         return ErrorCode.ERR_INTERNAL, []
+async def _create_locker_async(
+    amount: float, 
+    wallet_path: str, 
+    logger_handle: object,
+    config: object = None,
+    identity_sn: int = 0
+) -> Tuple[ErrorCode, bytes]:
+    """
+    Async implementation of locker creation with iterative coin breaking.
+    """
+    import math
+    import secrets
+    import string
+    
+    # Limit loops to prevent infinite cycles
+    MAX_LOOPS = 6
+    
+    try:
+        for _ in range(MAX_LOOPS):
+            # 1. Get coins (Now returns accumulated list >= amount)
+            coins = get_coins_by_value(wallet_path, amount, identity_sn=identity_sn)
+            
+            if not coins:
+                log_error(logger_handle, PAYMENT_CONTEXT, 
+                          f"Insufficient funds for amount {amount}")
+                return ErrorCode.ERR_NOT_FOUND, b''
+            
+            total_value_selected = sum(parse_denomination_code(c.denomination) for c in coins)
+            
+            # 2. Check for Exact Match (or close enough for floats)
+            if abs(total_value_selected - amount) < 0.00000001:
+                # --- MATCH FOUND: LOCK IT ---
+                random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits) 
+                                       for _ in range(7))
+                locker_code_str = random_chars[:3] + '-' + random_chars[3:]
+                locker_keys = get_keys_from_locker_code(locker_code_str)
+                
+                coins_for_put = [
+                    CoinForPut(c.denomination, c.serial_number, c.ans) 
+                    for c in coins
+                ]
+                
+                put_result, _ = await put_to_locker(coins_for_put, locker_keys, config, logger_handle)
+                
+                if put_result != PutResult.SUCCESS:
+                    log_error(logger_handle, PAYMENT_CONTEXT, f"Locker PUT failed: {put_result}")
+                    return ErrorCode.ERR_INTERNAL, b''
 
+                # Cleanup
+                for c in coins:
+                    try:
+                        if os.path.exists(c.file_path):
+                            os.remove(c.file_path)
+                    except: pass
 
+                locker_code_bytes = locker_code_str.encode('ascii').ljust(8, b'\x00')
+                return ErrorCode.SUCCESS, locker_code_bytes
+
+            # 3. OVERPAYMENT DETECTED: Must Break a Coin
+            elif total_value_selected > amount:
+                # We have multiple coins, or one large coin.
+                # Strategy: Keep coins that fit, break the one that overflows.
+                
+                # Sort descending (Largest first)
+                coins.sort(key=lambda x: parse_denomination_code(x.denomination), reverse=True)
+                
+                coin_to_break = None
+                current_stack = 0.0
+                
+                # Find the specific coin that pushes us over the limit
+                for c in coins:
+                    val = parse_denomination_code(c.denomination)
+                    if current_stack + val <= amount + 0.00000001:
+                        current_stack += val
+                    else:
+                        coin_to_break = c
+                        break
+                
+                # Fallback: Break the largest available if loop logic misses
+                if not coin_to_break:
+                    coin_to_break = coins[0]
+                
+                log_info(logger_handle, PAYMENT_CONTEXT,
+                         f"Have {total_value_selected}, need {amount}. "
+                         f"Breaking coin SN {coin_to_break.sn}")
+                
+                # Execute Break (Command 90)
+                break_result = await break_coin(coin_to_break, wallet_path, config, logger_handle)
+                
+                # Check success (Handle object vs list result)
+                success = False
+                if hasattr(break_result, 'success'): success = break_result.success
+                elif isinstance(break_result, list) and break_result: success = True
+                
+                if not success:
+                    log_error(logger_handle, PAYMENT_CONTEXT, "Coin break failed during payment")
+                    return ErrorCode.ERR_INTERNAL, b''
+                
+                # LOOP RESTARTS -> get_coins_by_value will be called again and will find the new change
+                continue
+                
+        # If loop finishes without returning
+        log_error(logger_handle, PAYMENT_CONTEXT, "Unable to make exact change after max attempts")
+        return ErrorCode.ERR_INTERNAL, b''
+
+    except Exception as e:
+        log_error(logger_handle, PAYMENT_CONTEXT, f"Async locker creation crashed: {e}")
+        return ErrorCode.ERR_INTERNAL, b''
 def request_locker_code(
     amount: float,
     db_handle: Optional[object] = None,
-    logger_handle: Optional[object] = None
+    logger_handle: Optional[object] = None,
+    config: Optional[object] = None,     # Added for Network
+    identity_sn: int = 0                 # Added to protect ID coin
 ) -> Tuple[ErrorCode, bytes]:
     """
     Request a locker code from cloudcoin for the specified amount.
-
-    The locker code is used to pay for storage on QMail servers.
-    The servers validate the locker code and deduct the appropriate amount.
-
-    Args:
-        amount: Amount in CloudCoin units
-        db_handle: Optional database handle for cloudcoin integration
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ErrorCode, 8-byte locker code)
-        - SUCCESS and locker code on success
-        - ERR_NOT_FOUND if insufficient funds
-        - ERR_INTERNAL on other errors
+    STRICT IMPLEMENTATION: Scans, Breaks, and Locks real coins.
     """
-    try:
-        # Try to import cloudcoin module
-        try:
-            from . import cloudcoin
-            has_cloudcoin = True
-        except ImportError:
-            try:
-                import cloudcoin
-                has_cloudcoin = True
-            except ImportError:
-                has_cloudcoin = False
+    # Hardcoded wallet path matching your logs/project structure
+    WALLET_PATH = "Data/Wallets/Default"
 
-        if has_cloudcoin and hasattr(cloudcoin, 'generate_locker_code'):
-            # Use real cloudcoin module
-            err, locker_code = cloudcoin.generate_locker_code(amount, db_handle)
-            if err != 0:
-                log_error(logger_handle, PAYMENT_CONTEXT, "request_locker_code failed",
-                          "CloudCoin locker code generation failed")
-                return ErrorCode.ERR_NOT_FOUND, b''
-            return ErrorCode.SUCCESS, locker_code
-        else:
-            # Fallback: generate a dummy locker code for testing in XXX-XXXX format
-            log_warning(logger_handle, PAYMENT_CONTEXT,
-                        "CloudCoin module not available, generating test locker code")
-            import secrets
-            import string
-            random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits)
-                                   for _ in range(7))
-            test_locker = (random_chars[:3] + '-' + random_chars[3:]).encode('ascii')
-            return ErrorCode.SUCCESS, test_locker
+    try:
+        # Run the async logic synchronously
+        result = asyncio.run(_create_locker_async(
+            amount, WALLET_PATH, logger_handle, config, identity_sn
+        ))
+        return result
 
     except Exception as e:
         log_error(logger_handle, PAYMENT_CONTEXT, "request_locker_code failed", str(e))
         return ErrorCode.ERR_INTERNAL, b''
 
-
 def calculate_total_payment(
     file_sizes: List[int],
     storage_weeks: int,
-    recipient_count: int,
+    recipients: List[str],  # <--- Correct: Accepts list of addresses
     db_handle: object,
     logger_handle: Optional[object] = None
 ) -> Tuple[ErrorCode, PaymentCalculation]:
     """
-    Calculate total payment for sending an email with attachments.
-
-    This is a convenience function that:
-    1. Gets server fees from database
-    2. Calculates storage cost for all files
-    3. Adds recipient fees (currently 0)
-
-    Args:
-        file_sizes: List of file sizes in bytes (email body + attachments)
-        storage_weeks: Number of weeks to store
-        recipient_count: Number of recipients
-        db_handle: Database handle
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ErrorCode, PaymentCalculation)
-
-    Example:
-        err, calc = calculate_total_payment([1024, 2048, 5000], 8, 3, db)
-        if err == ErrorCode.SUCCESS:
-            print(f"Total: {calc.total_cost}")
+    Calculate total payment, including per-user Inbox Fees from the database.
     """
     result = PaymentCalculation()
 
-    # Get server fees
+    # --- 1. Get Server Fees ---
     err, server_fees = get_server_fees(db_handle, logger_handle=logger_handle)
-    if err != ErrorCode.SUCCESS:
-        log_warning(logger_handle, PAYMENT_CONTEXT,
-                    "Could not get server fees, using defaults")
+    if err != ErrorCode.SUCCESS or not server_fees:
+        if logger_handle:
+            log_warning(logger_handle, PAYMENT_CONTEXT, "Using default server fees")
         server_fees = [ServerFees(server_id=f"default_{i}") for i in range(NUM_SERVERS)]
 
-    # Ensure we have enough servers
     while len(server_fees) < NUM_SERVERS:
         server_fees.append(ServerFees(server_id=f"default_{len(server_fees)}"))
 
-    # Calculate total size of all files
+    # --- 2. Calculate Storage Cost ---
     total_size = sum(file_sizes) if file_sizes else 0
+    try:
+        # FIX: calculate_storage_cost returns a float, not a tuple.
+        storage_cost_float = calculate_storage_cost(total_size, storage_weeks, server_fees)
+        
+        result.storage_cost = storage_cost_float
+        result.duration_code = weeks_to_duration_code(storage_weeks)
+    except Exception as e:
+        if logger_handle:
+            log_error(logger_handle, PAYMENT_CONTEXT, f"Storage calc failed: {e}")
+        return ErrorCode.ERR_INTERNAL, result
 
-    # Calculate storage cost
-    err, storage_calc = calculate_storage_cost(
-        total_size, NUM_SERVERS, storage_weeks, server_fees, logger_handle
-    )
-    if err != ErrorCode.SUCCESS:
-        return err, storage_calc
+    # --- 3. Calculate Recipient Fees (Robust Logic) ---
+    total_recipient_fee = 0.0
+    
+    # Robust Import: Handle both package and local execution contexts
+    get_user_by_address = None
+    DatabaseErrorCode = None
+    try:
+        from .database import get_user_by_address, DatabaseErrorCode
+    except ImportError:
+        try:
+            from database import get_user_by_address, DatabaseErrorCode
+        except ImportError:
+            pass # Fallback: db functions not available
 
-    # Calculate recipient fees (stub)
-    err, recipient_fees = calculate_recipient_fees(recipient_count, logger_handle)
-    if err != ErrorCode.SUCCESS:
-        result.error_code = err
-        result.error_message = "Failed to calculate recipient fees"
-        return err, result
+    if get_user_by_address and recipients:
+        for addr in recipients:
+            # Type Safety: Ensure address is a string before DB lookup
+            addr_str = str(addr).strip()
+            
+            # Look up user in DB to find their specific InboxFee
+            err, user = get_user_by_address(db_handle, addr_str)
+            
+            if err == DatabaseErrorCode.SUCCESS and user:
+                # Default to 0.0 if 'inbox_fee' is missing or None
+                fee = float(user.get('inbox_fee', 0.0))
+                total_recipient_fee += fee
+            else:
+                # User not in local DB (unknown contact). 
+                # Phase 1 Policy: Charge 0.0 for unknown users.
+                pass
+    
+    result.recipient_fees = total_recipient_fee
 
-    # Combine costs
-    result.storage_cost = storage_calc.storage_cost
-    result.recipient_fees = recipient_fees
-    result.total_cost = storage_calc.storage_cost + recipient_fees
-    result.server_breakdown = storage_calc.server_breakdown
-    result.duration_code = storage_calc.duration_code
+    # --- 4. Final Totals ---
+    result.total_cost = result.storage_cost + result.recipient_fees
     result.error_code = ErrorCode.SUCCESS
 
-    log_info(logger_handle, PAYMENT_CONTEXT,
-             f"Total payment: {result.total_cost:.6f} "
-             f"(storage={result.storage_cost:.6f}, recipients={result.recipient_fees:.6f})")
+    if logger_handle:
+        log_info(logger_handle, PAYMENT_CONTEXT,
+             f"Total: {result.total_cost:.4f} (Storage: {result.storage_cost:.4f}, Recip: {result.recipient_fees:.4f})")
 
     return ErrorCode.SUCCESS, result
-
-
 # ============================================================================
 # MAIN (for testing)
 # ============================================================================

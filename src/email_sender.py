@@ -41,7 +41,7 @@ from protocol import (
     weeks_to_duration_code
 )
 from network import connect_to_server, send_request, disconnect
-from payment import calculate_storage_cost, request_locker_code
+from payment import calculate_storage_cost, request_locker_code, calculate_total_payment
 from logger import log_info, log_error, log_warning, log_debug
 from config import get_raida_server_config
 
@@ -49,123 +49,11 @@ from config import get_raida_server_config
 import os
 import struct
 
+from coin_scanner import get_coins_by_value, parse_denomination_code, find_identity_coin , load_coin_from_file
+from coin_break import break_coin
+from locker_put import put_to_locker, CoinForPut, PutResult
+from key_manager import get_keys_from_locker_code
 
-def load_coin_from_file(file_path: str) -> Optional[Any]:
-    """
-    Loads full coin data including ANs and internal POWN status.
-    Required for payment orchestrations (Cmd 82).
-    """
-    import struct
-    try:
-        with open(file_path, 'rb') as f:
-            data = f.read()
-
-        if len(data) < 439:
-            return None
-
-        # Parse internal POWN from Byte 16
-        pown_bytes = data[16:29]
-        pown_str = ""
-        for i in range(25):
-            byte_val = pown_bytes[i // 2]
-            nibble = (byte_val >> 4) if (i % 2 == 0) else (byte_val & 0x0F)
-            pown_str += 'p' if nibble == 1 else ('f' if nibble == 0 else 'u')
-
-        # Parse SN/DN from Byte 32 preamble
-        denomination = struct.unpack('b', data[34:35])[0]
-        serial_number = struct.unpack('>I', data[35:39])[0]
-
-        # Parse 25 Authenticity Numbers (ANs)
-        # ANs start at Offset 39 (Byte 32 + 7 bytes of header)
-        ans = []
-        for i in range(25):
-            start = 39 + (i * 16)
-            ans.append(data[start : start + 16])
-
-        # Create a simple object to match the expected coin interface
-        return type('Coin', (), {
-            'denomination': denomination,
-            'sn': serial_number,
-            'ans': ans,
-            'pown_string': pown_str,
-            'file_path': file_path
-        })()
-    except Exception:
-        return None
-
-def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int = None) -> List:
-    """
-    Get coins from wallet that total the target value.
-    
-    IMPORTANT: Excludes identity coin to prevent accidental spending.
-    Uses internal file scanning (Byte 16) to ensure coin validity.
-    
-    Args:
-        wallet_path: Path to wallet (e.g., "Data/Wallets/Default")
-        target_value: Amount needed (e.g., 0.1)
-        identity_sn: Serial number of identity coin to exclude (optional)
-        
-    Returns:
-        List of coin objects
-    """
-    from coin_scanner import parse_denomination_code
-    import os
-    
-    bank_path = os.path.join(wallet_path, "Bank")
-    
-    if not os.path.exists(bank_path):
-        return []
-    
-    all_coins = []
-    
-    # 1. Scan and load all available coins
-    for filename in os.listdir(bank_path):
-        if not filename.endswith('.bin'):
-            continue
-            
-        file_path = os.path.join(bank_path, filename)
-        
-        # This reads Byte 16 inside the file for POWN status
-        coin = load_coin_from_file(file_path)
-        
-        if coin is None:
-            continue
-        
-        # CRITICAL: Skip identity coin
-        if identity_sn and coin.sn == identity_sn:
-            continue
-        
-        # Get float value (1.0, 0.1, etc.)
-        coin_value = parse_denomination_code(coin.denomination)
-        all_coins.append((coin, coin_value))
-
-    # 2. Try to find an EXACT MATCH using a greedy aggregation
-    # Sort descending to use larger coins first
-    all_coins.sort(key=lambda x: x[1], reverse=True)
-    
-    selected_for_aggregation = []
-    accumulated_value = 0.0
-    
-    for coin, val in all_coins:
-        # Check if adding this coin stays within the target
-        if accumulated_value + val <= target_value + 0.000001:
-            selected_for_aggregation.append(coin)
-            accumulated_value += val
-            
-        # If we hit the exact target, return the list
-        if abs(accumulated_value - target_value) < 0.000001:
-            return selected_for_aggregation
-
-    # 3. No exact match found via aggregation? 
-    # Find the SMALLEST single coin that is larger than the target (to be broken)
-    larger_coins = [(c, v) for c, v in all_coins if v > target_value]
-    if larger_coins:
-        # Sort ascending to find the smallest overhead
-        larger_coins.sort(key=lambda x: x[1])
-        return [larger_coins[0][0]]
-    
-    # Truly insufficient funds
-    return []
 
 
 async def create_recipient_locker(
@@ -221,10 +109,19 @@ async def create_recipient_locker(
             log_info(logger_handle, "LockerCreate",
                     f"Breaking coin {total_value_selected} to get {amount}")
             
-            broken_coins = await break_coin(coin_to_break, amount)
+            # --- FIX: Handle BreakResult object correctly ---
+            break_result = await break_coin(coin_to_break, amount)
+            
+            broken_coins = []
+            # Check if result is an object with .coins attribute (standard implementation)
+            if hasattr(break_result, 'coins'):
+                broken_coins = break_result.coins
+            # Fallback if it returns a list directly
+            elif isinstance(break_result, list):
+                broken_coins = break_result
             
             if not broken_coins:
-                log_error(logger_handle, "LockerCreate", "Failed to break coin")
+                log_error(logger_handle, "LockerCreate", "Failed to break coin (Empty result)")
                 return 2, None
             
             # MATH FIX: Calculate how many small coins are needed
@@ -288,24 +185,24 @@ import json
 import socket
 
 try:
-    from .qmail_types import (
+    from qmail_types import (
         ErrorCode, SendEmailErrorCode, SendEmailRequest, SendEmailResult,
         FileUploadInfo, EmailPackage, RecipientInfo, UploadResult,
         IdentityConfig, StorageDuration, RecipientType,
         TellRecipient, TellServer, TellResult, PendingTell
     )
-    from .striping import create_upload_stripes, calculate_parity_from_bytes
-    from .protocol import (
+    from striping import create_upload_stripes, calculate_parity_from_bytes
+    from protocol import (
         build_complete_upload_request, validate_upload_response,
         weeks_to_duration_code, ProtocolErrorCode,
         build_complete_tell_request, validate_tell_response,
         TELL_TYPE_QMAIL, CMD_TELL
     )
-    from .payment import (
+    from payment import (
         calculate_total_payment, request_locker_code,
         get_server_fees, PaymentCalculation
     )
-    from .database import (
+    from database import (
         get_user_by_address, insert_pending_tell, get_pending_tells,
         update_pending_tell_status, delete_pending_tell, fix_null_beacon_ids,
         DatabaseErrorCode
@@ -333,6 +230,7 @@ except ImportError:
         ERR_INSUFFICIENT_FUNDS = 108
         ERR_SERVER_UNREACHABLE = 201
         ERR_PARTIAL_FAILURE = 208
+        ERR_ENCRYPTION_FAILED = 209
 
     class StorageDuration:
         ONE_DAY = 0
@@ -727,8 +625,8 @@ def validate_request(
     - All attachment paths are safe and exist
     - Attachment count and sizes are within limits
     """
-    from src.logger import log_error, log_debug
-    from src.email_sender import SENDER_CONTEXT, MAX_ATTACHMENTS, MAX_FILE_SIZE, _validate_file_path
+    from logger import log_error, log_debug
+    from email_sender import SENDER_CONTEXT, MAX_ATTACHMENTS, MAX_FILE_SIZE, _validate_file_path
     import os
 
     # 1. CHECK EMAIL CONTENT
@@ -861,8 +759,8 @@ def upload_stripe_to_server(
     Upload a single stripe with Adaptive Idempotency and Plaintext Support.
     FIXED: Uses build_complete_upload_request + send_raw_request to avoid Double Header bug.
     """
-    from .network import connect_to_server, send_raw_request, disconnect, ServerInfo, NetworkErrorCode, StatusCode
-    from .protocol import build_complete_upload_request
+    from network import connect_to_server, send_raw_request, disconnect, ServerInfo, NetworkErrorCode, StatusCode
+    from protocol import build_complete_upload_request
     
     result = UploadResult()
     result.server_id = str(server_id)
@@ -958,19 +856,7 @@ def upload_file_to_servers(
 ) -> Tuple[ErrorCode, List[UploadResult]]:
     """
     Upload a file's stripes to all servers in parallel.
-
-    Args:
-        file_info: FileUploadInfo with stripes
-        servers: List of server configurations
-        identity: User identity
-        file_group_guid: 16-byte file group GUID
-        locker_code: 8-byte locker code
-        storage_duration: Duration code
-        thread_pool: Optional thread pool for parallel uploads
-        logger_handle: Optional logger handle
-
-    Returns:
-        Tuple of (ErrorCode, list of UploadResult)
+    FIXED: Handles both Dictionary (DB) and Object (Config) server items safely.
     """
     all_stripes = file_info.stripes + [file_info.parity_stripe]
     results = []
@@ -983,11 +869,31 @@ def upload_file_to_servers(
 
     def upload_single(args):
         stripe_idx, stripe_data, server = args
+        
+        # --- ROBUST ACCESS FIX ---
+        # 1. Try dictionary access first (most likely scenario from DB)
+        if isinstance(server, dict):
+            s_addr = server.get('ip_address', server.get('host', 'localhost'))
+            s_port = server.get('port', 50000 + stripe_idx)
+            # Use 'server_index' or 'server_id' or fallback to stripe_idx
+            s_id = server.get('server_index', server.get('server_id', stripe_idx))
+            
+            # If server_id is a string "RAIDAx", try to parse it, otherwise use index
+            if isinstance(s_id, str) and s_id.startswith("RAIDA"):
+                try:
+                    s_id = int(s_id.replace("RAIDA", ""))
+                except:
+                    s_id = stripe_idx
+        else:
+            # 2. Fallback to object attribute access (Config objects)
+            s_addr = getattr(server, 'address', getattr(server, 'host', 'localhost'))
+            s_port = getattr(server, 'port', 50000 + stripe_idx)
+            s_id = getattr(server, 'index', getattr(server, 'server_id', stripe_idx))
+
         return upload_stripe_to_server(
-            # FIXED: Use getattr instead of .get() for ServerConfig compatibility
-            server_address=getattr(server, 'address', getattr(server, 'host', 'localhost')),
-            server_port=getattr(server, 'port', 50000 + stripe_idx),
-            server_id=getattr(server, 'index', getattr(server, 'server_id', stripe_idx)),
+            server_address=s_addr,
+            server_port=int(s_port),
+            server_id=int(s_id),
             stripe_data=stripe_data,
             stripe_index=stripe_idx,
             identity=identity,
@@ -1009,21 +915,18 @@ def upload_file_to_servers(
         futures = [thread_pool.submit(upload_single, task) for task in tasks]
         for future in as_completed(futures):
             try:
-                result = future.result()
-                results.append(result)
+                results.append(future.result())
             except Exception as e:
                 log_error(logger_handle, SENDER_CONTEXT, "Upload task failed", str(e))
                 results.append(UploadResult(success=False, error_message=str(e)))
     else:
         # Sequential execution
         for task in tasks:
-            result = upload_single(task)
-            results.append(result)
+            results.append(upload_single(task))
 
     # Check results
     success_count = sum(1 for r in results if r.success)
-    fail_count = len(results) - success_count
-
+    
     log_info(logger_handle, SENDER_CONTEXT,
              f"File upload complete: {success_count}/{len(results)} stripes succeeded")
 
@@ -1096,11 +999,42 @@ def send_email_async(
             return result.error_code, result
         
         # Convert 25 ANs to hex string (800 hex chars = 25 * 16 bytes * 2)
-        hex_an_list = [an.hex() for an in identity_coin['ans']]
-        identity.authenticity_number = "".join(hex_an_list)
+        # --- ROBUST AN EXTRACTION ---
+  # --- ROBUST AN EXTRACTION FIX ---
+        raw_ans = None
+        file_path = "unknown"
+
+        # Handle Dict vs Object return from scanner
+        if isinstance(identity_coin, dict):
+            raw_ans = identity_coin.get('ans')
+            file_path = identity_coin.get('file_path', 'unknown')
+        else:
+            # Assume Object
+            raw_ans = getattr(identity_coin, 'ans', None)
+            file_path = getattr(identity_coin, 'file_path', 'unknown')
+
+        # FINAL CHECK
+        if not raw_ans:
+            # Try reloading it manually using local function if scanner failed
+            log_warning(logger_handle, SENDER_CONTEXT, f"Scanner failed to read ANs. Trying manual load: {file_path}")
+            manual_coin = load_coin_from_file(file_path) # Uses local function at top of file
+            if manual_coin:
+                raw_ans = manual_coin.ans
         
+        if not raw_ans:
+            log_error(logger_handle, SENDER_CONTEXT, f"Coin IS corrupted or empty. Path: {file_path}")
+            return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
+
+        # Convert 25 ANs to hex string
+        try:
+            hex_an_list = [an.hex() if isinstance(an, bytes) else str(an) for an in raw_ans]
+            identity.authenticity_number = "".join(hex_an_list)
+        except Exception as e:
+            log_error(logger_handle, SENDER_CONTEXT, f"Failed to format ANs: {e}")
+            return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
+
         log_info(logger_handle, SENDER_CONTEXT,
-                f"Loaded identity from: {os.path.basename(identity_coin['file_path'])}")
+                f"Loaded identity from: {os.path.basename(file_path)}")
 
         # Step 3: Generate file group GUID
         state.file_group_guid = uuid.uuid4().bytes
@@ -1112,36 +1046,40 @@ def send_email_async(
         result.file_count = state.total_files
 
         # Step 4: Calculate payment
-        update_state("CALCULATING", 10, "Calculating payment...")
-
+     # 4. Payment
+        update_state("CALCULATING", 10, "Calculating payment")
+        
+        # Collect file sizes
         file_sizes = [len(request.email_file)]
-        for path in (request.attachment_paths or []):
-            file_sizes.append(os.path.getsize(path))
-
-        recipient_count = len(request.to_recipients or []) + \
-                         len(request.cc_recipients or []) + \
-                         len(request.bcc_recipients or [])
-
+        for path in (request.attachment_paths or []): 
+            try:
+                file_sizes.append(os.path.getsize(path))
+            except OSError:
+                pass # Should have been caught by validation, but safe to ignore here
+        
+        # Collect ALL recipients into a single list
+        all_recipients = (request.to_recipients or []) + \
+                         (request.cc_recipients or []) + \
+                         (request.bcc_recipients or [])
+        
+        # CALL WITH LIST, NOT COUNT
         err, payment_calc = calculate_total_payment(
-            file_sizes, request.storage_weeks, recipient_count, db_handle, logger_handle
+            file_sizes, 
+            request.storage_weeks, 
+            all_recipients,  # <--- PASS THE LIST HERE
+            db_handle, 
+            logger_handle
         )
-        if err != ErrorCode.SUCCESS:
-            result.error_code = SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS
-            result.error_message = "Failed to calculate payment"
-            update_state("FAILED", 0, "Payment calculation failed")
+        
+        if err != ErrorCode.SUCCESS: 
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
-
-        result.total_cost = payment_calc.total_cost
-
-        # Step 5: Request locker code
-        update_state("PAYMENT", 15, "Requesting locker code...")
+        
+        update_state("PAYMENT", 15, f"Requesting locker code ({payment_calc.total_cost} CC)")
         err, locker_code = request_locker_code(payment_calc.total_cost, db_handle, logger_handle)
-        if err != ErrorCode.SUCCESS:
-            result.error_code = SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS
-            result.error_message = "Failed to get locker code"
-            update_state("FAILED", 0, "Locker code generation failed")
+        
+        if err != ErrorCode.SUCCESS: 
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
-
+            
         state.locker_code = locker_code
         storage_duration = weeks_to_duration_code(request.storage_weeks)
 
@@ -1252,171 +1190,141 @@ def send_tell_notifications(
 ) -> ErrorCode:
     """
     Send Tell notifications to all recipients.
-
-    Notifies each recipient's beacon server that a new email is available.
-    Uses cloudcoin locker keys for payment. Failed tells are stored in
-    PendingTells table for later retry.
-
-    Args:
-        request: SendEmailRequest with recipient info
-        file_group_guid: The file group GUID for this email
-        servers: List of server configurations
-        identity: User identity
-        logger_handle: Optional logger handle
-        db_handle: Database handle for user lookups
-        cc_handle: CloudCoin handle for locker keys
-        locker_code: 8-byte locker code for Tell encryption
-        upload_results: List of upload results with server locations
-
-    Returns:
-        ErrorCode (SUCCESS even on partial failures - email is already uploaded)
+    FIXED: Imports TellRecipient/TellServer from qmail_types (not protocol).
     """
-    # Collect all recipients with their types
-    all_recipients = []
-    for r in (request.to_recipients or []):
-        all_recipients.append((r, 0))  # 0 = To
-    for r in (request.cc_recipients or []):
-        all_recipients.append((r, 1))  # 1 = CC
-    for r in (request.bcc_recipients or []):
-        all_recipients.append((r, 2))  # 2 = BCC
+    import asyncio
+    import time
+    import json
+    import os
+    
+    # --- FIXED IMPORTS ---
+    from qmail_types import ErrorCode, TellRecipient, TellServer
+    from logger import log_info, log_debug, log_warning, log_error
+    from database import get_user_by_address, insert_pending_tell, DatabaseErrorCode
+    
+    # Ensure helper functions are available
+    # from email_sender import create_recipient_locker, _build_tell_servers, _parse_qmail_address, _beacon_id_to_raida_index
 
-    recipient_count = len(all_recipients)
-    if recipient_count == 0:
+    SENDER_CONTEXT = "EmailSender"
+
+    # 1. Collect Recipients
+    all_recipients = []
+    for r in (request.to_recipients or []): all_recipients.append((r, 0)) # 0 = To
+    for r in (request.cc_recipients or []): all_recipients.append((r, 1)) # 1 = CC
+    for r in (request.bcc_recipients or []): all_recipients.append((r, 2)) # 2 = BCC
+
+    if not all_recipients:
         log_debug(logger_handle, SENDER_CONTEXT, "No recipients for Tell notifications")
         return ErrorCode.SUCCESS
 
-    log_info(logger_handle, SENDER_CONTEXT,
-             f"Sending Tell notifications to {recipient_count} recipients")
+    log_info(logger_handle, SENDER_CONTEXT, f"Processing Tell notifications for {len(all_recipients)} recipients")
 
-    # Process any pending tells from previous failures (best effort)
+    # 2. Process Pending (Best Effort)
     if db_handle and cc_handle:
-        _process_pending_tells(db_handle, cc_handle, identity, logger_handle)
+        try:
+            _process_pending_tells(db_handle, cc_handle, identity, logger_handle)
+        except Exception:
+            pass
 
-    # Validate we have required handles
+    # 3. Validation
     if db_handle is None:
-        log_warning(logger_handle, SENDER_CONTEXT,
-                    "No database handle - cannot look up beacon servers")
-        return ErrorCode.SUCCESS  # Don't fail, email is uploaded
-
+        log_warning(logger_handle, SENDER_CONTEXT, "No database handle - cannot look up beacons")
+        return ErrorCode.SUCCESS 
+    
+    # Locker Code is required for the recipient to eventually DOWNLOAD the file
     if locker_code is None or len(locker_code) < 8:
-        log_warning(logger_handle, SENDER_CONTEXT,
-                    "No locker code - cannot encrypt Tell requests")
+        log_warning(logger_handle, SENDER_CONTEXT, "No File Locker Code - recipients will not be able to download")
         return ErrorCode.SUCCESS
 
-    # Validate all recipients have beacon servers
-    recipient_beacons = {}
-    for recipient, r_type in all_recipients:
-        address = recipient.address if hasattr(recipient, 'address') else str(recipient)
-        err, user = get_user_by_address(db_handle, address)
-        if err != DatabaseErrorCode.SUCCESS or user is None:
-            log_warning(logger_handle, SENDER_CONTEXT,
-                        f"Recipient not in database: {address}")
-            # Use default beacon
-            recipient_beacons[address] = ('raida11', r_type, recipient)
-        elif not user.get('beacon_id'):
-            log_warning(logger_handle, SENDER_CONTEXT,
-                        f"Recipient has no beacon: {address}, using raida11")
-            recipient_beacons[address] = ('raida11', r_type, recipient)
-        else:
-            recipient_beacons[address] = (user['beacon_id'], r_type, recipient)
-
-    # Get locker keys for all recipients
-   # Get locker keys for all recipients (per-recipient fees)
-    # Get locker keys for all recipients (create actual lockers)
-    # Get locker keys for all recipients (create actual lockers)
-    locker_keys = []
-    
-    wallet_path = "Data/Wallets/Default"
-    
-    for address, (beacon_id, r_type, recipient) in recipient_beacons.items():
-        # Look up recipient's sending fee
-        err, user = get_user_by_address(db_handle, address)
-        if err == DatabaseErrorCode.SUCCESS and user and user.get('sending_fee'):
-            try:
-                fee = float(user['sending_fee'])
-            except (ValueError, TypeError):
-                fee = 0.1
-        else:
-            fee = 0.1
-        
-        # Create locker with actual coins (EXCLUDING identity coin)
-        import asyncio
-        err_code, locker_hex = asyncio.run(create_recipient_locker(
-            wallet_path, fee, identity.serial_number, logger_handle
-        ))
-        
-        if err_code == 0 and locker_hex:
-            locker_keys.append(locker_hex)
-            log_info(logger_handle, SENDER_CONTEXT,
-                    f"Created locker for {address} with fee {fee}")
-        else:
-            # Failed - use placeholder
-            locker_keys.append(os.urandom(16).hex())
-            log_warning(logger_handle, SENDER_CONTEXT,
-                       f"Failed to create locker for {address}, using placeholder")
-            
-    # Build server list from upload results with locker_code for decryption
+    # 4. Build Server List (Locations of the uploaded file)
     tell_servers = _build_tell_servers(upload_results, servers, locker_code, logger_handle)
 
-    # Send Tell to each recipient serially
+    # 5. Process Each Recipient (Payment + Send)
     tells_sent = 0
     tells_failed = 0
     timestamp = int(time.time())
+    wallet_path = "Data/Wallets/Default"
 
-    for i, (address, (beacon_id, r_type, recipient)) in enumerate(recipient_beacons.items()):
-        locker_key_hex = locker_keys[i] if i < len(locker_keys) else os.urandom(16).hex()
-        locker_key_bytes = bytes.fromhex(locker_key_hex) if isinstance(locker_key_hex, str) else locker_key_hex
+    for address, r_type in all_recipients:
+        try:
+            # --- A. Resolve User & Beacon ---
+            beacon_id = 'raida11' # Default
+            sending_fee = 0.1     # Default
+            
+            err, user = get_user_by_address(db_handle, address)
+            if err == DatabaseErrorCode.SUCCESS and user:
+                if user.get('beacon_id'):
+                    beacon_id = user['beacon_id']
+                if user.get('sending_fee'):
+                    try:
+                        sending_fee = float(user['sending_fee'])
+                    except: 
+                        sending_fee = 0.1
 
-        # Parse address to get serial number
-        coin_id, denom, serial_number = _parse_qmail_address(address)
+            # --- B. Create Locker (Strict Notification Fee Payment) ---
+            # This creates a NEW locker (e.g. 0.1 CC) specifically to pay the Beacon.
+            # This is NOT the file storage locker.
+            err_code, locker_hex = asyncio.run(create_recipient_locker(
+                wallet_path, sending_fee, identity.serial_number, logger_handle
+            ))
 
-        # Build TellRecipient
-        tell_recipient = TellRecipient(
-            address_type=r_type,
-            coin_id=coin_id,
-            denomination=denom,
-            domain_id=0,  # QMail
-            serial_number=serial_number,
-            locker_payment_key=locker_key_bytes
-        )
+            if err_code != 0 or not locker_hex:
+                log_error(logger_handle, SENDER_CONTEXT, 
+                          f"Skipping Tell for {address}: Notification Fee Payment failed (Code {err_code})")
+                tells_failed += 1
+                continue
 
-        # Get beacon server info
-        beacon_raida_id = _beacon_id_to_raida_index(beacon_id)
+            locker_key_bytes = bytes.fromhex(locker_hex)
 
-        # Build and send Tell request
-        err = _send_single_tell(
-            beacon_raida_id, beacon_id, tell_recipient, file_group_guid,
-            tell_servers, locker_code, identity, timestamp, logger_handle
-        )
+            # --- C. Build Recipient Struct ---
+            # Parse 0006.4.12355 -> coin_id=6, denom=4, sn=12355
+            coin_id, denom, serial_number = _parse_qmail_address(address)
 
-        if err == ErrorCode.SUCCESS:
-            tells_sent += 1
-            log_debug(logger_handle, SENDER_CONTEXT,
-                      f"Tell sent to {address} via {beacon_id}")
-        else:
+            # Uses the imported TellRecipient class
+            tell_recipient = TellRecipient(
+                address_type=r_type,
+                coin_id=coin_id,
+                denomination=denom,
+                domain_id=0, 
+                serial_number=serial_number,
+                locker_payment_key=locker_key_bytes # The 0.1 CC key we just created
+            )
+
+            # --- D. Send Notification ---
+            beacon_raida_id = _beacon_id_to_raida_index(beacon_id)
+
+            err = _send_single_tell(
+                beacon_raida_id, beacon_id, tell_recipient, file_group_guid,
+                tell_servers, locker_code, identity, timestamp, logger_handle
+            )
+
+            if err == ErrorCode.SUCCESS:
+                tells_sent += 1
+                log_debug(logger_handle, SENDER_CONTEXT, f"Tell sent to {address} via {beacon_id}")
+            else:
+                tells_failed += 1
+                log_warning(logger_handle, SENDER_CONTEXT, f"Tell failed for {address} via {beacon_id}")
+
+                # Store in Retry Queue
+                if db_handle:
+                    server_list_json = json.dumps([{
+                        'stripe_index': s.stripe_index,
+                        'stripe_type': s.stripe_type,
+                        'ip_address': s.ip_address,
+                        'port': s.port
+                    } for s in tell_servers])
+
+                    insert_pending_tell(
+                        db_handle, file_group_guid, address, r_type,
+                        beacon_id, locker_code, server_list_json
+                    )
+
+        except Exception as e:
+            log_error(logger_handle, SENDER_CONTEXT, f"Exception processing Tell for {address}: {e}")
             tells_failed += 1
-            log_warning(logger_handle, SENDER_CONTEXT,
-                        f"Tell failed for {address} via {beacon_id}")
 
-            # Store in retry queue
-            if db_handle:
-                server_list_json = json.dumps([{
-                    'stripe_index': s.stripe_index,
-                    'stripe_type': s.stripe_type,
-                    'ip_address': s.ip_address,
-                    'port': s.port
-                } for s in tell_servers])
-
-                insert_pending_tell(
-                    db_handle, file_group_guid, address, r_type,
-                    beacon_id, locker_code, server_list_json
-                )
-
-    log_info(logger_handle, SENDER_CONTEXT,
-             f"Tell notifications: {tells_sent} sent, {tells_failed} failed")
-
+    log_info(logger_handle, SENDER_CONTEXT, f"Tell notifications: {tells_sent} sent, {tells_failed} failed")
     return ErrorCode.SUCCESS
-
 
 def _send_single_tell(
     raida_id: int,
@@ -1431,19 +1339,31 @@ def _send_single_tell(
 ) -> ErrorCode:
     """
     Deliver Tell notification with TCP-to-UDP fallback.
-    FIXED: Uses send_raw_request (TCP) or _send_udp_request (UDP).
     """
-    from .network import ServerInfo, connect_to_server, send_raw_request, disconnect, NetworkErrorCode
-    from .protocol import build_complete_tell_request, TELL_TYPE_QMAIL, validate_tell_response
+    from network import ServerInfo, connect_to_server, send_raw_request, disconnect, NetworkErrorCode
+    from protocol import build_complete_tell_request, TELL_TYPE_QMAIL, validate_tell_response
     
-    # 1. Build the request
-    # Unpacks 4 values to match your latest protocol.py structure.
+    # 1. Prepare AN for this specific RAIDA (Used for Packet Authentication)
+    target_an = bytes(16)
+    
+    hex_an = getattr(identity, 'authenticity_number', '')
+    if hex_an and len(hex_an) >= 800:
+        try:
+            start_idx = raida_id * 32 # 32 hex chars = 16 bytes
+            an_slice_hex = hex_an[start_idx : start_idx + 32]
+            target_an = bytes.fromhex(an_slice_hex)
+        except Exception:
+            pass 
+
+    # 2. Build the request
+    # locker_code: The File Access Code (allows recipient to download file)
+    # recipient.locker_payment_key: The Notification Fee (0.1 CC for this Tell)
     err, request_bytes, challenge, nonce = build_complete_tell_request(
         raida_id=raida_id,
         denomination=getattr(identity, 'denomination', 1),
         serial_number=getattr(identity, 'serial_number', 0),
         device_id=0,
-        an=getattr(identity, 'an', bytes(16)),
+        an=target_an,
         file_group_guid=file_group_guid,
         locker_code=locker_code,
         timestamp=timestamp,
@@ -1453,7 +1373,10 @@ def _send_single_tell(
         logger_handle=logger_handle
     )
 
-    # 2. Try TCP Port 50000+
+    if err != 0:
+        return ErrorCode.ERR_PROTOCOL
+
+    # 3. Try TCP Port 50000+
     host = f"{beacon_id}.cloudcoin.global"
     s_info = ServerInfo(host=host, port=50000 + raida_id, raida_id=raida_id)
     err_conn, conn = connect_to_server(s_info, logger_handle=logger_handle)
@@ -1462,17 +1385,17 @@ def _send_single_tell(
         try:
             # net_err 0 = SUCCESS
             net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
-            if net_err == NetworkErrorCode.SUCCESS and resp.status == 250:
+            if net_err == NetworkErrorCode.SUCCESS and resp and resp.status == 250:
                 return ErrorCode.SUCCESS
         finally:
             disconnect(conn)
 
-    # 3. FALLBACK: UDP Port 19000
-    # If TCP times out, the beacon likely only accepts UDP notifications.
+    # 4. FALLBACK: UDP Port 19000
     log_info(logger_handle, "EmailSender", f"TCP failed, trying UDP for {beacon_id}")
+    
+    # Assuming _send_udp_request is available in the module scope
     response = _send_udp_request(host, 19000, request_bytes, logger_handle)
     if response:
-        # validate_tell_response checks the echo and status
         _, status, _ = validate_tell_response(response, challenge, logger_handle)
         if status == 250:
             return ErrorCode.SUCCESS
@@ -1867,35 +1790,38 @@ def process_email_package(
 ) -> Tuple[SendEmailErrorCode, Optional[SendEmailResult]]:
     """
     Orchestrate full upload with Pretty Address resolution.
-    FIXED: Resolves recipients to numeric IDs for DB and technical addresses for RAIDA.
+    FIXED: Uses robust key access (.get) to prevent crashes on missing dictionary keys.
     """
     import uuid, os, time
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from src.network import connect_to_server, disconnect, send_raw_request
-    from src.config import get_raida_server_config
-    from src.protocol import build_complete_tell_request, weeks_to_duration_code, TELL_TYPE_QMAIL
-    from src.database import get_user_by_address, store_email, DatabaseErrorCode
-    from src.logger import log_info, log_error
+    from network import connect_to_server, disconnect, send_raw_request
+    from config import get_raida_server_config
+    from protocol import build_complete_tell_request, weeks_to_duration_code, TELL_TYPE_QMAIL
+    from database import get_user_by_address, store_email, DatabaseErrorCode
+    from logger import log_info, log_error
 
     log_info(logger_handle, "Sender", "Starting Pretty Email upload process.")
     file_group_guid = uuid.uuid4().bytes
 
-    # --- 1. RECIPIENT RESOLUTION (Pretty -> Technical & Numeric) ---
+    # --- 1. RECIPIENT RESOLUTION ---
     recipient_sns = []
     tech_addresses = []
-    # Hum har Pretty Address ko resolve karenge taaki protocol aur DB ko sahi data mile
+    
     for addr in package.recipients:
         err, user_info = get_user_by_address(db_handle, addr)
         if err == DatabaseErrorCode.SUCCESS and user_info:
-            # DB Junction table ke liye numeric SN (e.g. 2841)
-            recipient_sns.append(user_info['SerialNumber'])
-            # RAIDA Tell packet ke liye technical address (e.g. 0006.4.2841)
-            tech_addresses.append(f"0006.{user_info['Denomination']}.{user_info['SerialNumber']}")
+            # ROBUST ACCESS: Use .get() and fallback to handle key casing issues safely
+            sn = user_info.get('serial_number', user_info.get('SerialNumber', 0))
+            # CRITICAL FIX: Handle missing denomination safely
+            denom = user_info.get('denomination', user_info.get('Denomination', 0))
+            
+            recipient_sns.append(sn)
+            # Construct Technical Address: 0006.DN.SN
+            tech_addresses.append(f"0006.{denom}.{sn}")
         else:
-            # Agar DB mein nahi hai, toh raw string use karein (direct address case)
+            # Fallback for unknown users
             tech_addresses.append(addr)
-            # Try to extract numeric SN for DB mapping
-            from src.protocol import custom_sn_to_int
+            from protocol import custom_sn_to_int
             recipient_sns.append(custom_sn_to_int(addr))
 
     # --- 2. COST & LOCKER ---
@@ -1905,7 +1831,7 @@ def process_email_package(
     if err != ErrorCode.SUCCESS: 
         return SendEmailErrorCode.ERR_PAYMENT_FAILED, None
 
-    # Locker Sanitization (8 Bytes Null-Padded)
+    # Locker Sanitization
     if isinstance(locker_code, str):
         if len(locker_code) == 8:
             locker_code = locker_code.encode('ascii')
@@ -1940,18 +1866,16 @@ def process_email_package(
                 ))
         for f in as_completed(futures): f.result()
 
-    # --- 5. BEACON NOTIFICATION (Using Technical Addresses) ---
+    # --- 5. BEACON NOTIFICATION ---
     beacon_id = 11
     try:
         timestamp = int(time.time())
-        # AN slicing remains the same (Format 9 support)
         if hasattr(identity, 'authenticity_number') and len(identity.authenticity_number) >= 400:
             start = beacon_id * 16
             target_an = identity.authenticity_number[start : start+16]
         else:
             target_an = bytes(16)
 
-        # UPDATED: Using tech_addresses (0006.DN.SN) for the RAIDA network packet
         err_proto, tell_req, challenge, nonce = build_complete_tell_request(
             raida_id=beacon_id,
             denomination=identity.denomination,
@@ -1962,7 +1886,7 @@ def process_email_package(
             locker_code=locker_code,
             timestamp=timestamp,
             tell_type=TELL_TYPE_QMAIL,
-            recipients=tech_addresses, # <--- Correct technical format
+            recipients=tech_addresses, 
             servers=[] 
         )
         
@@ -1977,12 +1901,11 @@ def process_email_package(
     except Exception as e:
         log_error(logger_handle, "Sender", f"Tell failed: {e}")
 
-    # --- 6. LOCAL STORAGE (Using Fixed Database function) ---
-    # Save a copy in the 'sent' folder with properly linked Serial Numbers
+    # --- 6. LOCAL STORAGE ---
     sent_email_data = {
         'email_id': file_group_guid,
         'subject': package.subject,
-        'body': package.searchable_text, # Or full body
+        'body': package.searchable_text,
         'sender_sn': identity.serial_number,
         'recipient_sns': recipient_sns,
         'folder': 'sent',
@@ -1992,8 +1915,6 @@ def process_email_package(
     store_email(db_handle, sent_email_data)
 
     return SendEmailErrorCode.SUCCESS, SendEmailResult(file_group_guid, locker_code)
-
-
 # ============================================================================
 # MAIN (for testing)
 # ============================================================================

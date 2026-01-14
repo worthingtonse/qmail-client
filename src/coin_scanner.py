@@ -17,7 +17,7 @@ Date: 2025-12-22
 import os
 import struct
 import math
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional , List , Any
 from enum import IntEnum
 
 # Import error codes from cloudcoin module
@@ -393,6 +393,112 @@ def load_coin_metadata(filepath: str) -> Optional[Dict]:
         }
     except Exception:
         return None
+    
+
+
+
+def load_coin_from_file(file_path: str) -> Optional[Any]:
+    """
+    Loads full coin data including ANs and internal POWN status.
+    Required for payment orchestrations (Cmd 82).
+    """
+    import struct
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+
+        if len(data) < 439:
+            return None
+
+        # Parse internal POWN from Byte 16
+        pown_bytes = data[16:29]
+        pown_str = ""
+        for i in range(25):
+            byte_val = pown_bytes[i // 2]
+            nibble = (byte_val >> 4) if (i % 2 == 0) else (byte_val & 0x0F)
+            pown_str += 'p' if nibble == 1 else ('f' if nibble == 0 else 'u')
+
+        # Parse SN/DN from Byte 32 preamble
+        denomination = struct.unpack('b', data[34:35])[0]
+        serial_number = struct.unpack('>I', data[35:39])[0]
+
+        # Parse 25 Authenticity Numbers (ANs)
+        # ANs start at Offset 39 (Byte 32 + 7 bytes of header)
+        ans = []
+        for i in range(25):
+            start = 39 + (i * 16)
+            ans.append(data[start : start + 16])
+
+        # Create a simple object to match the expected coin interface
+        # FIXED: Added 'serial_number' alias to match 'sn' for compatibility
+        return type('Coin', (), {
+            'denomination': denomination,
+            'sn': serial_number,             # Used by some modules
+            'serial_number': serial_number,  # <--- FIXED: Added for coin_break compatibility
+            'ans': ans,
+            'pown_string': pown_str,
+            'file_path': file_path
+        })()
+    except Exception:
+        return None
+
+
+def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int = None) -> List:
+    """
+    Get coins from wallet that total the target value.
+    STRATEGY: Accumulate coins (Largest First) until target is met.
+    """
+    import os
+    # Ensure parse_denomination_code is available
+    from coin_scanner import parse_denomination_code
+    
+    bank_path = os.path.join(wallet_path, "Bank")
+    
+    if not os.path.exists(bank_path):
+        return []
+    
+    all_coins = []
+    
+    # 1. Scan and load all available coins
+    for filename in os.listdir(bank_path):
+        if not filename.endswith('.bin'):
+            continue
+            
+        file_path = os.path.join(bank_path, filename)
+        
+        # Use the loader you provided (assumed to be in module scope)
+        coin = load_coin_from_file(file_path)
+        
+        if coin is None:
+            continue
+        
+        # CRITICAL: Skip identity coin
+        if identity_sn and coin.serial_number == int(identity_sn):
+            continue
+        
+        # Get float value
+        coin_value = parse_denomination_code(coin.denomination)
+        all_coins.append((coin, coin_value))
+
+    # 2. Sort Descending (Largest First)
+    # This ensures we try to cover the amount with the fewest/largest coins possible
+    all_coins.sort(key=lambda x: x[1], reverse=True)
+    
+    selected_coins = []
+    current_sum = 0.0
+    
+    # 3. Accumulate until we hit target
+    for coin, val in all_coins:
+        selected_coins.append(coin)
+        current_sum += val
+        
+        # If we have enough (>= target), return the selection
+        # (The payment logic will handle breaking if we have too much)
+        if current_sum >= target_value - 0.00000001:
+            return selected_coins
+
+    # 4. Insufficient funds even after summing everything
+    return []
 
 def find_identity_coin(wallet_path: str, target_sn: Optional[int] = None) -> Optional[dict]:
     """

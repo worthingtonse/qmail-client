@@ -31,6 +31,7 @@ uses Python's built-in sqlite3 module which wraps the same C library.
 
 import sqlite3
 import os
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -147,23 +148,23 @@ PRAGMA foreign_keys = ON;
 -- ==========================================
 -- 1. QMailServers
 -- ==========================================
-CREATE TABLE IF NOT EXISTS QMailServers (
-    QMailServerID TEXT PRIMARY KEY,
-    ServerIndex INTEGER,
-    IPAddress TEXT NOT NULL,
-    PortNumb INTEGER,
-    server_type TEXT CHECK(server_type IN ('RAIDA', 'DRD', 'DKE', 'QMAIL', 'QWEB', 'QVPN')),
-    cost_per_mb TEXT,
-    Cost_per_week_storage TEXT,
-    ping_ms INTEGER,
-    percent_uptime REAL,
-    performance_benchmark_percentile REAL,
-    date_created DATETIME,
-    is_available INTEGER DEFAULT 1,
-    last_checked DATETIME,
-    use_for_parity INTEGER DEFAULT 0,
-    synced_at DATETIME
-);
+CREATE TABLE IF NOT EXISTS Servers (
+        ServerID TEXT PRIMARY KEY,
+        ServerIndex INTEGER,
+        IPAddress TEXT,
+        Port INTEGER,
+        ServerType TEXT,
+        CostPerMB REAL DEFAULT 1.0,
+        CostPer8Weeks REAL DEFAULT 1.0,
+        PercentUptime INTEGER DEFAULT 100,
+        PerformancePercentile INTEGER DEFAULT 0,
+        Region TEXT,
+        Description TEXT,
+        IsAvailable INTEGER DEFAULT 1,
+        LastSeen INTEGER,
+        UseForParity INTEGER DEFAULT 0,  -- <--- ADDED
+        PingMS INTEGER DEFAULT 0         -- <--- ADDED
+    );
 
 -- ==========================================
 -- 2. Users (Contacts)
@@ -522,8 +523,8 @@ CREATE INDEX IF NOT EXISTS idx_received_stripes_tell_id ON received_stripes(tell
 
 def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
     """
-    Initialize database connection and create all tables from SCHEMA_SQL.
-    FIXED: Ensures all columns exist before creating indexes to avoid 'no such column' errors.
+    Initialize database connection and create all tables.
+    FIXED: Auto-migrates missing columns (UseForParity, PingMS) to prevent crashes.
     """
     import sqlite3
     import os
@@ -533,7 +534,7 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
     if not db_path: 
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
-    # 1. Directory Safety: Ensure 'Data/' folder exists
+    # 1. Directory Safety
     db_dir = os.path.dirname(db_path)
     if db_dir and not os.path.exists(db_dir):
         try:
@@ -544,30 +545,39 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
             return DatabaseErrorCode.ERR_IO, None
 
     try:
-        # 2. Connection Setup
+        # 2. Connection
         connection = sqlite3.connect(db_path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
-        
-        # Enable Foreign Keys
         connection.execute("PRAGMA foreign_keys = ON")
         cursor = connection.cursor()
 
-        # 3. EXECUTE FULL SCHEMA
-        # Ab ye crash nahi karega kyunki SCHEMA_SQL mein auto_address add kar diya gaya hai.
+        # 3. Create Tables (If they don't exist)
         cursor.executescript(SCHEMA_SQL)
 
-        # 4. SAFETY CHECK: Ensure migration columns are there anyway
-        cursor.execute("PRAGMA table_info(Users)")
-        existing_cols = [col[1] for col in cursor.fetchall()]
+        # 4. MIGRATION: Fix Servers Table (This fixes your crash)
+        cursor.execute("PRAGMA table_info(Servers)")
+        server_cols = [col[1] for col in cursor.fetchall()]
         
-        if 'contact_count' not in existing_cols:
+        if 'UseForParity' not in server_cols:
+            log_info(logger, "Database", "Migrating: Adding UseForParity to Servers")
+            cursor.execute("ALTER TABLE Servers ADD COLUMN UseForParity INTEGER DEFAULT 0")
+            
+        if 'PingMS' not in server_cols:
+            log_info(logger, "Database", "Migrating: Adding PingMS to Servers")
+            cursor.execute("ALTER TABLE Servers ADD COLUMN PingMS INTEGER DEFAULT 0")
+
+        # 5. MIGRATION: Fix Users Table (Preserving your existing checks)
+        cursor.execute("PRAGMA table_info(Users)")
+        user_cols = [col[1] for col in cursor.fetchall()]
+        
+        if 'contact_count' not in user_cols:
             cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
         
-        if 'last_contacted_timestamp' not in existing_cols:
+        if 'last_contacted_timestamp' not in user_cols:
             cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp INTEGER")
 
         connection.commit()
-        log_info(logger, "Database", f"Full database schema (13 tables) initialized: {db_path}")
+        log_info(logger, "Database", f"Database initialized and migrated: {db_path}")
         
         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
         return DatabaseErrorCode.SUCCESS, handle
@@ -575,7 +585,6 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
     except sqlite3.Error as e:
         if logger: log_error(logger, "Database", "Initialization failed", str(e))
         return DatabaseErrorCode.ERR_OPEN_FAILED, None
-
 # ============================================================================
 # CLOSE DATABASE
 # ============================================================================
@@ -1740,44 +1749,37 @@ def execute_query(
 # ADDITIONAL HELPER FUNCTIONS
 # ============================================================================
 
-def store_server(handle: DatabaseHandle, server: Dict[str, Any]) -> Tuple[DatabaseErrorCode, Optional[int]]:
+def store_server(handle: Any, server: Dict[str, Any]) -> Tuple[DatabaseErrorCode, Optional[int]]:
     """
-    Store or update a QMail server record.
-
-    Args:
-        handle: Database handle
-        server: Dictionary with server data
-
-    Returns:
-        Tuple of (error_code, server_id)
-
-    C signature: DatabaseErrorCode store_server(DatabaseHandle* handle, const ServerInfo* server, int64_t* out_server_id);
+    Store or update a QMail server record manually.
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
     try:
         cursor = handle.connection.cursor()
-
         server_id = server.get('server_id')
-
+        
+        # Note: This uses INSERT OR REPLACE which resets flags like UseForParity to default (0)
         cursor.execute("""
-            INSERT OR REPLACE INTO QMailServers
-            (QMailServerID, IPAddress, PortNumb, server_type, ping_ms)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO Servers
+            (ServerID, IPAddress, Port, ServerType, LastSeen, IsAvailable, CostPerMB, CostPer8Weeks)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             server_id,
             server.get('ip_address', ''),
-            server.get('port'),
-            server.get('server_type'),
-            server.get('ping_ms')
+            server.get('port', 50000),
+            server.get('server_type', 'QMAIL'),
+            int(time.time()),
+            1,
+            server.get('cost_per_mb', 1.0),
+            server.get('cost_per_8_weeks', 1.0)
         ))
 
-        if server_id is None:
-            server_id = cursor.lastrowid
-
+        # We generally track by ServerID (text), but if rowid is needed:
+        row_id = cursor.lastrowid
         handle.connection.commit()
-        return DatabaseErrorCode.SUCCESS, server_id
+        return DatabaseErrorCode.SUCCESS, row_id
 
     except sqlite3.Error as e:
         log_error(handle.logger, DB_CONTEXT, "Failed to store server", str(e))
@@ -2300,8 +2302,8 @@ def upsert_user(handle: Any, user_data: Dict[str, Any]) -> DatabaseErrorCode:
     """
     import sqlite3
     # Inner import to prevent circular dependency with data_sync
-    from src.data_sync import convert_to_custom_base32 
-    from src.database import DatabaseErrorCode
+    from data_sync import convert_to_custom_base32 
+    from database import DatabaseErrorCode
 
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM
@@ -2353,56 +2355,65 @@ def upsert_user(handle: Any, user_data: Dict[str, Any]) -> DatabaseErrorCode:
     except sqlite3.Error as e:
         # Optionally log the error if handle.logger exists
         return DatabaseErrorCode.ERR_QUERY_FAILED
-def upsert_server(handle: DatabaseHandle, server: Dict[str, Any]) -> DatabaseErrorCode:
+
+def upsert_server(handle: Any, server: Dict[str, Any]) -> DatabaseErrorCode:
     """
     Insert or update a QMail server from remote sync data.
-
-    Args:
-        handle: Database handle
-        server: Dictionary with server data from JSON sync:
-            - server_id: str (required, e.g., "RAIDA1")
-            - server_index: int
-            - ip_address: str
-            - port: int
-            - server_type: str
-            - cost_per_mb: float
-            - cost_per_week: float
-            - percent_uptime: float
-            - performance_benchmark_percentile: float
-            - date_created: str (ISO datetime)
-
-    Returns:
-        DatabaseErrorCode
-
-    C signature: DatabaseErrorCode upsert_server(DatabaseHandle* handle, const SyncServer* server);
+    Matches 'Server Host File' fields to 'Servers' table.
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM
 
     server_id = server.get('server_id')
-    if server_id is None:
+    if not server_id:
         return DatabaseErrorCode.ERR_INVALID_PARAM
 
     try:
         cursor = handle.connection.cursor()
+        
+        # timestamp for LastSeen/SyncedAt
+        now = int(time.time())
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO QMailServers
-            (QMailServerID, ServerIndex, IPAddress, PortNumb, server_type,
-             cost_per_mb, Cost_per_week_storage, percent_uptime,
-             performance_benchmark_percentile, date_created, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        """, (
-            server_id,
-            server.get('server_index'),
-            server.get('ip_address', ''),
-            server.get('port'),
-            server.get('server_type', 'QMAIL'),
-            str(server.get('cost_per_mb', '')) if server.get('cost_per_mb') else None,
-            str(server.get('cost_per_week', '')) if server.get('cost_per_week') else None,
-            server.get('percent_uptime'),
-            server.get('performance_benchmark_percentile'),
-            server.get('date_created')
+        # Extract values
+        s_idx = server.get('server_index', 0)
+        ip = server.get('ip_address', '')
+        port = server.get('port', 50000)
+        s_type = server.get('server_type', 'QMAIL')
+        
+        # Costs (Handle defaults)
+        c_mb = float(server.get('cost_per_mb', 1.0))
+        c_8w = float(server.get('cost_per_8_weeks', 1.0))
+        
+        uptime = server.get('percent_uptime', 100)
+        perf = server.get('performance_benchmark_percentile', 0)
+        region = server.get('region', '')
+        desc = server.get('description', '')
+        date_created = server.get('date_created', '')
+
+        # Use UPSERT logic to preserve UseForParity if it exists
+        sql = """
+            INSERT INTO Servers (
+                ServerID, ServerIndex, IPAddress, Port, ServerType,
+                CostPerMB, CostPer8Weeks, PercentUptime, PerformancePercentile,
+                Region, Description, IsAvailable, LastSeen, UseForParity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0)
+            ON CONFLICT(ServerID) DO UPDATE SET
+                ServerIndex=excluded.ServerIndex,
+                IPAddress=excluded.IPAddress,
+                Port=excluded.Port,
+                CostPerMB=excluded.CostPerMB,
+                CostPer8Weeks=excluded.CostPer8Weeks,
+                PercentUptime=excluded.PercentUptime,
+                PerformancePercentile=excluded.PerformancePercentile,
+                Region=excluded.Region,
+                Description=excluded.Description,
+                LastSeen=excluded.LastSeen
+        """
+        
+        cursor.execute(sql, (
+            server_id, s_idx, ip, port, s_type,
+            c_mb, c_8w, uptime, perf,
+            region, desc, now
         ))
 
         handle.connection.commit()
@@ -2457,16 +2468,7 @@ def get_all_servers(
 ) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
     """
     Get all QMail servers from database.
-
-    Args:
-        handle: Database handle
-        available_only: If True, only return servers marked as available
-
-    Returns:
-        Tuple of (error_code, list of server dicts)
-
-    C signature: DatabaseErrorCode get_all_servers(DatabaseHandle* handle, bool available_only,
-                                                    Server** out_servers, int* out_count);
+    Updated to match 'Servers' schema and 'cost_per_8_weeks' requirement.
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, []
@@ -2474,42 +2476,36 @@ def get_all_servers(
     try:
         cursor = handle.connection.cursor()
 
+        sql = """
+            SELECT ServerID, ServerIndex, IPAddress, Port, ServerType,
+                   CostPerMB, CostPer8Weeks, PingMS, PercentUptime, 
+                   PerformancePercentile, IsAvailable, UseForParity, LastSeen,
+                   Region, Description
+            FROM Servers
+        """
         if available_only:
-            cursor.execute("""
-                SELECT QMailServerID, ServerIndex, IPAddress, PortNumb, server_type,
-                       cost_per_mb, Cost_per_week_storage, ping_ms,
-                       percent_uptime, performance_benchmark_percentile,
-                       is_available, use_for_parity, last_checked
-                FROM QMailServers
-                WHERE is_available = 1
-                ORDER BY ServerIndex
-            """)
-        else:
-            cursor.execute("""
-                SELECT QMailServerID, ServerIndex, IPAddress, PortNumb, server_type,
-                       cost_per_mb, Cost_per_week_storage, ping_ms,
-                       percent_uptime, performance_benchmark_percentile,
-                       is_available, use_for_parity, last_checked
-                FROM QMailServers
-                ORDER BY ServerIndex
-            """)
+            sql += " WHERE IsAvailable = 1"
+        sql += " ORDER BY ServerIndex ASC"
 
+        cursor.execute(sql)
         servers = []
         for row in cursor.fetchall():
             servers.append({
-                'server_id': row['QMailServerID'],
+                'server_id': row['ServerID'],
                 'server_index': row['ServerIndex'],
                 'ip_address': row['IPAddress'],
-                'port': row['PortNumb'],
-                'server_type': row['server_type'],
-                'cost_per_mb': row['cost_per_mb'],
-                'cost_per_week': row['Cost_per_week_storage'],
-                'ping_ms': row['ping_ms'],
-                'percent_uptime': row['percent_uptime'],
-                'performance_benchmark_percentile': row['performance_benchmark_percentile'],
-                'is_available': bool(row['is_available']),
-                'is_parity': bool(row['use_for_parity']),
-                'last_checked': row['last_checked']
+                'port': row['Port'],
+                'server_type': row['ServerType'],
+                'cost_per_mb': row['CostPerMB'],
+                'cost_per_8_weeks': row['CostPer8Weeks'],  # Crucial for payment.py
+                'ping_ms': row['PingMS'],
+                'percent_uptime': row['PercentUptime'],
+                'performance_benchmark_percentile': row['PerformancePercentile'],
+                'is_available': bool(row['IsAvailable']),
+                'use_for_parity': bool(row['UseForParity']),
+                'last_checked': row['LastSeen'],
+                'region': row['Region'],
+                'description': row['Description']
             })
 
         return DatabaseErrorCode.SUCCESS, servers
@@ -2519,40 +2515,33 @@ def get_all_servers(
         return DatabaseErrorCode.ERR_QUERY_FAILED, []
 
 
-def get_stripe_servers(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
+def get_stripe_servers(handle: Any) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
     """
-    Get servers to use for data stripes (excludes parity server).
-
-    Returns:
-        Tuple of (error_code, list of server dicts)
-
-    C signature: DatabaseErrorCode get_stripe_servers(DatabaseHandle* handle,
-                                                       Server** out_servers, int* out_count);
+    Get servers to use for data stripes (excludes designated parity server).
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, []
 
     try:
         cursor = handle.connection.cursor()
-
+        
+        # Select servers that are Available AND NOT Parity
         cursor.execute("""
-            SELECT QMailServerID, ServerIndex, IPAddress, PortNumb, server_type,
-                   ping_ms, is_available
-            FROM QMailServers
-            WHERE is_available = 1 AND use_for_parity = 0
-            ORDER BY ServerIndex
+            SELECT ServerID, ServerIndex, IPAddress, Port, ServerType, IsAvailable
+            FROM Servers
+            WHERE IsAvailable = 1 AND UseForParity = 0
+            ORDER BY ServerIndex ASC
         """)
 
         servers = []
         for row in cursor.fetchall():
             servers.append({
-                'server_id': row['QMailServerID'],
+                'server_id': row['ServerID'],
                 'server_index': row['ServerIndex'],
                 'ip_address': row['IPAddress'],
-                'port': row['PortNumb'],
-                'server_type': row['server_type'],
-                'ping_ms': row['ping_ms'],
-                'is_available': bool(row['is_available'])
+                'port': row['Port'],
+                'server_type': row['ServerType'],
+                'is_available': bool(row['IsAvailable'])
             })
 
         return DatabaseErrorCode.SUCCESS, servers
@@ -2561,15 +2550,9 @@ def get_stripe_servers(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, List[
         log_error(handle.logger, DB_CONTEXT, "Failed to get stripe servers", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, []
 
-
-def get_parity_server(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
+def get_parity_server(handle: Any) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
     Get the designated parity server.
-
-    Returns:
-        Tuple of (error_code, server dict or None)
-
-    C signature: DatabaseErrorCode get_parity_server(DatabaseHandle* handle, Server* out_server);
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
@@ -2578,10 +2561,10 @@ def get_parity_server(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, Option
         cursor = handle.connection.cursor()
 
         cursor.execute("""
-            SELECT QMailServerID, ServerIndex, IPAddress, PortNumb, server_type,
-                   ping_ms, is_available
-            FROM QMailServers
-            WHERE use_for_parity = 1
+            SELECT ServerID, ServerIndex, IPAddress, Port, ServerType,
+                   PingMS, IsAvailable
+            FROM Servers
+            WHERE UseForParity = 1
             LIMIT 1
         """)
 
@@ -2590,13 +2573,13 @@ def get_parity_server(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, Option
             return DatabaseErrorCode.SUCCESS, None
 
         server = {
-            'server_id': row['QMailServerID'],
+            'server_id': row['ServerID'],
             'server_index': row['ServerIndex'],
             'ip_address': row['IPAddress'],
-            'port': row['PortNumb'],
-            'server_type': row['server_type'],
-            'ping_ms': row['ping_ms'],
-            'is_available': bool(row['is_available'])
+            'port': row['Port'],
+            'server_type': row['ServerType'],
+            'ping_ms': row['PingMS'],
+            'is_available': bool(row['IsAvailable'])
         }
 
         return DatabaseErrorCode.SUCCESS, server
@@ -2604,39 +2587,24 @@ def get_parity_server(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, Option
     except sqlite3.Error as e:
         log_error(handle.logger, DB_CONTEXT, "Failed to get parity server", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
-
-
-def set_parity_server(handle: DatabaseHandle, server_id: str) -> DatabaseErrorCode:
+    
+def set_parity_server(handle: Any, server_id: str) -> DatabaseErrorCode:
     """
     Designate a server as the parity server.
-
-    Clears parity flag from all other servers first.
-
-    Args:
-        handle: Database handle
-        server_id: QMailServerID to use for parity (e.g., "RAIDA14")
-
-    Returns:
-        DatabaseErrorCode
-
-    C signature: DatabaseErrorCode set_parity_server(DatabaseHandle* handle, const char* server_id);
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM
-
     if not server_id:
         return DatabaseErrorCode.ERR_INVALID_PARAM
 
     try:
         cursor = handle.connection.cursor()
 
-        # Clear all parity flags
-        cursor.execute("UPDATE QMailServers SET use_for_parity = 0")
+        # Clear existing
+        cursor.execute("UPDATE Servers SET UseForParity = 0")
 
-        # Set the new parity server
-        cursor.execute("""
-            UPDATE QMailServers SET use_for_parity = 1 WHERE QMailServerID = ?
-        """, (server_id,))
+        # Set new
+        cursor.execute("UPDATE Servers SET UseForParity = 1 WHERE ServerID = ?", (server_id,))
 
         if cursor.rowcount == 0:
             handle.connection.rollback()
@@ -2653,58 +2621,43 @@ def set_parity_server(handle: DatabaseHandle, server_id: str) -> DatabaseErrorCo
 
 
 def update_server_status(
-    handle: DatabaseHandle,
+    handle: Any,
     server_id: str,
     is_available: bool,
     ping_ms: int = None
 ) -> DatabaseErrorCode:
     """
     Update server availability status.
-
-    Called after ping tests or connection failures.
-
-    Args:
-        handle: Database handle
-        server_id: QMailServerID
-        is_available: Whether server is available
-        ping_ms: Optional ping time in milliseconds
-
-    Returns:
-        DatabaseErrorCode
-
-    C signature: DatabaseErrorCode update_server_status(DatabaseHandle* handle, const char* server_id,
-                                                         bool is_available, int ping_ms);
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM
-
     if not server_id:
         return DatabaseErrorCode.ERR_INVALID_PARAM
 
     try:
         cursor = handle.connection.cursor()
+        now = int(time.time())
 
         if ping_ms is not None:
             cursor.execute("""
-                UPDATE QMailServers
-                SET is_available = ?, ping_ms = ?, last_checked = datetime('now')
-                WHERE QMailServerID = ?
-            """, (1 if is_available else 0, ping_ms, server_id))
+                UPDATE Servers
+                SET IsAvailable = ?, PingMS = ?, LastSeen = ?
+                WHERE ServerID = ?
+            """, (1 if is_available else 0, ping_ms, now, server_id))
         else:
             cursor.execute("""
-                UPDATE QMailServers
-                SET is_available = ?, last_checked = datetime('now')
-                WHERE QMailServerID = ?
-            """, (1 if is_available else 0, server_id))
+                UPDATE Servers
+                SET IsAvailable = ?, LastSeen = ?
+                WHERE ServerID = ?
+            """, (1 if is_available else 0, now, server_id))
 
         handle.connection.commit()
         return DatabaseErrorCode.SUCCESS
 
     except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, f"Failed to update server status for {server_id}", str(e))
+        log_error(handle.logger, DB_CONTEXT, f"Failed to update status for {server_id}", str(e))
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED
-
 
 def get_user_count(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, int]:
     """
@@ -2729,28 +2682,21 @@ def get_user_count(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, int]:
         return DatabaseErrorCode.ERR_QUERY_FAILED, 0
 
 
-def get_server_count(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, int]:
+def get_server_count(handle: Any) -> Tuple[DatabaseErrorCode, int]:
     """
     Get total count of servers in database.
-
-    Returns:
-        Tuple of (error_code, count)
-
-    C signature: DatabaseErrorCode get_server_count(DatabaseHandle* handle, int* out_count);
     """
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, 0
 
     try:
         cursor = handle.connection.cursor()
-        cursor.execute("SELECT COUNT(*) FROM QMailServers")
+        cursor.execute("SELECT COUNT(*) FROM Servers")
         count = cursor.fetchone()[0]
         return DatabaseErrorCode.SUCCESS, count
-
     except sqlite3.Error as e:
         log_error(handle.logger, DB_CONTEXT, "Failed to get server count", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, 0
-
 
 # ============================================================================
 # INCOMING EMAIL/DOWNLOAD FUNCTIONS
@@ -3448,25 +3394,18 @@ def delete_pending_tell(
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED
 
-
 def get_user_by_address(
     handle: Any, 
     qmail_address: str
 ) -> Tuple[DatabaseErrorCode, Optional[Dict[str, Any]]]:
     """
-    Get full user info by their Pretty Email Address.
-    REPLACES old get_user_by_address to match the new Integer SN schema.
-    
-    Args:
-        handle: Database handle
-        qmail_address: Pretty address (e.g., "Sean.Worthington@CEO#C23.Giga")
-
-    Returns:
-        Tuple of (DatabaseErrorCode, user dict or None)
+    Get full user info by their Pretty Email Address OR Technical Address.
+    FIXED: Explicitly returns 'denomination' which is required for technical addressing.
     """
     import sqlite3
-    from src.database import DatabaseErrorCode
-    from src.logger import log_error
+    # Ensure these are available/imported
+    # from src.database import DatabaseErrorCode
+    # from src.logger import log_error
 
     if handle is None or handle.connection is None:
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
@@ -3475,35 +3414,70 @@ def get_user_by_address(
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
 
     try:
-        # 1. Row factory enable karein taaki dictionary access mil sake
+        # 1. Enable dictionary-like access
         handle.connection.row_factory = sqlite3.Row
         cursor = handle.connection.cursor()
+        
+        target_sn = None
+        user_row = None
 
-        # 2. Query matching the new schema
-        # SerialNumber replace kar raha hai UserID ko.
-        # Beacon replace kar raha hai BeaconID ko.
+        # 2. Strategy A: Direct Lookup (Pretty Address)
         cursor.execute("""
             SELECT 
                 SerialNumber, Denomination, CustomSerialNumber, 
                 FirstName, LastName, auto_address, Description, 
                 InboxFee, Class, Beacon
-            FROM Users
+            FROM Users 
             WHERE auto_address = ?
         """, (qmail_address.strip(),))
+        user_row = cursor.fetchone()
 
-        row = cursor.fetchone()
-        
-        if row is None:
+        # 3. Strategy B: Extract Serial Number from Technical String
+        if user_row is None:
+            clean_addr = qmail_address.strip()
+            
+            # Check for Dot-Delimited String (e.g. "0006.4.12355")
+            parts = clean_addr.split('.')
+            if len(parts) >= 2 and parts[-1].isdigit():
+                try:
+                    target_sn = int(parts[-1])
+                except ValueError:
+                    pass
+            # Check for pure Integer string
+            elif clean_addr.isdigit():
+                target_sn = int(clean_addr)
+            # Check for Custom Serial Number (e.g. "C23")
+            else:
+                cursor.execute("SELECT * FROM Users WHERE CustomSerialNumber = ?", (clean_addr,))
+                user_row = cursor.fetchone()
+
+            # If we found an SN, look up by Primary Key
+            if target_sn is not None and user_row is None:
+                cursor.execute("SELECT * FROM Users WHERE SerialNumber = ?", (target_sn,))
+                user_row = cursor.fetchone()
+
+        if user_row is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, None
 
-        # 3. Convert row to dict - Ye format api_handlers expect karte hain
-        user = dict(row)
+        # 4. CRITICAL FIX: Return a standardized dictionary with ALL required keys
+        # We use lowercase keys to match Python standards
+        user = {
+            'serial_number': user_row['SerialNumber'],
+            'denomination': user_row['Denomination'],  # <--- THIS WAS MISSING
+            'custom_sn': user_row['CustomSerialNumber'],
+            'first_name': user_row['FirstName'],
+            'last_name': user_row['LastName'],
+            'auto_address': user_row['auto_address'],
+            'description': user_row['Description'],
+            'inbox_fee': user_row['InboxFee'] if user_row['InboxFee'] is not None else 0.0,
+            'class': user_row['Class'],
+            'beacon_id': user_row['Beacon']
+        }
 
         return DatabaseErrorCode.SUCCESS, user
 
     except sqlite3.Error as e:
-        log_error(handle.logger, "Database", 
-                  f"Failed to get user by address {qmail_address}", str(e))
+        # log_error(handle.logger, "Database", f"Failed to get user {qmail_address}", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, None
 
 

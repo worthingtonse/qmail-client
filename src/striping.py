@@ -23,7 +23,7 @@ C Notes:
 """
 
 import zlib
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple , Any
 
 # Import types from qmail_types
 try:

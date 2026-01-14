@@ -311,8 +311,13 @@ def handle_mail_send(request_handler, context):
         # DB lookup for Sean.Worthington@CEO#C23.Giga
         err, user_info = get_user_by_address(app_ctx.db_handle, addr)
         if err == DatabaseErrorCode.SUCCESS and user_info:
+            # FIXED: Use lowercase keys 'denomination' and 'serial_number' matching database.py
+            # Use .get() for safety against capitalization changes
+            denom = user_info.get('denomination', user_info.get('Denomination', 0))
+            sn = user_info.get('serial_number', user_info.get('SerialNumber', 0))
+            
             # Pass Technical Address (0006.D.SN) so email_sender can parse it easily
-            tech_addr = f"0006.{user_info['Denomination']}.{user_info['SerialNumber']}"
+            tech_addr = f"0006.{denom}.{sn}"
             resolved_to.append(tech_addr)
         else:
             resolved_to.append(addr) # Fallback to raw string
@@ -359,7 +364,7 @@ def handle_mail_send(request_handler, context):
                 cc_handle=app_ctx.cc_handle
             )
 
-            if result.success:
+            if result and getattr(result, 'success', False):
                 complete_task(app_ctx.task_manager, task_id, {"success": True}, "Email sent successfully")
             else:
                 # Reactive Healing check
@@ -375,7 +380,6 @@ def handle_mail_send(request_handler, context):
 
     app_ctx.thread_pool.executor.submit(process_send)
     return request_handler.send_json_response(202, {"status": "accepted", "task_id": task_id, "message": "Email queued"})
-
 def handle_mail_download(request_handler, context):
     """
     GET /api/mail/download/{id} - Download email by ID

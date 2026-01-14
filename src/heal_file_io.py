@@ -34,7 +34,7 @@ import os
 import struct
 import threading
 import logging
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
 
