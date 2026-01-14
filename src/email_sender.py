@@ -942,15 +942,16 @@ def upload_file_to_servers(
 # ============================================================================
 
 def send_email_async(
-    request: 'SendEmailRequest',
-    identity: 'IdentityConfig',
-    db_handle: object,
-    servers: List[Dict],
-    thread_pool: Optional[ThreadPoolExecutor] = None,
-    task_callback: Optional[callable] = None,
-    logger_handle: Optional[object] = None,
-    cc_handle: object = None 
-) -> Tuple[SendEmailErrorCode, SendEmailResult]:
+        request: 'SendEmailRequest',
+        identity: 'IdentityConfig',
+        db_handle: object,
+        servers: List[Dict],
+        thread_pool: Optional[ThreadPoolExecutor] = None,
+        task_callback: Optional[callable] = None,
+        logger_handle: Optional[object] = None,
+        cc_handle: object = None,
+        config: object = None  # ADD THIS LINE
+    ) -> Tuple[SendEmailErrorCode, SendEmailResult]:
     """
     Send an email asynchronously.
     FIXED: Integrates binary .key file loading and server-specific AN verification.
@@ -1075,8 +1076,9 @@ def send_email_async(
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
         
         update_state("PAYMENT", 15, f"Requesting locker code ({payment_calc.total_cost} CC)")
-        err, locker_code = request_locker_code(payment_calc.total_cost, db_handle, logger_handle)
-        
+        err, locker_code = request_locker_code(
+        payment_calc.total_cost, db_handle, logger_handle, config, identity.serial_number
+    )
         if err != ErrorCode.SUCCESS: 
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
             

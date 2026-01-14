@@ -357,12 +357,14 @@ def handle_mail_send(request_handler, context):
             log_info(app_ctx.logger, "API", f"Using {len(all_servers)} servers for upload")
 
             err, result = send_email_async(
-                request_obj, identity, app_ctx.db_handle, all_servers,
-                app_ctx.thread_pool.executor,
-                lambda s: update_task_progress(app_ctx.task_manager, task_id, s.progress, s.message),
-                app_ctx.logger,
-                cc_handle=app_ctx.cc_handle
+            request_obj, identity, app_ctx.db_handle, all_servers,
+            app_ctx.thread_pool.executor,
+            lambda s: update_task_progress(app_ctx.task_manager, task_id, s.progress, s.message),
+            app_ctx.logger,
+            cc_handle=app_ctx.cc_handle,
+            config=app_ctx.config  # ADD THIS LINE
             )
+
 
             if result and getattr(result, 'success', False):
                 complete_task(app_ctx.task_manager, task_id, {"success": True}, "Email sent successfully")
