@@ -110,7 +110,7 @@ async def create_recipient_locker(
                     f"Breaking coin {total_value_selected} to get {amount}")
             
             # --- FIX: Handle BreakResult object correctly ---
-            break_result = await break_coin(coin_to_break, amount)
+            break_result = await break_coin(coin_to_break, wallet_path, None, logger_handle)
             
             broken_coins = []
             # Check if result is an object with .coins attribute (standard implementation)

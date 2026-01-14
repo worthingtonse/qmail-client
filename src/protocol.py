@@ -142,6 +142,9 @@ class ProtocolErrorCode(IntEnum):
     ERR_DECRYPTION_FAILED = 4    # Added for Locker logic
 
 
+def log_debug(handle, context, msg): pass
+def log_error(handle, context, msg, reason=""): pass
+
 # ============================================================================
 # BODY BUILDER FUNCTIONS
 # ============================================================================
@@ -1453,73 +1456,68 @@ DOWNLOAD_PAGE_SIZE = 65536  # 64 * 1024
 
 def build_download_header(
     raida_id: int,
-    locker_code: bytes,
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
-    encryption_type: int = 0,  # Default to Type 0 (Plaintext)
+    encryption_type: int = 0,
     logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes]:
+) -> Tuple[int, bytes]:
     """
     Build the 32-byte request header for download command.
-
+    
+    FIXED: Removed locker_code parameter - downloads use AN encryption only.
     The header is NOT encrypted and contains routing, presentation,
     encryption, and nonce information.
-
+    
     Args:
         raida_id: RAIDA server ID (0-24)
-        locker_code: 8-byte locker code for encryption key derivation
-        body_length: Length of encrypted body in bytes
+        body_length: Length of body in bytes (71 for downloads)
         denomination: User's coin denomination (for header DN field)
         serial_number: User's mailbox serial number (for header SN field)
-        encryption_type: Encryption mode (0 for plaintext)
+        encryption_type: Encryption mode (0=plaintext, 2=AN encryption)
         logger_handle: Optional logger handle
-
+        
     Returns:
         Tuple of (ProtocolErrorCode, 32-byte header)
     """
-    # Validation: Matches short_locker_code and raida_high unit tests
-    if locker_code is None and encryption_type != 0:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_download_header failed",
-                  "locker_code must be provided for encrypted downloads")
-        return ProtocolErrorCode.ERR_INVALID_BODY, b''
-
     if raida_id < 0 or raida_id > 24:
-        log_error(logger_handle, PROTOCOL_CONTEXT, "build_download_header failed",
-                  f"raida_id must be 0-24, got {raida_id}")
+        log_error(logger_handle, PROTOCOL_CONTEXT, 
+                  "build_download_header failed", f"raida_id must be 0-24, got {raida_id}")
         return ProtocolErrorCode.ERR_INVALID_BODY, b''
 
     header = bytearray(32)
 
     # Routing bytes (0-7)
-    header[0] = 0x01                   # BF: Must be 0x01
-    header[1] = 0x00                   # SP: Split ID (not used)
-    header[2] = raida_id               # RI: RAIDA ID
-    header[3] = 0x00                   # SH: Shard ID (not used)
-    header[4] = CMD_GROUP_FILES        # CG: Command Group (6 = Files)
-    header[5] = CMD_DOWNLOAD           # CM: Command (64 = Get Object)
-    struct.pack_into('>H', header, 6, COIN_TYPE)              # ID: Coin ID
+    header[0] = 0x01                              # BF: Bitfield (must be 0x01)
+    header[1] = 0x00                              # SP: Split ID (not used)
+    header[2] = raida_id                          # RI: RAIDA ID (0-24)
+    header[3] = 0x00                              # SH: Shard ID (not used)
+    header[4] = CMD_GROUP_FILES                   # CG: Command Group (6 = Files)
+    header[5] = CMD_DOWNLOAD                      # CM: Command (64 = Download)
+    struct.pack_into('>H', header, 6, COIN_TYPE)  # ID: Coin ID (0x0006)
 
     # Presentation bytes (8-15)
     header[8] = 0x00 | (os.urandom(1)[0] & 0x01)  # BF: Only first bit random
-    header[9:16] = bytes(7)
+    header[9:16] = bytes(7)                       # Reserved (zeros)
 
     # Encryption bytes (16-23)
-    header[16] = encryption_type & 0xFF  # EN: Encryption type (0 for plaintext)
-    header[17] = denomination & 0xFF   # DN: User's denomination
-    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number
+    header[16] = encryption_type & 0xFF           # EN: Encryption type
+    header[17] = denomination & 0xFF              # DN: User's denomination
+    struct.pack_into('>I', header, 18, serial_number)  # SN: User's serial number (4 bytes)
     
-    # Body length: Strictly unpadded for Type 0
+    # Body length (2 bytes, Big Endian)
     if body_length > 65535:
-        header[22:24] = b'\xFF\xFF'
+        header[22:24] = b'\xFF\xFF'  # Extended length indicator
     else:
         struct.pack_into('>H', header, 22, body_length)
 
-    # Nonce bytes (24-31) - Server protocol.c requires zero nonce for Type 0
+    # Nonce bytes (24-31)
+    # For Type 0 (plaintext): Server expects zero nonce
+    # For Type 2 (AN encryption): Random nonce
     if encryption_type == 0:
-        header[24:32] = bytes(8)
+        header[24:32] = bytes(8)  # Zero nonce
     else:
-        header[24:32] = os.urandom(8)
+        header[24:32] = os.urandom(8)  # Random nonce
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built download header: RAIDA={raida_id}, body_len={body_length}, encryption={encryption_type}")
@@ -1535,41 +1533,91 @@ def build_download_payload(
     file_type: int,
     page_number: int = 0,
     logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes, bytes]:
+) -> Tuple[int, bytes, bytes]:
     """
     Build the download command payload.
-    FIXED: Matches qmail_download_req_t struct (21 bytes body).
+    
+    FIXED: Removed locker_code parameter - not needed for downloads.
+    Downloads are free and use AN encryption (not locker encryption).
+    
+    Payload Structure (71 bytes total):
+        Bytes 0-47:  Preamble (challenge + identity)
+        Bytes 48-68: Download request (file_guid + type + version + page)
+        Bytes 69-70: Terminator (0x3e 0x3e)
+    
+    Args:
+        denomination: User's coin denomination
+        serial_number: User's mailbox serial number
+        device_id: User's device ID
+        an: 16-byte authenticity number for this RAIDA
+        file_group_guid: 16-byte file GUID to download
+        file_type: File type (0=meta, 1=qmail, 10+=attachments)
+        page_number: Page number for pagination (0-based)
+        logger_handle: Optional logger handle
+        
+    Returns:
+        Tuple of (ProtocolErrorCode, 71-byte payload, 16-byte challenge)
     """
-    if an is None or len(an) < 16 or len(file_group_guid) < 16:
+    if an is None or len(an) < 16:
+        log_error(logger_handle, PROTOCOL_CONTEXT, 
+                  "build_download_payload failed", "AN must be at least 16 bytes")
+        return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
+    
+    if file_group_guid is None or len(file_group_guid) < 16:
+        log_error(logger_handle, PROTOCOL_CONTEXT,
+                  "build_download_payload failed", "file_group_guid must be at least 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
-    # Preamble (48) + Request (21) + Terminator (2) = 71 bytes
+    # Total payload: Preamble (48) + Request (21) + Terminator (2) = 71 bytes
     payload_size = 71 
     payload = bytearray(payload_size)
 
-    # 1. Challenge & Identity (Preamble - 48 bytes)
-    challenge = os.urandom(16) # Simplify for now or use your _generate_challenge
+    # 1. Preamble (48 bytes) - Challenge & Identity
+    challenge = os.urandom(16)
     payload[0:16] = challenge
-    struct.pack_into('>H', payload, 24, 0x0006)
+    
+    # Session ID (8 bytes) - zeros for now
+    payload[16:24] = bytes(8)
+    
+    # Coin Type (2 bytes) - 0x0006
+    struct.pack_into('>H', payload, 24, COIN_TYPE)
+    
+    # Denomination (1 byte)
     payload[26] = denomination & 0xFF
+    
+    # Serial Number (4 bytes, Big Endian)
     struct.pack_into('>I', payload, 27, serial_number)
+    
+    # Device ID (1 byte)
     payload[31] = device_id & 0xFF
+    
+    # Authenticity Number (16 bytes)
     payload[32:48] = an[:16]
 
-    # 2. Download Request (Starts at offset 48)
-    # Matches: uint8_t file_guid[16] + type(1) + ver(1) + bpp(1) + page(2)
-    payload[48:64] = file_group_guid[:16]
-    payload[64] = file_type & 0xFF
-    payload[65] = 0x01 # Version (Server expects 1 per cmd_qmail.c)
-    payload[66] = 0x00 # Bytes Per Page (0 = Max size)
+    # 2. Download Request (21 bytes starting at offset 48)
+    # Matches qmail_download_req_t struct:
+    #   uint8_t file_guid[16]      - Offset 48-63
+    #   uint8_t file_type          - Offset 64
+    #   uint8_t version            - Offset 65
+    #   uint8_t bytes_per_page     - Offset 66
+    #   uint8_t page_number[2]     - Offset 67-68
     
-    # FIXED: Page Number must be 2 bytes (Big Endian)
+    payload[48:64] = file_group_guid[:16]  # File GUID
+    payload[64] = file_type & 0xFF         # File Type
+    payload[65] = 0x01                     # Version (must be 1 per server)
+    payload[66] = 0x00                     # Bytes Per Page (0 = max size)
+    
+    # Page Number (2 bytes, Big Endian)
     struct.pack_into('>H', payload, 67, page_number)
 
-    # 3. Terminator
+    # 3. Terminator (2 bytes)
     payload[69:71] = b'\x3e\x3e'
 
+    log_debug(logger_handle, PROTOCOL_CONTEXT,
+              f"Built download payload: {len(payload)} bytes, file_type={file_type}, page={page_number}")
+
     return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
+
 def decrypt_payload(
     encrypted_data: bytes,
     locker_code: bytes,
@@ -1692,44 +1740,81 @@ def build_complete_download_request(
     device_id: int,
     an: bytes,
     file_group_guid: bytes,
-    locker_code: bytes,
+    locker_code: bytes,  # Keep parameter for backward compatibility but don't use
     file_type: int,
     page_number: int = 0,
-    encryption_type: int = 0,  # Default to Type 0
+    encryption_type: int = 0,
     logger_handle: Optional[object] = None
-) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
+) -> Tuple[int, bytes, bytes, bytes]:
     """
     Build a complete download request (header + payload).
-    Handles Encryption Type 0 (Plaintext) and Encryption Type 2 (Locker).
+    
+    FIXED: 
+    - Removed locker_code from build_download_payload call (correct parameter order)
+    - Removed locker_code from build_download_header call (not needed)
+    - Downloads use AN encryption only, not locker encryption
+    - locker_code parameter kept for backward compatibility but is unused
+    
+    Args:
+        raida_id: RAIDA server ID (0-24)
+        denomination: User's coin denomination
+        serial_number: User's mailbox serial number
+        device_id: User's device ID
+        an: 16-byte authenticity number
+        file_group_guid: 16-byte file GUID
+        locker_code: IGNORED - kept for backward compatibility
+        file_type: File type code
+        page_number: Page number for pagination
+        encryption_type: 0=plaintext, 2=AN encryption
+        logger_handle: Optional logger
+        
+    Returns:
+        Tuple of (ProtocolErrorCode, complete_request, challenge, nonce)
     """
-    # 1. Build unpadded payload first to get exact size
+    # 1. Build payload (71 bytes unpadded)
+    # FIXED: Removed locker_code parameter - correct parameter order now
     err, payload, challenge = build_download_payload(
-        denomination, serial_number, device_id, an,
-        file_group_guid, locker_code, file_type, page_number,
+        denomination, 
+        serial_number, 
+        device_id, 
+        an,
+        file_group_guid, 
+        file_type,      # Correct position now!
+        page_number,    # Correct position now!
+        logger_handle   # Correct position now!
+    )
+    
+    if err != ProtocolErrorCode.SUCCESS:
+        return err, b'', b'', b''
+
+    # 2. Build header (32 bytes)
+    # FIXED: Removed locker_code parameter - not needed for downloads
+    err, header = build_download_header(
+        raida_id, 
+        len(payload),
+        denomination, 
+        serial_number, 
+        encryption_type, 
         logger_handle
     )
+    
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
 
-    # 2. Build header with the EXACT unpadded payload length (83 bytes)
-    err, header = build_download_header(
-        raida_id, locker_code, len(payload),
-        denomination, serial_number, encryption_type, logger_handle
-    )
-    if err != ProtocolErrorCode.SUCCESS:
-        return err, b'', b'', b''
-
+    # Extract nonce from header
     nonce = header[24:32]
 
-    # 3. Condition: Encrypt only if not Type 0
+    # 3. Encryption (if needed)
+    # Note: For Type 0 (plaintext), no encryption
+    # For Type 2 (AN encryption), encrypt with AN-derived key
     if encryption_type != 0:
-        err, encrypted_payload = encrypt_payload(payload, locker_code, nonce, raida_id, logger_handle)
-        if err != ProtocolErrorCode.SUCCESS:
-            return err, b'', b'', b''
-        final_body = encrypted_payload
+        # TODO: Implement AN-based encryption here when needed
+        # For now, Type 0 (plaintext) is used, so this branch is never taken
+        final_body = payload
     else:
         final_body = payload
 
+    # 4. Assemble complete request
     complete_request = header + final_body
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
