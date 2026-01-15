@@ -380,22 +380,13 @@ def build_get_encryption_ticket_body(
     """
     Build request body for Get Encryption Ticket command (CMD 44).
 
-    Body format (31 bytes total):
+    Body format (32 bytes total):
         - Challenge: 16 bytes (12 random + 4 CRC32)
         - Broken RAIDA ID: 1 byte (which RAIDA we're encrypting for)
-        - Coin SN: 4 bytes (fracked coin's serial number, big-endian)
+        - Coin DN: 1 byte (denomination of coin being fixed)
+        - Coin SN: 4 bytes (serial number, big-endian)
         - Key Part: 8 bytes (half of fracked coin's AN for broken RAIDA)
         - Terminator: 2 bytes (0x3E3E)
-
-    Protocol:
-        - payload[0] = broken_raida_id (tells helper which RAIDA to encrypt for)
-        - Server gets DN from header (ci->encryption_denomination)
-        - Server uses get_inter_raida_key(my_id, broken_raida_id, 0, key) for proper key
-
-    Server creates 16-byte encrypted block:
-        KeyPart[0-7] + DN[8] + SN[9-12] + Random[13-14] + 0xFF[15]
-
-    NOTE: This request must be ENCRYPTED using helper RAIDA's AN.
 
     Args:
         broken_raida_id: The broken RAIDA we're trying to fix
@@ -411,12 +402,13 @@ def build_get_encryption_ticket_body(
     challenge = generate_challenge()
     body.extend(challenge)
 
-    # Broken RAIDA ID (1 byte) - tells helper which RAIDA to encrypt for
-    # Server uses this to select the correct RAIDA-to-RAIDA key
-    # DN is obtained from header (ci->encryption_denomination)
+    # Broken RAIDA ID (1 byte)
     body.append(broken_raida_id & 0xFF)
 
-    # Coin SN (4 bytes, big-endian) - the fracked coin's SN
+    # Coin DN (1 byte)
+    body.append(fracked_coin.denomination & 0xFF)
+
+    # Coin SN (4 bytes, big-endian)
     body.extend(struct.pack('>I', fracked_coin.serial_number))
 
     # Key Part (8 bytes)
@@ -435,23 +427,19 @@ def build_fix_encryption_body(
     """
     Build request body for Fix Encryption command (CMD 45).
 
-    Body format - from server cmd_key_exchange.c:
+    Body format:
         - Challenge: 16 bytes
-        - Fracked Coin DN: 1 byte
-        - Fracked Coin SN: 4 bytes (big-endian per Go client)
-        - Key Part Records: N x 26 bytes each
+        - Coin DN: 1 byte
+        - Coin SN: 4 bytes (big-endian)
+        - Num Tickets: 1 byte
+        For each ticket (22 bytes each):
+            - Helper RAIDA ID: 1 byte
+            - Split ID: 1 byte (0 for AN[0:7], 1 for AN[8:15])
+            - Key Selector: 4 bytes
+            - Encrypted Key Part: 16 bytes
         - Terminator: 2 bytes (0x3E3E)
 
-    Each Key Part Record (26 bytes):
-        - Coin ID: 2 bytes (0x0006)
-        - Split ID: 1 byte (0 for first half, 1 for second half of AN)
-        - Helper RAIDA ID (DA): 1 byte
-        - Shard ID: 1 byte (0x00)
-        - DN: 1 byte
-        - SN: 4 bytes (big-endian per Go client)
-        - Encrypted Key Part: 16 bytes
-
-    NOTE: This request is UNENCRYPTED.
+    NOTE: This request is UNENCRYPTED (Type 0).
 
     Args:
         fracked_coin: The coin we're fixing
@@ -466,31 +454,25 @@ def build_fix_encryption_body(
     challenge = generate_challenge()
     body.extend(challenge)
 
-    # Fracked Coin DN (1 byte)
+    # Coin DN (1 byte)
     body.append(fracked_coin.denomination & 0xFF)
 
-    # Fracked Coin SN (4 bytes, big-endian per Go client)
+    # Coin SN (4 bytes, big-endian)
     body.extend(struct.pack('>I', fracked_coin.serial_number))
 
-    # Key Part Records (26 bytes each)
+    # Num Tickets (1 byte)
+    body.append(len(key_parts) & 0xFF)
+
+    # Each ticket (22 bytes)
     for kp in key_parts:
-        # Coin ID (2 bytes) - 0x0006 for CloudCoin
-        body.extend(struct.pack('>H', 0x0006))
-
-        # Split ID (1 byte) - 0 for first half of AN, 1 for second half
-        body.append(kp.split_id & 0x01)
-
-        # Helper RAIDA ID / Detection Agent (1 byte)
+        # Helper RAIDA ID (1 byte)
         body.append(kp.helper_raida_id & 0xFF)
 
-        # Shard ID (1 byte)
-        body.append(0x00)
+        # Split ID (1 byte)
+        body.append(kp.split_id & 0x01)
 
-        # DN (1 byte)
-        body.append(kp.denomination & 0xFF)
-
-        # SN (4 bytes, big-endian per Go client)
-        body.extend(struct.pack('>I', kp.serial_number))
+        # Key Selector (4 bytes, big-endian) - using 0 for now
+        body.append(0)
 
         # Encrypted Key Part (16 bytes)
         body.extend(kp.encrypted_key_part[:16])
@@ -644,37 +626,30 @@ def get_encryption_ticket(
 
     Process:
     1. Build Get Encryption Ticket request body
-    2. Build header with encryption enabled (using helper_coin's AN)
-    3. Send ENCRYPTED request to helper RAIDA
+    2. Build header with NO encryption (Type 0)
+    3. Send UNENCRYPTED request to helper RAIDA
     4. Parse response to extract encrypted key part
 
-    IMPORTANT: All helpers must use the SAME nonce because the broken RAIDA
-    will decrypt ALL key parts using the single nonce from the CMD 45 header.
-
     Args:
-        helper_raida_id: RAIDA that will encrypt for us (has shared secret)
+        helper_raida_id: RAIDA that will encrypt for us
         broken_raida_id: Broken RAIDA we're fixing
         key_part: 8-byte key part (half of fracked coin's AN)
         fracked_coin: The coin we're fixing
-        shared_nonce: 8-byte nonce (all helpers MUST use the same nonce)
+        shared_nonce: Not used (kept for compatibility)
         split_id: 0 for AN bytes 0-7, 1 for AN bytes 8-15
 
     Returns:
         Tuple of (error_code, EncryptedKeyPart with 16-byte encrypted key)
     """
-    # Use shared nonce (critical: all helpers must use same nonce for CMD 45 to work)
-    nonce = shared_nonce if shared_nonce else os.urandom(8)
-
     result = EncryptedKeyPart(
         helper_raida_id=helper_raida_id,
         denomination=fracked_coin.denomination,
         serial_number=fracked_coin.serial_number,
         original_key_part=key_part,
-        nonce=nonce,  # Store nonce - spec suggests CMD 45 may need matching nonces
-        split_id=split_id  # 0 for first half, 1 for second half of AN
+        split_id=split_id
     )
 
-    # Build request body (31 bytes per server cmd_encrypt_key)
+    # Build request body
     body, challenge = build_get_encryption_ticket_body(
         broken_raida_id,
         key_part,
@@ -683,32 +658,18 @@ def get_encryption_ticket(
 
     logger.debug(f"CMD 44 body ({len(body)} bytes): {body.hex()}")
 
-    # Build header with encryption type 1 (shared secret)
-    # SN must be big-endian in header (build_request_header uses big-endian)
+    # Build header with NO encryption (Type 0)
     header = build_request_header(
         raida_id=helper_raida_id,
         command_group=CMD_GROUP_KEY_EXCHANGE,
         command_code=CMD_GET_ENCRYPTION_TICKET,
         body_length=len(body),
-        encryption_type=ENC_SHARED_SECRET,
-        denomination=fracked_coin.denomination,
-        serial_number=fracked_coin.serial_number
+        encryption_type=ENC_NONE
     )
-
-    # Encrypt ENTIRE body except terminator using helper's AN
-    # The nonce is already in header bytes 24-31 from build_request_header
-    helper_an = fracked_coin.ans[helper_raida_id]
-    encrypted_part = aes_ctr_encrypt(body[:-2], helper_an, nonce)  # Encrypt all but terminator
-    encrypted_body = encrypted_part + TERMINATOR
-
-    # Update header with our nonce (overwrite the random one)
-    header = bytearray(header)
-    header[24:32] = nonce
-    header = bytes(header)
 
     logger.debug(f"CMD 44 header ({len(header)} bytes): {header.hex()}")
 
-    request = header + encrypted_body
+    request = header + body
     err, response = send_request(helper_raida_id, request)
 
     if err != HealErrorCode.SUCCESS:
@@ -721,7 +682,6 @@ def get_encryption_ticket(
     err, encrypted_key_part = parse_get_encryption_ticket_response(response)
 
     if err != HealErrorCode.SUCCESS:
-        # Get more info from response header
         if len(response) >= 32:
             r_raida, r_status, r_cg, r_body = parse_response_header(response)
             logger.debug(f"Response header: raida={r_raida}, status={r_status}, cg={r_cg}, body={r_body}")
@@ -732,7 +692,6 @@ def get_encryption_ticket(
     logger.debug(f"Got encrypted key part from RAIDA{helper_raida_id}: {encrypted_key_part.hex()}")
 
     return HealErrorCode.SUCCESS, result
-
 
 def fix_encryption_on_raida(
     broken_raida_id: int,
