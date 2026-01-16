@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 # RAIDA Network Configuration
 RAIDA_COUNT = 25
-RAIDA_TIMEOUT = 300  # seconds per request
+RAIDA_TIMEOUT = 30  # seconds per request
 
 # Coin identifier for CloudCoin
 COIN_ID = 0x0006
@@ -693,6 +693,7 @@ def parse_get_ticket_response(
     if status == STATUS_ALL_PASS:
         results = [True] * num_coins
         if len(body) >= 4:
+            print(f"DEBUG: Raw ticket bytes: {body[:4].hex()}") 
             ticket_id = struct.unpack('>I', body[:4])[0]
     elif status == STATUS_ALL_FAIL:
         results = [False] * num_coins

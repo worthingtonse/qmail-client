@@ -455,6 +455,7 @@ def get_ticket_from_raida(
         if err == HealErrorCode.SUCCESS:
             result_dict[raida_id] = (ticket_id, coin_results)
             logger.debug(f"RAIDA{raida_id}: ticket={ticket_id:08x}, passed={sum(coin_results)}/{len(coin_results)}")
+            print(f"RAIDA{raida_id}: Received ticket value: 0x{ticket_id:08X}") 
         else:
             result_dict[raida_id] = (0, [False] * len(coins))
     else:
@@ -602,6 +603,9 @@ def fix_on_raida(
     
     logger.info(f"RAIDA{raida_id}: Starting Fix for {len(coins)} coin(s)")
     logger.info(f"RAIDA{raida_id}: Valid tickets from {len(valid_ticket_raida)} RAIDA: {valid_ticket_raida}")
+    for i, t in enumerate(tickets):
+        if t != 0:
+              print(f"RAIDA{raida_id}: Sending ticket[{i}] = 0x{t:08X}")      
     logger.info(f"RAIDA{raida_id}: Failed tickets from {len(failed_ticket_raida)} RAIDA: {failed_ticket_raida}")
     logger.info(f"RAIDA{raida_id}: PG = {pg.hex()}")
     
