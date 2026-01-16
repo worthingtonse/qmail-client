@@ -357,7 +357,7 @@ def parse_diagnostic_response(response: bytes, raida_id: int) -> RaidaDiagReport
     resp_raida_id = response[0]
     resp_status = response[2]
     
-    if resp_status != 0:  # STATUS_SUCCESS = 0
+    if resp_status != 250:  # STATUS_SUCCESS = 0
         report.error_message = f"Server returned error code: {resp_status} (0x{resp_status:02X})"
         return report
     
