@@ -358,7 +358,7 @@ def parse_diagnostic_response(response: bytes, raida_id: int) -> RaidaDiagReport
     resp_status = response[2]
     
     if resp_status != 0:  # STATUS_SUCCESS = 0
-        report.error_message = f"Server returned error status: {resp_status}"
+        report.error_message = f"Server returned error code: {resp_status} (0x{resp_status:02X})"
         return report
     
     # Get body size from header (bytes 9-11)
@@ -889,7 +889,7 @@ def main():
             print(generate_root_cause_analysis(reports))
         
         if args.output:
-            with open(args.output, 'w') as f:
+            with open(args.output, 'w', encoding='utf-8') as f:
                 f.write(report_text)
             print(f"\nFull report written to {args.output}")
     

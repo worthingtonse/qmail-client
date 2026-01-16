@@ -101,20 +101,68 @@ class RaidaServer:
     is_online: bool = True
 
 
+# def get_default_raida_servers() -> List[RaidaServer]:
+#     """
+#     Get default RAIDA server configuration.
+
+#     Uses the pattern: raida{N}.cloudcoin.global:5000{N}
+
+#     Returns:
+#         List of 25 RaidaServer objects
+#     """
+#     servers = []
+#     for i in range(RAIDA_COUNT):
+#         servers.append(RaidaServer(
+#             raida_id=i,
+#             host=RAIDA_URL_PATTERN.format(i),
+#             port=RAIDA_BASE_PORT + i
+#         ))
+#     return servers
+
 def get_default_raida_servers() -> List[RaidaServer]:
     """
-    Get default RAIDA server configuration.
-
-    Uses the pattern: raida{N}.cloudcoin.global:5000{N}
-
+    Get default RAIDA server configuration using direct IP addresses.
+    
+    Note: Hostnames like raida0.cloudcoin.global resolve to Cloudflare IPs
+    which don't forward TCP port 50000. We must use direct IPs.
+    
     Returns:
         List of 25 RaidaServer objects
     """
+    # Direct IP addresses (bypassing Cloudflare)
+    RAIDA_IPS = [
+        "78.46.170.45",      # RAIDA 0
+        "47.229.9.94",       # RAIDA 1
+        "209.46.126.167",    # RAIDA 2
+        "116.203.157.233",   # RAIDA 3
+        "95.183.51.104",     # RAIDA 4
+        "31.163.201.90",     # RAIDA 5
+        "52.14.83.91",       # RAIDA 6
+        "161.97.169.229",    # RAIDA 7
+        "13.234.55.11",      # RAIDA 8
+        "124.187.106.233",   # RAIDA 9
+        "94.130.179.247",    # RAIDA 10
+        "67.181.90.11",      # RAIDA 11
+        "3.16.169.178",      # RAIDA 12
+        "113.30.247.109",    # RAIDA 13
+        "168.220.219.199",   # RAIDA 14
+        "185.37.61.73",      # RAIDA 15
+        "193.7.195.250",     # RAIDA 16
+        "5.161.63.179",      # RAIDA 17
+        "76.114.47.144",     # RAIDA 18
+        "190.105.235.113",   # RAIDA 19
+        "184.18.166.118",    # RAIDA 20
+        "125.236.210.184",   # RAIDA 21
+        "5.161.123.254",     # RAIDA 22
+        "130.255.77.156",    # RAIDA 23
+        "209.205.66.24",     # RAIDA 24
+    ]
+    
     servers = []
     for i in range(RAIDA_COUNT):
         servers.append(RaidaServer(
             raida_id=i,
-            host=RAIDA_URL_PATTERN.format(i),
+            host=RAIDA_IPS[i],
             port=RAIDA_BASE_PORT + i
         ))
     return servers
