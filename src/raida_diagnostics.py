@@ -867,7 +867,7 @@ def main():
         json_str = json.dumps(output, indent=2)
         
         if args.output:
-            with open(args.output, 'w') as f:
+            with open(args.output, 'w', encoding='utf-8') as f:
                 f.write(json_str)
             print(f"JSON report written to {args.output}")
         else:
