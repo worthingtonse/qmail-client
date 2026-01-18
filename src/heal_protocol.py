@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 # RAIDA Network Configuration
 RAIDA_COUNT = 25
-RAIDA_TIMEOUT = 30  # seconds per request
+RAIDA_TIMEOUT = 20  # seconds per request
 
 # Coin identifier for CloudCoin
 COIN_ID = 0x0006
@@ -414,27 +414,40 @@ def build_request_header(
     header = bytearray(REQUEST_HEADER_SIZE)
 
     # Routing bytes (0-7)
-    header[0] = 0x01                    # BF: Bitfield
+    header[0] = 0x00                    # VR: Version (must be 0x00!)
     header[1] = 0x00                    # SP: Split ID
-    header[2] = raida_id                # RI: RAIDA ID
+    header[2] = raida_id & 0xFF         # RI: RAIDA ID
     header[3] = 0x00                    # SH: Shard ID
-    header[4] = command_group           # CG: Command Group
-    header[5] = command_code            # CM: Command Code
-    struct.pack_into('>H', header, 6, COIN_ID)  # ID: Coin ID
+    header[4] = command_group & 0xFF    # CG: Command Group
+    header[5] = command_code & 0xFF     # CM: Command Code
+    header[6] = (COIN_ID >> 8) & 0xFF   # C#: Coin ID MSB
+    header[7] = COIN_ID & 0xFF          # C#: Coin ID LSB
 
     # Presentation bytes (8-15)
-    header[8] = os.urandom(1)[0] & 0x01  # BF with random bit
-    # Bytes 9-15 are zeros (reserved)
+    header[8] = 0x00                    # PL: Presentation Layer
+    header[9] = 0x00                    # AP: Application MSB
+    header[10] = 0x00                   # AP: Application LSB
+    header[11] = 0x00                   # CP: Compression
+    header[12] = 0x00                   # TR: Transform
+    header[13] = 0x00                   # AI: AI Transform
+    header[14] = 0x01                   # RE: Index of this packet (must be 0x01!)
+    header[15] = 0x01                   # RE: Total packets sent (must be 0x01!)
 
     # Encryption bytes (16-23)
-    header[16] = encryption_type        # EN: Encryption type
+    header[16] = encryption_type & 0xFF # EN: Encryption type
     header[17] = denomination & 0xFF    # DN: Denomination
-    struct.pack_into('>I', header, 18, serial_number)  # SN: Serial number
-    struct.pack_into('>H', header, 22, body_length)    # BL: Body length
+    header[18] = (serial_number >> 24) & 0xFF  # SN byte 0 (MSB)
+    header[19] = (serial_number >> 16) & 0xFF  # SN byte 1
+    header[20] = (serial_number >> 8) & 0xFF   # SN byte 2
+    header[21] = serial_number & 0xFF          # SN byte 3 (LSB)
+    header[22] = (body_length >> 8) & 0xFF     # BL: Body length MSB
+    header[23] = body_length & 0xFF            # BL: Body length LSB
 
     # Nonce bytes (24-31)
-    nonce = os.urandom(8)
-    header[24:32] = nonce
+    nonce = os.urandom(6)
+    header[24:30] = nonce
+    header[30] = 0x11                   # Echo byte 0
+    header[31] = 0x11                   # Echo byte 1
 
     return bytes(header)
 
@@ -693,7 +706,6 @@ def parse_get_ticket_response(
     if status == STATUS_ALL_PASS:
         results = [True] * num_coins
         if len(body) >= 4:
-            print(f"DEBUG: Raw ticket bytes: {body[:4].hex()}") 
             ticket_id = struct.unpack('>I', body[:4])[0]
     elif status == STATUS_ALL_FAIL:
         results = [False] * num_coins

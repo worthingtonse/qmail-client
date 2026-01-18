@@ -28,7 +28,7 @@ Healing Process Overview:
 import os
 import sys
 import logging
-from typing import List, Set, Dict, Tuple , Any
+from typing import List, Set, Dict, Tuple
 from dataclasses import dataclass, field
 
 # Import from modular components
@@ -396,6 +396,13 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
     logger.info(
         f"Wallet folders verified: Bank, Fracked, Limbo, Fraud, Suspect, Grade")
 
+    # STEP 0: DISCOVER BANK COIN STATUS
+    # Check if Bank coins have unknown status and discover their true state
+    # This may move some coins to Fracked folder if they need healing
+    err, checked, moved = discover_bank_coin_status(wallet_path)
+    if moved > 0:
+        logger.info(f"Discovered {moved} coins in Bank that need attention")
+
     # STEP 1-2: CHECK ENCRYPTION (DON'T FAIL IF ALL BROKEN - FIX AFTER HEALING)
     err, encryption_health = check_encryption(wallet_path)
     if err != HealErrorCode.SUCCESS:
@@ -419,11 +426,11 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
             # DON'T FAIL HERE - healing can work without encryption
     elif broken_raida_count > 0:
         logger.warning(
-            f"⚠ Cannot fix encryption - only {working_raida_count} working RAIDA (need 2+)")
-        logger.warning("⚠ Will attempt healing in UNENCRYPTED mode")
-        logger.warning("⚠ RAIDA requests will be sent WITHOUT encryption!")
+            f"[!] Cannot fix encryption - only {working_raida_count} working RAIDA (need 2+)")
+        logger.warning("[!] Will attempt healing in UNENCRYPTED mode")
+        logger.warning("[!] RAIDA requests will be sent WITHOUT encryption!")
     else:
-        logger.info("✓ All RAIDA have working encryption")
+        logger.info("[OK] All RAIDA have working encryption")
 
     # STEP 3: Find limbo coins
     err, limbo_coins = find_limbo(wallet_path)
@@ -481,12 +488,6 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
         err, fixes_applied = fix_with_tickets(
             coins_to_fix, tickets, fracked_raida)
 
-        # CRITICAL FIX: Abort on Network Error to prevent infinite loops
-        if err == HealErrorCode.ERR_NETWORK_ERROR:
-             logger.error("Critical Network Timeout during Fix. Aborting to prevent infinite loops.")
-             result.errors.append("Network Timeout - Server took too long to synchronize")
-             break
-
         # Count fracked positions after fix
         fracked_after = sum(coin.count_fracked() for coin in coins_to_fix)
 
@@ -532,6 +533,208 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
 
     return result
 
+
+# ============================================================================
+# STEP 9: DISCOVER BANK COIN STATUS
+# ============================================================================
+
+def discover_bank_coin_status(wallet_path: str) -> Tuple[HealErrorCode, int, int]:
+    """
+    STEP 9: Discover true status of Bank coins with unknown ('u') RAIDA.
+
+    Bank coins may have 'u' (unknown) status on some RAIDA if they were
+    never properly authenticated. This step sends Get Ticket requests
+    to discover their true status and update POWN strings.
+
+    Coins that turn out to be fracked will be moved to Fracked folder.
+    Coins that turn out to be counterfeit will be moved to Counterfeit folder.
+
+    Args:
+        wallet_path: Path to wallet folder
+
+    Returns:
+        Tuple of (error_code, coins_checked, coins_moved)
+    """
+    logger.info("STEP 9: Discovering Bank coin status...")
+
+    bank_folder = os.path.join(wallet_path, FOLDER_BANK)
+    err, bank_coins = load_coins_from_folder(bank_folder)
+
+    if err != HealErrorCode.SUCCESS or not bank_coins:
+        logger.info("  -> No coins in Bank folder")
+        return HealErrorCode.SUCCESS, 0, 0
+
+    # Find coins with unknown status
+    coins_with_unknown = [c for c in bank_coins if 'u' in c.pown]
+
+    if not coins_with_unknown:
+        logger.info("  -> All Bank coins have known status")
+        return HealErrorCode.SUCCESS, 0, 0
+
+    logger.info(f"  -> Found {len(coins_with_unknown)} coins with unknown status")
+
+    # Get tickets to discover true status (this updates POWN strings)
+    from heal_network import get_tickets_for_coins_batch
+    tickets, results = get_tickets_for_coins_batch(coins_with_unknown)
+
+    # Now grade the coins based on discovered status
+    coins_moved = 0
+    fracked_folder = os.path.join(wallet_path, FOLDER_FRACKED)
+    fraud_folder = os.path.join(wallet_path, FOLDER_COUNTERFEIT)
+
+    for coin in coins_with_unknown:
+        status = coin.get_grade_status()
+        logger.info(f"  -> Coin {coin.serial_number}: {coin.pown} -> {status}")
+
+        if status == 'authentic':
+            # Coin is good, update file in place
+            from heal_file_io import write_coin_file
+            write_coin_file(coin.file_path, coin)
+            logger.info(f"     Updated in Bank (all 25 pass)")
+        elif status == 'fracked':
+            # Move to Fracked folder for healing
+            err = move_coin_file(coin, fracked_folder)
+            logger.info(f"     Moved to Fracked folder for healing")
+            coins_moved += 1
+        elif status == 'counterfeit':
+            # Move to Counterfeit folder
+            err = move_coin_file(coin, fraud_folder)
+            logger.info(f"     Moved to Counterfeit folder")
+            coins_moved += 1
+
+    return HealErrorCode.SUCCESS, len(coins_with_unknown), coins_moved
+
+
+# ============================================================================
+# MULTI-WALLET HEALING
+# ============================================================================
+
+def get_wallets_base_path() -> str:
+    """
+    Get the base path for wallets, relative to the project root.
+
+    Handles both running from src/ directory and project root.
+    """
+    # Try relative to current directory first
+    if os.path.exists("Data/Wallets"):
+        return "Data/Wallets"
+
+    # Try parent directory (if running from src/)
+    if os.path.exists("../Data/Wallets"):
+        return "../Data/Wallets"
+
+    # Try absolute path based on this file's location
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(this_dir)
+    wallets_path = os.path.join(project_root, "Data", "Wallets")
+    if os.path.exists(wallets_path):
+        return wallets_path
+
+    # Default fallback
+    return "Data/Wallets"
+
+
+def discover_all_wallets(base_path: str = None) -> List[str]:
+    """
+    Discover all wallet folders in the base path.
+
+    A valid wallet folder is any directory that contains a Bank subfolder
+    or is a direct child of the wallets base path.
+
+    Args:
+        base_path: Base path to search for wallets (auto-detected if None)
+
+    Returns:
+        List of wallet paths
+    """
+    if base_path is None:
+        base_path = get_wallets_base_path()
+
+    wallets = []
+
+    if not os.path.exists(base_path):
+        logger.warning(f"Wallets base path does not exist: {base_path}")
+        return wallets
+
+    for name in os.listdir(base_path):
+        wallet_path = os.path.join(base_path, name)
+        if os.path.isdir(wallet_path):
+            # Check if it looks like a wallet (has Bank folder or other wallet folders)
+            bank_path = os.path.join(wallet_path, FOLDER_BANK)
+            fracked_path = os.path.join(wallet_path, FOLDER_FRACKED)
+            if os.path.exists(bank_path) or os.path.exists(fracked_path):
+                wallets.append(wallet_path)
+            else:
+                # Still include it - heal_wallet will create the folders
+                wallets.append(wallet_path)
+
+    # Sort for consistent ordering
+    wallets.sort()
+    return wallets
+
+
+def heal_all_wallets(max_iterations: int = 3, base_path: str = None) -> Dict[str, HealResult]:
+    """
+    Heal ALL wallets found in the wallets folder.
+
+    Automatically discovers all wallet folders (Default, Mailbox, Sender, etc.)
+    and processes each one.
+
+    Args:
+        max_iterations: Maximum fix iterations per wallet
+        base_path: Base path to search for wallets (auto-detected if None)
+
+    Returns:
+        Dict mapping wallet_path -> HealResult
+    """
+    if base_path is None:
+        base_path = get_wallets_base_path()
+
+    logger.info("=" * 60)
+    logger.info("HEALING ALL WALLETS")
+    logger.info("=" * 60)
+
+    # Discover all wallets
+    wallet_paths = discover_all_wallets(base_path)
+
+    if not wallet_paths:
+        logger.warning(f"No wallets found in {base_path}")
+        return {}
+
+    logger.info(f"Found {len(wallet_paths)} wallets: {[os.path.basename(w) for w in wallet_paths]}")
+
+    results = {}
+
+    for wallet_path in wallet_paths:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing wallet: {wallet_path}")
+        logger.info(f"{'='*60}")
+        results[wallet_path] = heal_wallet(wallet_path, max_iterations)
+
+    # Summary
+    logger.info("\n" + "=" * 60)
+    logger.info("ALL WALLETS HEAL SUMMARY")
+    logger.info("=" * 60)
+
+    total_fracked = 0
+    total_fixed = 0
+    total_failed = 0
+
+    for wallet_path, result in results.items():
+        logger.info(f"\n{wallet_path}:")
+        logger.info(f"  Fracked: {result.total_fracked}")
+        logger.info(f"  Fixed: {result.total_fixed}")
+        logger.info(f"  Failed: {result.total_failed}")
+        total_fracked += result.total_fracked
+        total_fixed += result.total_fixed
+        total_failed += result.total_failed
+
+    logger.info(f"\nTOTAL: {total_fixed}/{total_fracked} fixed, {total_failed} failed")
+    logger.info("=" * 60)
+
+    return results
+
+
 # ============================================================================
 # CLI INTERFACE
 # ============================================================================
@@ -542,6 +745,7 @@ def main():
 
     Usage:
         python heal.py <wallet_path>
+        python heal.py --all              # Heal both Default and Mailbox
         python heal.py --help
         python heal.py --test
     """
@@ -552,9 +756,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python heal.py Data/Wallets/Default
-    python heal.py --test
-    python heal.py --verbose Data/Wallets/Mailbox
+    python heal.py --all                    # Heal both Default and Mailbox wallets
+    python heal.py Data/Wallets/Default     # Heal specific wallet
+    python heal.py --test                   # Run module tests
+    python heal.py --verbose --all          # Verbose heal of all wallets
         """
     )
 
@@ -562,7 +767,13 @@ Examples:
         'wallet_path',
         nargs='?',
         default=None,
-        help='Path to wallet folder'
+        help='Path to wallet folder (or use --all for Default + Mailbox)'
+    )
+
+    parser.add_argument(
+        '--all', '-a',
+        action='store_true',
+        help='Heal both Default and Mailbox wallets'
     )
 
     parser.add_argument(
@@ -584,6 +795,12 @@ Examples:
         help='Maximum fix iterations (default: 3)'
     )
 
+    parser.add_argument(
+        '--discover-only',
+        action='store_true',
+        help='Only discover Bank coin status without full healing'
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -595,6 +812,27 @@ Examples:
         run_integration_tests()
         return
 
+    # Handle --discover-only mode
+    if args.discover_only:
+        if args.all:
+            wallet_paths = discover_all_wallets()
+            for wallet_path in wallet_paths:
+                logger.info(f"\nDiscovering: {wallet_path}")
+                discover_bank_coin_status(wallet_path)
+        elif args.wallet_path:
+            discover_bank_coin_status(args.wallet_path)
+        else:
+            parser.print_help()
+        return
+
+    # Handle --all flag
+    if args.all:
+        results = heal_all_wallets(max_iterations=args.max_iterations)
+        # Exit with error if any wallet had errors
+        has_errors = any(r.errors for r in results.values())
+        sys.exit(1 if has_errors else 0)
+
+    # Handle specific wallet path
     if not args.wallet_path:
         parser.print_help()
         return

@@ -101,68 +101,20 @@ class RaidaServer:
     is_online: bool = True
 
 
-# def get_default_raida_servers() -> List[RaidaServer]:
-#     """
-#     Get default RAIDA server configuration.
-
-#     Uses the pattern: raida{N}.cloudcoin.global:5000{N}
-
-#     Returns:
-#         List of 25 RaidaServer objects
-#     """
-#     servers = []
-#     for i in range(RAIDA_COUNT):
-#         servers.append(RaidaServer(
-#             raida_id=i,
-#             host=RAIDA_URL_PATTERN.format(i),
-#             port=RAIDA_BASE_PORT + i
-#         ))
-#     return servers
-
 def get_default_raida_servers() -> List[RaidaServer]:
     """
-    Get default RAIDA server configuration using direct IP addresses.
-    
-    Note: Hostnames like raida0.cloudcoin.global resolve to Cloudflare IPs
-    which don't forward TCP port 50000. We must use direct IPs.
-    
+    Get default RAIDA server configuration.
+
+    Uses the pattern: raida{N}.cloudcoin.global:5000{N}
+
     Returns:
         List of 25 RaidaServer objects
     """
-    # Direct IP addresses (bypassing Cloudflare)
-    RAIDA_IPS = [
-        "78.46.170.45",      # RAIDA 0
-        "47.229.9.94",       # RAIDA 1
-        "209.46.126.167",    # RAIDA 2
-        "116.203.157.233",   # RAIDA 3
-        "95.183.51.104",     # RAIDA 4
-        "31.163.201.90",     # RAIDA 5
-        "52.14.83.91",       # RAIDA 6
-        "161.97.169.229",    # RAIDA 7
-        "13.234.55.11",      # RAIDA 8
-        "124.187.106.233",   # RAIDA 9
-        "94.130.179.247",    # RAIDA 10
-        "67.181.90.11",      # RAIDA 11
-        "3.16.169.178",      # RAIDA 12
-        "113.30.247.109",    # RAIDA 13
-        "168.220.219.199",   # RAIDA 14
-        "185.37.61.73",      # RAIDA 15
-        "193.7.195.250",     # RAIDA 16
-        "5.161.63.179",      # RAIDA 17
-        "76.114.47.144",     # RAIDA 18
-        "190.105.235.113",   # RAIDA 19
-        "184.18.166.118",    # RAIDA 20
-        "125.236.210.184",   # RAIDA 21
-        "5.161.123.254",     # RAIDA 22
-        "130.255.77.156",    # RAIDA 23
-        "209.205.66.24",     # RAIDA 24
-    ]
-    
     servers = []
     for i in range(RAIDA_COUNT):
         servers.append(RaidaServer(
             raida_id=i,
-            host=RAIDA_IPS[i],
+            host=RAIDA_URL_PATTERN.format(i),
             port=RAIDA_BASE_PORT + i
         ))
     return servers
@@ -314,69 +266,34 @@ def get_raida_endpoint(raida_id: int) -> Tuple[str, int]:
 # ============================================================================
 # LOW-LEVEL NETWORK OPERATIONS
 # ============================================================================
+
 def send_request(
     raida_id: int,
     request_data: bytes,
-    timeout: float = None  # CHANGED: Default to None to force dynamic lookup
+    timeout: float = RAIDA_TIMEOUT
 ) -> Tuple[HealErrorCode, bytes]:
     """
     Send a request to a RAIDA server and receive response.
-    Includes KeepAlive and Dynamic Timeout to prevent 30s disconnects.
-    """
-    import select
-    import errno
-    
-    # DYNAMIC LOOKUP: Ensures we use the latest 120s value from protocol
-    if timeout is None:
-        from heal_protocol import RAIDA_TIMEOUT
-        timeout = RAIDA_TIMEOUT
 
+    Uses TCP socket for reliable communication.
+
+    Args:
+        raida_id: Target RAIDA server ID (0-24)
+        request_data: Complete request (header + body)
+        timeout: Socket timeout in seconds
+
+    Returns:
+        Tuple of (error_code, response_bytes)
+    """
     host, port = get_raida_endpoint(raida_id)
-    sock = None
 
     try:
         # Create TCP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        # CRITICAL FIX: Enable KeepAlive.
-        # This prevents routers/firewalls from killing the connection 
-        # while we wait 120s for the Server to fix the coins.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        
-        # Set non-blocking mode for connect to respect timeout
-        sock.setblocking(False)
-        
-        # Try to connect (will raise error immediately for non-blocking)
-        try:
-            sock.connect((host, port))
-            # If we get here, connection succeeded immediately (localhost/fast)
-        except socket.error as e:
-            # Check if it's "in progress" error (expected for non-blocking connect)
-            if e.errno not in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
-                # Real error, not just "in progress"
-                logger.warning(f"RAIDA{raida_id} connection error ({host}:{port}): {e}")
-                return HealErrorCode.ERR_NETWORK_ERROR, b''
-        
-        # Wait for connection with timeout using select
-        _, writable, exceptional = select.select([], [sock], [sock], timeout)
-        
-        if exceptional:
-            logger.warning(f"RAIDA{raida_id} connection error ({host}:{port})")
-            return HealErrorCode.ERR_NETWORK_ERROR, b''
-        
-        if not writable:
-            logger.warning(f"RAIDA{raida_id} connection timeout ({host}:{port}) - Waited {timeout}s")
-            return HealErrorCode.ERR_NETWORK_ERROR, b''
-        
-        # Check if connection actually succeeded
-        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-        if err != 0:
-            logger.warning(f"RAIDA{raida_id} connection failed ({host}:{port}): error {err}")
-            return HealErrorCode.ERR_NETWORK_ERROR, b''
-        
-        # Connection successful, set blocking mode for I/O operations
-        sock.setblocking(True)
         sock.settimeout(timeout)
+
+        # Connect to RAIDA
+        sock.connect((host, port))
 
         # Send request
         sock.sendall(request_data)
@@ -386,6 +303,7 @@ def send_request(
         while len(response_header) < RESPONSE_HEADER_SIZE:
             chunk = sock.recv(RESPONSE_HEADER_SIZE - len(response_header))
             if not chunk:
+                sock.close()
                 return HealErrorCode.ERR_NETWORK_ERROR, b''
             response_header += chunk
 
@@ -401,10 +319,11 @@ def send_request(
                     break
                 response_body += chunk
 
+        sock.close()
         return HealErrorCode.SUCCESS, response_header + response_body
 
     except socket.timeout:
-        logger.warning(f"RAIDA{raida_id} timeout ({host}:{port}) - Waited {timeout}s")
+        logger.warning(f"RAIDA{raida_id} timeout ({host}:{port})")
         return HealErrorCode.ERR_NETWORK_ERROR, b''
     except socket.error as e:
         logger.warning(f"RAIDA{raida_id} socket error: {e}")
@@ -412,13 +331,8 @@ def send_request(
     except Exception as e:
         logger.error(f"RAIDA{raida_id} unexpected error: {e}")
         return HealErrorCode.ERR_INTERNAL, b''
-    finally:
-        # RESOURCE FIX: Always close socket to prevent 'Too many open files'
-        if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
+
+
 # ============================================================================
 # GET TICKET OPERATIONS
 # ============================================================================
@@ -426,7 +340,7 @@ def send_request(
 def get_ticket_from_raida(
     raida_id: int,
     coins: List[CloudCoinBin],
-    result_dict: Dict[int, Tuple[int, List[bool]]]
+    result_dict: Dict[int, Tuple[int, List[str]]]
 ) -> None:
     """
     Get ticket from a single RAIDA for a batch of coins (thread worker).
@@ -434,7 +348,8 @@ def get_ticket_from_raida(
     Args:
         raida_id: Target RAIDA ID
         coins: List of coins to authenticate
-        result_dict: Shared dict to store results {raida_id: (ticket_id, passed_list)}
+        result_dict: Shared dict to store results {raida_id: (ticket_id, status_list)}
+            status_list contains 'p' (pass), 'f' (fail), or 'u' (unknown/timeout)
     """
     coin_data = [(c.denomination, c.serial_number, c.ans[raida_id]) for c in coins]
     body = build_get_ticket_body(coin_data)
@@ -453,16 +368,20 @@ def get_ticket_from_raida(
     if err == HealErrorCode.SUCCESS:
         err, ticket_id, coin_results = parse_get_ticket_response(response, len(coins))
         if err == HealErrorCode.SUCCESS:
-            result_dict[raida_id] = (ticket_id, coin_results)
-            logger.debug(f"RAIDA{raida_id}: ticket={ticket_id:08x}, passed={sum(coin_results)}/{len(coin_results)}")
-            print(f"RAIDA{raida_id}: Received ticket value: 0x{ticket_id:08X}") 
+            # Convert bool results to status chars: True='p', False='f'
+            status_list = ['p' if passed else 'f' for passed in coin_results]
+            result_dict[raida_id] = (ticket_id, status_list)
+            logger.debug(f"RAIDA{raida_id}: ticket={ticket_id:08x}, passed={sum(1 for s in status_list if s=='p')}/{len(status_list)}")
         else:
-            result_dict[raida_id] = (0, [False] * len(coins))
+            # Parse error - keep as unknown
+            result_dict[raida_id] = (0, ['u'] * len(coins))
     else:
-        result_dict[raida_id] = (0, [False] * len(coins))
+        # Network error (timeout, connection refused, etc.) - keep as unknown
+        # Don't mark as 'f' because we don't know if the coin is authentic there
+        result_dict[raida_id] = (0, ['u'] * len(coins))
 
 
-def get_tickets_parallel(coins: List[CloudCoinBin]) -> Tuple[List[int], Dict[int, List[bool]]]:
+def get_tickets_parallel(coins: List[CloudCoinBin]) -> Tuple[List[int], Dict[int, List[str]]]:
     """
     Get tickets from all RAIDA in parallel for a batch of coins.
 
@@ -472,9 +391,9 @@ def get_tickets_parallel(coins: List[CloudCoinBin]) -> Tuple[List[int], Dict[int
     Returns:
         Tuple of:
             - List of 25 ticket IDs (0 if failed)
-            - Dict mapping raida_id -> list of pass/fail results for each coin
+            - Dict mapping raida_id -> list of status chars ('p'/'f'/'u') for each coin
     """
-    result_dict: Dict[int, Tuple[int, List[bool]]] = {}
+    result_dict: Dict[int, Tuple[int, List[str]]] = {}
     threads = []
 
     for raida_id in range(RAIDA_COUNT):
@@ -491,13 +410,14 @@ def get_tickets_parallel(coins: List[CloudCoinBin]) -> Tuple[List[int], Dict[int
 
     # Extract results
     tickets = [0] * RAIDA_COUNT
-    results: Dict[int, List[bool]] = {i: [] for i in range(RAIDA_COUNT)}
+    results: Dict[int, List[str]] = {i: [] for i in range(RAIDA_COUNT)}
 
     for raida_id in range(RAIDA_COUNT):
         if raida_id in result_dict:
             tickets[raida_id], results[raida_id] = result_dict[raida_id]
         else:
-            results[raida_id] = [False] * len(coins)
+            # No response from this RAIDA - keep as unknown, NOT failed
+            results[raida_id] = ['u'] * len(coins)
 
     return tickets, results
 
@@ -597,23 +517,8 @@ def fix_on_raida(
         tickets: List of 25 ticket IDs from other RAIDA
         result_dict: Shared dict to store results {raida_id: [passed_list]}
     """
-    # Log detailed ticket information
-    valid_ticket_raida = [i for i, t in enumerate(tickets) if t != 0]
-    failed_ticket_raida = [i for i, t in enumerate(tickets) if t == 0]
-    
-    logger.info(f"RAIDA{raida_id}: Starting Fix for {len(coins)} coin(s)")
-    logger.info(f"RAIDA{raida_id}: Valid tickets from {len(valid_ticket_raida)} RAIDA: {valid_ticket_raida}")
-    for i, t in enumerate(tickets):
-        if t != 0:
-              print(f"RAIDA{raida_id}: Sending ticket[{i}] = 0x{t:08X}")      
-    logger.info(f"RAIDA{raida_id}: Failed tickets from {len(failed_ticket_raida)} RAIDA: {failed_ticket_raida}")
-    logger.info(f"RAIDA{raida_id}: PG = {pg.hex()}")
-    
     coin_data = [(c.denomination, c.serial_number) for c in coins]
-    logger.info(f"RAIDA{raida_id}: Coin data = {coin_data}")
-    
     body = build_fix_body(coin_data, pg, tickets)
-    logger.info(f"RAIDA{raida_id}: Fix body size = {len(body)} bytes")
 
     # Build header
     header = build_request_header(
@@ -624,31 +529,23 @@ def fix_on_raida(
     )
 
     request = header + body
-    logger.info(f"RAIDA{raida_id}: Sending Fix request ({len(request)} bytes)...")
-    
     err, response = send_request(raida_id, request)
 
     if err != HealErrorCode.SUCCESS:
-        logger.warning(f"RAIDA{raida_id}: FIX command failed with error={err}")
+        logger.warning(f"RAIDA{raida_id} FIX command failed: error={err}")
         result_dict[raida_id] = [False] * len(coins)
         return
 
-    logger.info(f"RAIDA{raida_id}: Received response ({len(response)} bytes)")
-    
-    # Parse response
-    err, fix_results = parse_fix_response(response, len(coins))
     if err == HealErrorCode.SUCCESS:
-        result_dict[raida_id] = fix_results
-        success_count = sum(fix_results)
-        if success_count > 0:
-            logger.info(f"RAIDA{raida_id}: ✓ Successfully fixed {success_count}/{len(coins)} coin(s)")
+        err, fix_results = parse_fix_response(response, len(coins))
+        if err == HealErrorCode.SUCCESS:
+            result_dict[raida_id] = fix_results
+            logger.debug(f"RAIDA{raida_id}: fix results = {fix_results}")
         else:
-            logger.warning(f"RAIDA{raida_id}: ✗ Fix completed but no coins were fixed (0/{len(coins)})")
-            logger.warning(f"RAIDA{raida_id}: Server validation failed - got fewer than 14 votes")
-            logger.warning(f"RAIDA{raida_id}: This happened because {len(failed_ticket_raida)} RAIDA didn't respond during ticket validation")
+            result_dict[raida_id] = [False] * len(coins)
     else:
-        logger.warning(f"RAIDA{raida_id}: Failed to parse fix response, error={err}")
         result_dict[raida_id] = [False] * len(coins)
+
 
 def fix_coins_parallel(
     coins: List[CloudCoinBin],
@@ -695,12 +592,17 @@ def fix_coins_parallel(
 
 def get_tickets_for_coins_batch(
     coins: List[CloudCoinBin]
-) -> Tuple[List[int], Dict[int, List[bool]]]:
+) -> Tuple[List[int], Dict[int, List[str]]]:
     """
     Get tickets for multiple coins from all RAIDA.
 
     This is the batch version that heal.py expects.
     It makes one request per RAIDA for all coins.
+
+    IMPORTANT: When a ticket is rejected (coin not authentic on that RAIDA),
+    this function updates the coin's POWN string to mark that RAIDA as 'f' (failed).
+    When a RAIDA times out or has network errors, it stays as 'u' (unknown).
+    This is critical for correct grading - we only mark as 'f' when we KNOW it failed.
 
     Args:
         coins: List of coins to get tickets for
@@ -708,12 +610,43 @@ def get_tickets_for_coins_batch(
     Returns:
         Tuple of:
             - List of 25 ticket IDs
-            - Dict mapping raida_id -> list of pass/fail per coin
+            - Dict mapping raida_id -> list of status chars ('p'/'f'/'u') per coin
     """
     if not coins:
         return [0] * RAIDA_COUNT, {}
 
-    return get_tickets_parallel(coins)
+    tickets, results = get_tickets_parallel(coins)
+
+    # Update coins' POWN strings based on ticket results
+    # - 'p' = ticket accepted, coin is authentic on this RAIDA
+    # - 'f' = ticket rejected, coin is NOT authentic on this RAIDA (fracked)
+    # - 'u' = network error/timeout, status unknown (DON'T change POWN)
+    for raida_id in range(RAIDA_COUNT):
+        if raida_id in results:
+            coin_results = results[raida_id]
+            for coin_idx, status_char in enumerate(coin_results):
+                if coin_idx < len(coins):
+                    if status_char == 'p':
+                        # Ticket accepted - coin is authentic on this RAIDA
+                        coins[coin_idx].update_pown_char(raida_id, 'p')
+                    elif status_char == 'f':
+                        # Ticket rejected - coin is NOT authentic on this RAIDA
+                        # Mark as 'f' (failed) so we know this RAIDA needs fixing
+                        coins[coin_idx].update_pown_char(raida_id, 'f')
+                        logger.debug(f"Coin SN={coins[coin_idx].serial_number}: "
+                                   f"RAIDA{raida_id} rejected ticket, marked as 'f'")
+                    # else status_char == 'u': network timeout - don't change POWN
+                    # We don't know if the coin is authentic or not on this RAIDA
+
+    # Log updated POWN strings for debugging
+    for coin in coins:
+        pass_count = coin.pown.count('p')
+        fail_count = coin.pown.count('f')
+        unknown_count = coin.pown.count('u')
+        logger.debug(f"Coin SN={coin.serial_number} POWN updated: "
+                    f"{coin.pown} (pass={pass_count}, fail={fail_count}, unknown={unknown_count})")
+
+    return tickets, results
 
 
 def find_coins_batch(coins: List[CloudCoinBin]) -> Dict[int, List[str]]:
