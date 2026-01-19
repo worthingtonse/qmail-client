@@ -471,8 +471,8 @@ def build_fix_encryption_body(
         # Split ID (1 byte)
         body.append(kp.split_id & 0x01)
 
-        # Key Selector (4 bytes, big-endian) - using 0 for now
-        body.append(0)
+        # Key Selector (4 bytes, big-endian) - using 1 for now
+        body.append(1)
 
         # Encrypted Key Part (16 bytes)
         body.extend(kp.encrypted_key_part[:16])
