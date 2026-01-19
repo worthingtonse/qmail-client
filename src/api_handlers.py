@@ -2597,9 +2597,9 @@ def handle_stake_mailbox(request_handler, context):
     Required to establish identity before the client can send mail.
     """
     import asyncio
-    from src.locker_download import download_from_locker, LockerDownloadResult
-    from src.wallet_structure import get_wallet_path, DEFAULT_WALLET
-    from src.heal_file_io import move_coin_file
+    from locker_download import download_from_locker, LockerDownloadResult
+    from wallet_structure import get_wallet_path, DEFAULT_WALLET
+    from heal_file_io import move_coin_file
 
     app_ctx = request_handler.server_instance.app_context
     data = context.json or {}

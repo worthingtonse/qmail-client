@@ -496,6 +496,169 @@ async def _download_all_raidas(
 # MAIN DOWNLOAD FUNCTION
 # ============================================================================
 
+# async def download_from_locker(
+#     locker_code: bytes,
+#     wallet_path: str,
+#     db_handle: Any = None,
+#     logger_handle: Optional[object] = None
+# ) -> Tuple[LockerDownloadResult, List[LockerCoin]]:
+#     """
+#     Download CloudCoins from a RAIDA locker using new DOWNLOAD command (85).
+
+#     This is the main async function for locker download. Suitable for
+#     direct calls or API use.
+
+#     Workflow (Updated for Command 8):
+#     1. Validate locker code (must be 8 bytes)
+#     2. Derive 25 locker keys using MD5(raida_id + locker_code) + 0xFF padding
+#     3. Generate 25 unique seeds (one per RAIDA for security!)
+#     4. Get RAIDA server list
+#     5. Parallel DOWNLOAD to all 25 RAIDAs (replaces PEEK + REMOVE)
+#     6. Check consensus (need >= 13 successful responses)
+#     7. Merge coin lists and compute ANs locally
+#     8. Save coins to Fracked folder
+
+#     Args:
+#         locker_code: 8-byte locker code from Tell notification
+#         wallet_path: Path to wallet folder (coins go to Fracked subfolder)
+#         db_handle: Database handle for RAIDA server lookup
+#         logger_handle: Optional logger handle
+
+#     Returns:
+#         Tuple of (result_code, list_of_LockerCoin)
+#         On success, coins are saved to wallet_path/Fracked/
+#     """
+#     log_info(logger_handle, LOCKER_CONTEXT,
+#              f"Starting locker download for {locker_code.hex()[:16]}...")
+
+#     # 1. Validate locker code
+#     if not locker_code or len(locker_code) < 8:
+#         log_error(logger_handle, LOCKER_CONTEXT,
+#                   "Invalid locker code", f"length={len(locker_code) if locker_code else 0}")
+#         return LockerDownloadResult.ERR_INVALID_LOCKER_CODE, []
+
+#     # Use first 8 bytes
+#     locker_code = locker_code[:8]
+
+#     # 2. Derive 25 locker keys
+#     try:
+#         locker_keys = get_keys_from_locker_code(locker_code)
+#         if len(locker_keys) != RAIDA_COUNT:
+#             raise ValueError(f"Expected {RAIDA_COUNT} keys, got {len(locker_keys)}")
+#     except Exception as e:
+#         log_error(logger_handle, LOCKER_CONTEXT,
+#                   "Key derivation failed", str(e))
+#         return LockerDownloadResult.ERR_KEY_DERIVATION_FAILED, []
+
+#     log_debug(logger_handle, LOCKER_CONTEXT,
+#               f"Derived {len(locker_keys)} locker keys")
+
+#     # 3. Generate 25 unique seeds (one per RAIDA for security!)
+#     # Each RAIDA gets a unique seed so administrators can't compute other RAIDAs' ANs
+#     seeds = [secrets.token_bytes(AN_LENGTH) for _ in range(RAIDA_COUNT)]
+#     log_debug(logger_handle, LOCKER_CONTEXT,
+#               f"Generated {len(seeds)} unique seeds for AN generation")
+
+#     # 4. Get RAIDA servers
+#     servers = await get_raida_servers(db_handle, logger_handle)
+#     if not servers or len(servers) != RAIDA_COUNT:
+#         log_error(logger_handle, LOCKER_CONTEXT,
+#                   "Failed to get RAIDA servers",
+#                   f"got {len(servers) if servers else 0} servers")
+#         return LockerDownloadResult.ERR_NO_RAIDA_SERVERS, []
+
+#     # 5. Parallel DOWNLOAD to all RAIDAs (single command replaces PEEK + REMOVE)
+#     download_success, coin_lists_per_raida = await _download_all_raidas(
+#         locker_keys, seeds, servers, logger_handle=logger_handle
+#     )
+
+#     # 6. Check consensus
+#     if download_success < MINIMUM_PASS_COUNT:
+#         log_error(logger_handle, LOCKER_CONTEXT,
+#                   "Insufficient DOWNLOAD responses",
+#                   f"{download_success}/{RAIDA_COUNT} < {MINIMUM_PASS_COUNT}")
+#         return LockerDownloadResult.ERR_INSUFFICIENT_RESPONSES, []
+
+#     # 7. Merge coin lists and determine which RAIDAs have each coin
+#     # Build: {(denom, sn): [raida_ids that returned this coin]}
+#     coin_raida_map: Dict[Tuple[int, int], List[int]] = {}
+#     for raida_id, coins in coin_lists_per_raida.items():
+#         for denom, sn in coins:
+#             key = (denom, sn)
+#             if key not in coin_raida_map:
+#                 coin_raida_map[key] = []
+#             coin_raida_map[key].append(raida_id)
+
+#     if not coin_raida_map:
+#         log_info(logger_handle, LOCKER_CONTEXT, "Locker is empty")
+#         return LockerDownloadResult.ERR_LOCKER_EMPTY, []
+
+#     log_info(logger_handle, LOCKER_CONTEXT,
+#              f"Found {len(coin_raida_map)} unique coins in locker")
+
+#     # 8. For each coin, compute ANs and build POWN string
+#     fracked_path = os.path.join(wallet_path, "Fracked")
+#     os.makedirs(fracked_path, exist_ok=True)
+
+#     saved_coins = []
+#     for (denom, sn), raida_ids in coin_raida_map.items():
+#         # Initialize coin with all ANs as zeros and all statuses as fail
+#         ans = [bytes(AN_LENGTH)] * RAIDA_COUNT
+#         statuses = [False] * RAIDA_COUNT
+
+#         # For each RAIDA that returned this coin, compute the AN
+#         for raida_id in raida_ids:
+#             ans[raida_id] = compute_coin_an(raida_id, sn, seeds[raida_id])
+#             statuses[raida_id] = True
+
+#         # Create DownloadedCoin for conversion
+#         coin = DownloadedCoin(
+#             denomination=denom,
+#             serial_number=sn,
+#             ans=ans,
+#             statuses=statuses
+#         )
+
+#         pass_count = coin.pass_count
+
+#         # Only save if at least one RAIDA passed
+#         if pass_count > 0:
+#             locker_coin = coin.to_locker_coin()
+
+#             filename = generate_coin_filename(
+#                 locker_coin.denomination,
+#                 locker_coin.serial_number
+#             )
+#             filepath = os.path.join(fracked_path, filename)
+
+#             err = write_coin_file(filepath, locker_coin, logger_handle)
+#             if err == CloudCoinErrorCode.SUCCESS:
+#                 saved_coins.append(locker_coin)
+#                 log_debug(logger_handle, LOCKER_CONTEXT,
+#                           f"Saved coin SN={locker_coin.serial_number} "
+#                           f"({pass_count}/25 passed)")
+#             else:
+#                 log_error(logger_handle, LOCKER_CONTEXT,
+#                           f"Failed to save coin SN={locker_coin.serial_number}",
+#                           f"error={err}")
+#         else:
+#             log_warning(logger_handle, LOCKER_CONTEXT,
+#                         f"Coin SN={sn} had 0 passes, not saved")
+
+#     if not saved_coins:
+#         log_error(logger_handle, LOCKER_CONTEXT,
+#                   "No coins saved", "all coins had 0 passes")
+#         return LockerDownloadResult.ERR_FILE_WRITE_ERROR, []
+
+#     total_value = sum(10.0 ** c.denomination for c in saved_coins
+#                       if c.denomination != 11)
+#     log_info(logger_handle, LOCKER_CONTEXT,
+#              f"Locker download complete: {len(saved_coins)} coins saved, "
+#              f"total value={total_value}")
+
+#     return LockerDownloadResult.SUCCESS, saved_coins
+
+
 async def download_from_locker(
     locker_code: bytes,
     wallet_path: str,
@@ -516,17 +679,20 @@ async def download_from_locker(
     5. Parallel DOWNLOAD to all 25 RAIDAs (replaces PEEK + REMOVE)
     6. Check consensus (need >= 13 successful responses)
     7. Merge coin lists and compute ANs locally
-    8. Save coins to Fracked folder
+    8. Grade coins and save to appropriate folders:
+       - 25/25 passes -> Bank (authentic)
+       - 13-24 passes -> Fracked (needs healing)
+       - <13 passes -> Counterfeit
 
     Args:
         locker_code: 8-byte locker code from Tell notification
-        wallet_path: Path to wallet folder (coins go to Fracked subfolder)
+        wallet_path: Path to wallet folder (coins go to Bank/Fracked/Counterfeit)
         db_handle: Database handle for RAIDA server lookup
         logger_handle: Optional logger handle
 
     Returns:
         Tuple of (result_code, list_of_LockerCoin)
-        On success, coins are saved to wallet_path/Fracked/
+        On success, coins are graded and saved to appropriate folders
     """
     log_info(logger_handle, LOCKER_CONTEXT,
              f"Starting locker download for {locker_code.hex()[:16]}...")
@@ -537,7 +703,7 @@ async def download_from_locker(
                   "Invalid locker code", f"length={len(locker_code) if locker_code else 0}")
         return LockerDownloadResult.ERR_INVALID_LOCKER_CODE, []
 
-    # Use first 8 bytes
+    # Use first 8 bytes (strip null padding if present)
     locker_code = locker_code[:8]
 
     # 2. Derive 25 locker keys
@@ -596,11 +762,20 @@ async def download_from_locker(
     log_info(logger_handle, LOCKER_CONTEXT,
              f"Found {len(coin_raida_map)} unique coins in locker")
 
-    # 8. For each coin, compute ANs and build POWN string
+    # 8. For each coin, compute ANs, grade, and save to appropriate folder
+    # Create all necessary folders
+    bank_path = os.path.join(wallet_path, "Bank")
     fracked_path = os.path.join(wallet_path, "Fracked")
+    counterfeit_path = os.path.join(wallet_path, "Counterfeit")
+    os.makedirs(bank_path, exist_ok=True)
     os.makedirs(fracked_path, exist_ok=True)
+    os.makedirs(counterfeit_path, exist_ok=True)
 
     saved_coins = []
+    bank_count = 0
+    fracked_count = 0
+    counterfeit_count = 0
+
     for (denom, sn), raida_ids in coin_raida_map.items():
         # Initialize coin with all ANs as zeros and all statuses as fail
         ans = [bytes(AN_LENGTH)] * RAIDA_COUNT
@@ -621,29 +796,50 @@ async def download_from_locker(
 
         pass_count = coin.pass_count
 
-        # Only save if at least one RAIDA passed
-        if pass_count > 0:
-            locker_coin = coin.to_locker_coin()
-
-            filename = generate_coin_filename(
-                locker_coin.denomination,
-                locker_coin.serial_number
-            )
-            filepath = os.path.join(fracked_path, filename)
-
-            err = write_coin_file(filepath, locker_coin, logger_handle)
-            if err == CloudCoinErrorCode.SUCCESS:
-                saved_coins.append(locker_coin)
-                log_debug(logger_handle, LOCKER_CONTEXT,
-                          f"Saved coin SN={locker_coin.serial_number} "
-                          f"({pass_count}/25 passed)")
-            else:
-                log_error(logger_handle, LOCKER_CONTEXT,
-                          f"Failed to save coin SN={locker_coin.serial_number}",
-                          f"error={err}")
-        else:
+        # Skip coins with 0 passes (should not happen but safety check)
+        if pass_count == 0:
             log_warning(logger_handle, LOCKER_CONTEXT,
                         f"Coin SN={sn} had 0 passes, not saved")
+            continue
+
+        # Convert to LockerCoin for file writing
+        locker_coin = coin.to_locker_coin()
+
+        # Generate filename
+        filename = generate_coin_filename(
+            locker_coin.denomination,
+            locker_coin.serial_number
+        )
+
+        # GRADING LOGIC: Determine destination folder based on pass count
+        if pass_count == RAIDA_COUNT:
+            # All 25 passed - authentic, goes to Bank
+            dest_folder = bank_path
+            grade = "AUTHENTIC"
+            bank_count += 1
+        elif pass_count >= MINIMUM_PASS_COUNT:
+            # 13-24 passed - fracked, needs healing
+            dest_folder = fracked_path
+            grade = "FRACKED"
+            fracked_count += 1
+        else:
+            # Less than 13 passed - counterfeit
+            dest_folder = counterfeit_path
+            grade = "COUNTERFEIT"
+            counterfeit_count += 1
+
+        filepath = os.path.join(dest_folder, filename)
+
+        err = write_coin_file(filepath, locker_coin, logger_handle)
+        if err == CloudCoinErrorCode.SUCCESS:
+            saved_coins.append(locker_coin)
+            log_debug(logger_handle, LOCKER_CONTEXT,
+                      f"Saved coin SN={locker_coin.serial_number} "
+                      f"({pass_count}/25 passed) -> {grade}")
+        else:
+            log_error(logger_handle, LOCKER_CONTEXT,
+                      f"Failed to save coin SN={locker_coin.serial_number}",
+                      f"error={err}")
 
     if not saved_coins:
         log_error(logger_handle, LOCKER_CONTEXT,
@@ -653,7 +849,8 @@ async def download_from_locker(
     total_value = sum(10.0 ** c.denomination for c in saved_coins
                       if c.denomination != 11)
     log_info(logger_handle, LOCKER_CONTEXT,
-             f"Locker download complete: {len(saved_coins)} coins saved, "
+             f"Locker download complete: {len(saved_coins)} coins saved "
+             f"(Bank: {bank_count}, Fracked: {fracked_count}, Counterfeit: {counterfeit_count}), "
              f"total value={total_value}")
 
     return LockerDownloadResult.SUCCESS, saved_coins

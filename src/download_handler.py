@@ -478,9 +478,9 @@ async def download_locker_payment(
     Download the locker payment for a received email.
     FIXED: Uses stake_locker_identity for Go-style naming and target wallet separation.
     """
-    from src.database import get_received_tell_by_guid
-    from src.task_manager import stake_locker_identity
-    from src.locker_download import clean_locker_code
+    from database import get_received_tell_by_guid
+    from task_manager import stake_locker_identity
+    # from src.locker_download import clean_locker_code
     import os
     
     try:
@@ -502,7 +502,8 @@ async def download_locker_payment(
         # clean_locker_code should return the 8-byte code (e.g. FG9YUE3\0)
         locker_code_8char = clean_locker_code(locker_code_bytes)
         
-        log_info(logger_handle, "DownloadHandler", f"Receiving payment from locker: {locker_code_8char.decode('ascii', 'ignore')}")
+        # log_info(logger_handle, "DownloadHandler", f"Receiving payment from locker: {locker_code_8char.decode('ascii', 'ignore')}")
+        log_info(logger_handle, "DownloadHandler", f"Receiving payment from locker: {locker_code_8char}")
         
         # 4. EXECUTE STAKING (Targeting Default Wallet)
         # We use stake_locker_identity because it handles the 439-byte Format 9 saving
