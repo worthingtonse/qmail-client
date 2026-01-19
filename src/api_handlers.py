@@ -2613,7 +2613,7 @@ def handle_stake_mailbox(request_handler, context):
     clean_code = raw_code.strip()
     locker_bytes = clean_code.encode('ascii')
 
-    # 2. Call Command 91 (Download)
+    # 2. Call Command 8 (Download)
     # NOTE: If this fails with insufficient responses, it confirms servers lack CCV3.
     wallet_path = get_wallet_path(DEFAULT_WALLET)
     try:
@@ -2628,7 +2628,7 @@ def handle_stake_mailbox(request_handler, context):
     if result != LockerDownloadResult.SUCCESS:
         return request_handler.send_json_response(502, {
             "error": "RAIDA Infrastructure Error",
-            "details": "Command 91 failed. Ensure CCV3 is rolled out on all RAIDAs."
+            "details": "Command 8 failed. Ensure CCV3 is rolled out on all RAIDAs."
         })
 
     # 3. Activate Identity: Move coin to Bank and update config

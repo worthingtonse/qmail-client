@@ -119,8 +119,26 @@ class CloudCoinBin:
         return 10.0 ** self.denomination
 
     def get_fracked_raida(self) -> List[int]:
-        """Return list of RAIDA indices where coin is fracked (failed)."""
+        """Return list of RAIDA indices where coin is definitively fracked (failed).
+        
+        NOTE: This only returns positions marked as 'f' (definitively failed).
+        For healing, use get_needs_healing_raida() which includes both 
+        'f' (failed) and 'u' (unknown) positions.
+        """
         return [i for i, char in enumerate(self.pown) if char == 'f']
+
+    def get_needs_healing_raida(self) -> List[int]:
+        """Return list of RAIDA indices that need healing.
+        
+        This includes both:
+        - 'f' (failed/fracked) - definitely need fixing
+        - 'u' (unknown) - status unknown, should be fixed if coin has quorum elsewhere
+        
+        This is the method to use for healing operations when the coin has 
+        sufficient passes (13+) to prove authenticity. Positions with 'u' 
+        (unknown/timeout) should be healed because they might have lost sync.
+        """
+        return [i for i, char in enumerate(self.pown) if char in ('f', 'u')]
 
     def get_passed_raida(self) -> List[int]:
         """Return list of RAIDA indices where coin is authenticated."""
@@ -163,8 +181,15 @@ class CloudCoinBin:
             self.pown = ''.join(pown_list)
 
     def count_fracked(self) -> int:
-        """Return count of fracked (failed) RAIDA positions."""
+        """Return count of fracked (failed) RAIDA positions.
+        
+        NOTE: This only counts 'f' positions. For healing, use count_needs_healing().
+        """
         return self.pown.count('f')
+
+    def count_needs_healing(self) -> int:
+        """Return count of positions that need healing (both 'f' and 'u')."""
+        return self.pown.count('f') + self.pown.count('u')
 
     def count_passed(self) -> int:
         """Return count of passed RAIDA positions."""

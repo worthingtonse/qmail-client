@@ -1122,7 +1122,7 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
     else:
         locker_code_str = str(locker_code_bytes).strip()
 
-    log_info(logger, "Staking", f"Staking coins into {target_wallet} wallet via Command 91...")
+    log_info(logger, "Staking", f"Staking coins into {target_wallet} wallet via Command 8...")
     log_debug(logger, "Staking", f"Locker code: {locker_code_str}")
 
     # Hardcoded RAIDA IP addresses as fallback (from config.py)
@@ -1157,7 +1157,7 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
     seeds = {}
     responses = {}
 
-    # 2. Parallel Network Requests (Command 91)
+    # 2. Parallel Network Requests (Command 8)
     with ThreadPoolExecutor(max_workers=25) as executor:
         future_to_raida = {}
         servers_used = 0
@@ -1274,7 +1274,7 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
     return True
 
 def execute_single_stake(srv_cfg, packet, logger, raida_id=None):
-    """Network worker for Command 91"""
+    """Network worker for Command 8"""
     from src.network import connect_to_server, disconnect, send_raw_request
     from src.protocol import parse_locker_download_response
 

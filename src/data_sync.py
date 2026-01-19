@@ -182,7 +182,6 @@ def convert_to_custom_base32(n: int) -> str:
         arr.append(ALPHABET[rem])
     arr.reverse()
     return ''.join(arr)
-
 def convert_from_custom_base32(encoded_str: str) -> int:
     """'C23' -> 9572 conversion"""
     ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"

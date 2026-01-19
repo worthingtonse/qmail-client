@@ -8,11 +8,11 @@ a locker code that can be used to retrieve coins.
 Author: Claude Opus 4.5
 Version: 2.0.0
 
-Workflow (Updated for Command 91 - DOWNLOAD):
+Workflow (Updated for Command 8- DOWNLOAD):
 1. Receive locker code (8 bytes) from Tell notification
 2. Derive 25 locker keys: MD5(raida_id + locker_code_hex) with 0xFF padding
 3. Generate 25 unique seeds (one per RAIDA for security)
-4. Send RAIDA Locker DOWNLOAD (command 91) to all RAIDAs in parallel
+4. Send RAIDA Locker DOWNLOAD (command 8) to all RAIDAs in parallel
 5. Parse response to get coin list (denomination, serial_number)
 6. Compute ANs locally: MD5("{raida_id}{serial_number}{seed_hex}")
 7. Save coins to Fracked folder as .bin files
@@ -325,7 +325,7 @@ def compute_coin_an(denomination: int, serial_number: int, seed: bytes) -> bytes
     return bytes(digest)
 
 # ============================================================================
-# LOCKER DOWNLOAD FUNCTIONS (Command 91)
+# LOCKER DOWNLOAD FUNCTIONS (Command 8)
 # ============================================================================
 
 async def _download_single_raida(
@@ -508,7 +508,7 @@ async def download_from_locker(
     This is the main async function for locker download. Suitable for
     direct calls or API use.
 
-    Workflow (Updated for Command 91):
+    Workflow (Updated for Command 8):
     1. Validate locker code (must be 8 bytes)
     2. Derive 25 locker keys using MD5(raida_id + locker_code) + 0xFF padding
     3. Generate 25 unique seeds (one per RAIDA for security!)

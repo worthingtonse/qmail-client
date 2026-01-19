@@ -464,13 +464,13 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
         iteration += 1
         logger.info(f"\n--- Fix Iteration {iteration}/{max_iterations} ---")
 
-        # Count fracked positions before fix
-        fracked_before = sum(coin.count_fracked() for coin in coins_to_fix)
+        # Count positions needing healing before fix (includes both 'f' and 'u')
+        fracked_before = sum(coin.count_needs_healing() for coin in coins_to_fix)
 
-        # Identify which RAIDA need fixing
+        # Identify which RAIDA need fixing (include both failed AND unknown)
         fracked_raida: Set[int] = set()
         for coin in coins_to_fix:
-            fracked_raida.update(coin.get_fracked_raida())
+            fracked_raida.update(coin.get_needs_healing_raida())
 
         if not fracked_raida:
             logger.info("No fracked RAIDA positions remaining")
@@ -488,8 +488,8 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
         err, fixes_applied = fix_with_tickets(
             coins_to_fix, tickets, fracked_raida)
 
-        # Count fracked positions after fix
-        fracked_after = sum(coin.count_fracked() for coin in coins_to_fix)
+        # Count positions needing healing after fix
+        fracked_after = sum(coin.count_needs_healing() for coin in coins_to_fix)
 
         logger.info(f"Fracked positions: {fracked_before} -> {fracked_after}")
 
@@ -504,8 +504,8 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
             logger.info(
                 f"Reduced by {fracked_before - fracked_after} - continuing...")
 
-        # Filter to only still-fracked coins
-        coins_to_fix = [c for c in coins_to_fix if c.count_fracked() > 0]
+        # Filter to only still-fracked coins (those with 'f' or 'u' positions)
+        coins_to_fix = [c for c in coins_to_fix if c.count_needs_healing() > 0]
 
     # STEP 8: Grade all coins
     err = grade_coins(wallet_path, fracked_coins)

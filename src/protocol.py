@@ -102,7 +102,7 @@ CMD_GROUP_LOCKER = 8      # Command Group for locker operations
 CMD_LOCKER_PUT = 82       # Put coins into locker (0x52)
 CMD_LOCKER_PEEK = 83      # Peek at locker contents (0x53)
 CMD_LOCKER_REMOVE = 84    # Remove coins from locker (0x54)
-CMD_LOCKER_DOWNLOAD = 91  # Download coins from locker (0x5B) - per server protocol.c
+CMD_LOCKER_DOWNLOAD = 8  # Download coins from locker (0x5B) - per server protocol.c
 
 # Protocol constants
 COIN_TYPE = 0x0006
@@ -2009,7 +2009,7 @@ def build_complete_make_change_request(
 
 
 # ============================================================================
-# LOCKER DOWNLOAD COMMAND FUNCTIONS (Command 91)
+# LOCKER DOWNLOAD COMMAND FUNCTIONS (Command 8)
 # ============================================================================
 
 def build_locker_download_header(
@@ -2058,7 +2058,7 @@ def build_locker_download_header(
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
     header[4] = CMD_GROUP_LOCKER       # CG: Command Group (8 = Locker)
-    header[5] = CMD_LOCKER_DOWNLOAD    # CM: Command (91 = Download)
+    header[5] = CMD_LOCKER_DOWNLOAD    # CM: Command (8) = Download)
     struct.pack_into('>H', header, 6, COIN_TYPE)  # ID: Coin ID (0x0006)
 
     # Presentation bytes (8-15)
@@ -2431,7 +2431,7 @@ def build_complete_locker_download_request(
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
     """
-    FIXED: Builds a Version 1 (Legacy) Request for Command 91.
+    FIXED: Builds a Version 1 (Legacy) Request for Command 8.
     Formula: MD5(raida_id + locker_code_str) + 0xFFFFFFFF
     """
     # 1. DERIVE THE LOCKER ACCESS KEY (PAN)
@@ -2462,7 +2462,7 @@ def build_complete_locker_download_request(
     header[0] = 0x01                   # BF: Legacy Version
     header[2] = raida_id               # RI: Target RAIDA
     header[4] = 8                      # CG: Locker Group
-    header[5] = 91                     # CM: Download Command
+    header[5] = 8                    # CM: Download Command
     
     # Coin Type (Usually 1 for CloudCoin or 6 for specific RAIDAX coins)
     struct.pack_into('>H', header, 6, COIN_TYPE) 
