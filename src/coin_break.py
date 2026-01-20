@@ -632,7 +632,7 @@ async def break_coin(
              f"Breaking coin: SN={coin.serial_number}, DN={coin.denomination}")
 
     # Validate coin can be broken
-    if coin.denomination < 0:  # -1 = 0.1, can't break further
+    if coin.denomination <= -8: # -1 = 0.1, can't break further
         return BreakResult(
             success=False,
             original_coin=coin,
