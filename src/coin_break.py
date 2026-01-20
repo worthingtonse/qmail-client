@@ -141,6 +141,7 @@ CODE_TO_DENOM = {
 
 # Response status codes
 STATUS_SUCCESS = 250
+STATUS_ALL_PASS = 241  # Server returns this for successful make_change
 ERROR_SN_NOT_AVAILABLE = 40
 
 # Network timeout (ms)
@@ -396,7 +397,7 @@ async def _make_change_single_raida(
         # 5. VALIDATE status code from response header
         status = response_header.status if response_header and hasattr(response_header, 'status') else 0
 
-        if status == STATUS_SUCCESS:
+        if status == STATUS_SUCCESS or status == STATUS_ALL_PASS:
             log_debug(logger_handle, BREAK_CONTEXT, f"RAIDA {raida_id}: SUCCESS")
             return (raida_id, STATUS_SUCCESS, "")
         elif status == ERROR_SN_NOT_AVAILABLE:
@@ -489,7 +490,7 @@ def _create_new_coins(
         for raida_id in range(CC_RAIDA_COUNT):
             status = status_map.get(raida_id, 0)
 
-            if status == STATUS_SUCCESS:
+            if status == STATUS_SUCCESS or status == STATUS_ALL_PASS:
                 # Use the PAN we sent as the AN
                 ans.append(pans[raida_id][coin_idx])
                 pown_chars.append('p')
@@ -669,12 +670,12 @@ async def break_coin(
     raida_statuses = [0] * CC_RAIDA_COUNT
     pass_count = 0
     for raida_id, status, error in results:
-     raida_statuses[raida_id] = status
-    if status == STATUS_SUCCESS:
-        pass_count += 1
-    else:
+        raida_statuses[raida_id] = status
+        if status == STATUS_SUCCESS or status == STATUS_ALL_PASS:
+            pass_count += 1
+        else:
         # Log why each RAIDA failed
-        log_warning(logger_handle, BREAK_CONTEXT,
+         log_warning(logger_handle, BREAK_CONTEXT,
                    f"RAIDA {raida_id} failed: status={status}, error={error}")
 
     log_info(logger_handle, BREAK_CONTEXT,
