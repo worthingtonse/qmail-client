@@ -114,8 +114,8 @@ async def create_recipient_locker(
             
             broken_coins = []
             # Check if result is an object with .coins attribute (standard implementation)
-            if hasattr(break_result, 'coins'):
-                broken_coins = break_result.coins
+            if hasattr(break_result, 'new_coins'):
+               broken_coins = break_result.new_coins
             # Fallback if it returns a list directly
             elif isinstance(break_result, list):
                 broken_coins = break_result
@@ -123,6 +123,9 @@ async def create_recipient_locker(
             if not broken_coins:
                 log_error(logger_handle, "LockerCreate", "Failed to break coin (Empty result)")
                 return 2, None
+            
+            if hasattr(break_result, 'success') and break_result.success:
+              broken_coins = break_result.new_coins
             
             # MATH FIX: Calculate how many small coins are needed
             # e.g. If we broke a 1.0 to pay 0.3, broken_coins[0] is 0.1.
@@ -152,7 +155,7 @@ async def create_recipient_locker(
         for c in final_coins_to_lock:
             coins_for_put.append(CoinForPut(
                 denomination=c.denomination,
-                serial_number=c.sn,
+                serial_number=c.serial_number,
                 ans=c.ans
             ))
         
