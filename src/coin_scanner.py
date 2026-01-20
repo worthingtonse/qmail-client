@@ -502,22 +502,34 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
 
 def find_identity_coin(wallet_path: str, target_sn: Optional[int] = None) -> Optional[dict]:
     """
-    Scans wallet for an identity coin. Comparison is integer-to-integer.
+    Scans wallet for an identity coin. 
+    FIX: Uses load_coin_from_file to ensure ANs are loaded.
     """
     import os
-    from src.coin_scanner import load_coin_metadata
+    # Use the FULL loader, not the metadata loader
+    from src.coin_scanner import load_coin_from_file 
     
     if not os.path.exists(wallet_path): return None
     
     for filename in os.listdir(wallet_path):
         if not filename.endswith('.bin'): continue
-        meta = load_coin_metadata(os.path.join(wallet_path, filename))
-        if meta:
-            # If target_sn is None, take the first coin, else match SN (integer)
-            if target_sn is None or meta['serial_number'] == int(target_sn):
-                return meta
+        
+        # Load the FULL coin (including ANs)
+        coin_obj = load_coin_from_file(os.path.join(wallet_path, filename))
+        
+        if coin_obj:
+            # If target_sn is None, take the first coin, else match SN
+            if target_sn is None or coin_obj.serial_number == int(target_sn):
+                # Convert the Object back to a Dict to match existing API expectations
+                # or return the object if your handlers support it.
+                return {
+                    'serial_number': coin_obj.serial_number,
+                    'denomination': coin_obj.denomination,
+                    'ans': coin_obj.ans,  # <--- This is what was missing!
+                    'pown_string': coin_obj.pown_string,
+                    'file_path': coin_obj.file_path
+                }
     return None
-
 
 # ============================================================================
 # TESTING / MAIN
