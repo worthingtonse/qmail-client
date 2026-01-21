@@ -11,7 +11,7 @@ Extended by: Claude Opus 4.5 (Upload, Tell, Download, Make Change commands)
 Version: 1.2.0
 
 Changes in v1.2.0:
-    - Added Make Change (Command Group 8, Command 90) for coin breaking functionality
+    - Added Make Change (Command Group 9, Command 90) for coin breaking functionality
     - build_make_change_payload() for 203-byte payload
     - build_make_change_header() for 32-byte header with encryption type 1
     - build_complete_make_change_request() for complete request building
@@ -94,7 +94,7 @@ CMD_PEEK = 63             # PEEK command code
 CMD_DOWNLOAD = 64         # GET/Download command code
 
 # Change Service Command Group and Codes
-CMD_GROUP_CHANGE = 8      # Command Group for change-making operations (same as Locker)
+CMD_GROUP_CHANGE = 9      # Command Group for change-making operations 
 CMD_MAKE_CHANGE = 90      # Make Change command code (0x5A)
 
 # Locker Service Command Group and Codes
@@ -1824,7 +1824,7 @@ def build_complete_download_request(
     return ProtocolErrorCode.SUCCESS, complete_request, challenge, nonce
 
 # ============================================================================
-# MAKE CHANGE COMMAND FUNCTIONS (Command Group 8, Command 90) - Added by opus45
+# MAKE CHANGE COMMAND FUNCTIONS (Command Group 9, Command 90) - Added by opus45
 # ============================================================================
 def build_make_change_payload(
     original_dn: int,
@@ -1929,7 +1929,7 @@ def build_make_change_header(
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
     Build the 32-byte request header for Make Change command.
-    STRICT VERSION: Matches Group 8, Command 90 with random nonce.
+    STRICT VERSION: Matches Group 9, Command 90 with random nonce.
     """
     if raida_id < 0 or raida_id > 24:
         log_error(logger_handle, PROTOCOL_CONTEXT, "build_make_change_header failed",
@@ -1938,12 +1938,12 @@ def build_make_change_header(
 
     header = bytearray(32)
 
-    # Routing bytes (0-7): CG=8 (Locker), CM=90 (Make Change)
+    # Routing bytes (0-7): CG=9 (change), CM=90 (Make Change)
     header[0] = 0x01                   # BF: Version 1
     header[1] = 0x00                   # SP: Split ID
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID
-    header[4] = CMD_GROUP_LOCKER       # CG: Command Group (8)
+    header[4] = CMD_GROUP_CHANGE      # CG: Command Group (9)
     header[5] = CMD_MAKE_CHANGE        # CM: Command (90)
     struct.pack_into('>H', header, 6, COIN_TYPE)  # ID: 0x0006
 
