@@ -518,33 +518,36 @@ def _create_new_coins(
     return new_coins
 
 
-def _save_new_coins_to_fracked(
+def _save_new_coins(
     coins: List[LockerCoin],
     wallet_path: str,
+    folder_name: str = "Bank",
     logger_handle=None
 ) -> CloudCoinErrorCode:
     """
-    Save the new coins to the Fracked folder for grading.
+    Save the new coins to the specified folder (Bank or Fracked).
 
     Args:
         coins: List of LockerCoin objects to save
         wallet_path: Path to wallet
+        folder_name: Target folder (default: "Bank")
 
     Returns:
         CloudCoinErrorCode
     """
-    fracked_path = os.path.join(wallet_path, "Fracked")
+    target_path = os.path.join(wallet_path, folder_name)
 
-    # Ensure Fracked folder exists
-    Path(fracked_path).mkdir(parents=True, exist_ok=True)
+    # Ensure target folder exists
+    Path(target_path).mkdir(parents=True, exist_ok=True)
 
     saved_count = 0
     for coin in coins:
+        # Use stable filename (DN.SN.bin) to prevent renaming issues
         filename = generate_coin_filename(
             coin.denomination,
             coin.serial_number
         )
-        filepath = os.path.join(fracked_path, filename)
+        filepath = os.path.join(target_path, filename)
 
         err = write_coin_file(filepath, coin, logger_handle)
         if err == CloudCoinErrorCode.SUCCESS:
@@ -554,7 +557,7 @@ def _save_new_coins_to_fracked(
                       f"Failed to save coin SN={coin.serial_number}")
 
     log_info(logger_handle, BREAK_CONTEXT,
-             f"Saved {saved_count}/{len(coins)} new coins to Fracked/")
+             f"Saved {saved_count}/{len(coins)} new coins to {folder_name}/")
 
     return CloudCoinErrorCode.SUCCESS if saved_count == len(coins) else CloudCoinErrorCode.ERR_IO_ERROR
 
@@ -598,9 +601,8 @@ def _move_original_to_change(
 
 
 # ============================================================================
-# MAIN FUNCTION
+# MAIN FUNCTION / break coin is saving change coins to bank folder so that they can be used for payment quickly
 # ============================================================================
-
 async def break_coin(
     coin: CoinToBreak,
     wallet_path: str,
@@ -632,7 +634,9 @@ async def break_coin(
              f"Breaking coin: SN={coin.serial_number}, DN={coin.denomination}")
 
     # Validate coin can be broken
-    if coin.denomination <= -8: # -1 = 0.1, can't break further
+    # -8 is the internal code for 0.00000001 (min denom). 
+    # If denomination is <= -8, we cannot break it further.
+    if coin.denomination <= -8: 
         return BreakResult(
             success=False,
             original_coin=coin,
@@ -674,9 +678,9 @@ async def break_coin(
         if status == STATUS_SUCCESS or status == STATUS_ALL_PASS:
             pass_count += 1
         else:
-        # Log why each RAIDA failed
-         log_warning(logger_handle, BREAK_CONTEXT,
-                   f"RAIDA {raida_id} failed: status={status}, error={error}")
+            # Log why each RAIDA failed
+            log_warning(logger_handle, BREAK_CONTEXT,
+                        f"RAIDA {raida_id} failed: status={status}, error={error}")
 
     log_info(logger_handle, BREAK_CONTEXT,
              f"Make Change results: {pass_count}/{CC_RAIDA_COUNT} passed")
@@ -696,8 +700,12 @@ async def break_coin(
     new_denomination = coin.denomination - 1  # One step smaller
     new_coins = _create_new_coins(starting_sn, pans, results, new_denomination, logger_handle)
 
-    # Save new coins to Fracked folder
-    err = _save_new_coins_to_fracked(new_coins, wallet_path, logger_handle)
+    # --- SAVE TO BANK (The Fix) ---
+    # Since we passed consensus (>=13), these coins are valid for spending.
+    # We save them to "Bank" so the payment system can immediately use them 
+    # for the next step of breaking or for the final payment.
+    err = _save_new_coins(new_coins, wallet_path, "Bank", logger_handle)
+    
     if err != CloudCoinErrorCode.SUCCESS:
         log_warning(logger_handle, BREAK_CONTEXT,
                     "Some coins may not have been saved")
@@ -719,7 +727,6 @@ async def break_coin(
         pass_count=pass_count,
         error_message=""
     )
-
 
 async def break_coin_by_denomination(
     wallet_path: str,

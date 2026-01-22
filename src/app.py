@@ -739,7 +739,7 @@ def start_periodic_healer(wallet_paths: List[str], logger: Any, interval_hours: 
 
     def healer_loop():
         # Wait 30 seconds after app start to let RAIDA servers stabilize
-        time.sleep(30)
+        time.sleep(300)
 
         while True:
             log_info(logger, "PeriodicHeal", "Starting scheduled wallet health check.")
@@ -1184,6 +1184,12 @@ def main():
     print("\n[ Task Management ]")
     print(
         f"  GET  {base_url}/api/task/status/{{id}}      - Check async task status")
+    print(
+        f"  POST {base_url}/api/wallet/heal             - Manual coin healing")
+    print(
+        f"  GET  {base_url}/api/wallet/heal/status      - Wallet health status")
+    print(
+        f"  POST {base_url}/api/wallet/discover         - Discover Bank coin status")
     print(
         f"  POST {base_url}/api/task/cancel/{{id}}      - Cancel a pending task")
     print()

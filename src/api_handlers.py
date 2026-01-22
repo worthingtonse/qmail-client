@@ -2800,6 +2800,522 @@ def handle_locker_download(request_handler, context):
             "error_code": int(result)
         })
 
+# ============================================================================
+# WALLET HEAL ENDPOINTS
+# ============================================================================
+
+def handle_wallet_heal(request_handler, context):
+    """
+    POST /api/wallet/heal - Manually trigger healing of fracked coins
+    
+    This endpoint provides manual control over the healing process, complementing
+    the automatic healing that occurs during other wallet operations.
+    
+    Request Body (optional):
+    {
+        "wallet": "Default" | "Mailbox" | "all",  // Default: "all"
+        "max_iterations": 3,                       // Default: 3 (1-10)
+        "async": false                             // Default: false (synchronous)
+    }
+    
+    Synchronous Response (async: false):
+    {
+        "status": "success" | "partial" | "error",
+        "wallets_processed": 2,
+        "total_fracked": 10,
+        "total_fixed": 8,
+        "total_failed": 2,
+        "total_limbo": 5,
+        "total_limbo_recovered": 3,
+        "details": [
+            {
+                "wallet": "Default",
+                "fracked": 5,
+                "fixed": 4,
+                "failed": 1,
+                "limbo": 2,
+                "limbo_recovered": 1,
+                "errors": []
+            },
+            ...
+        ],
+        "timestamp": 1735000000
+    }
+    
+    Async Response (async: true):
+    {
+        "status": "started",
+        "task_id": "abc123...",
+        "message": "Healing started in background"
+    }
+    
+    Error Response:
+    {
+        "status": "error",
+        "error": "Error message",
+        "details": "Additional information"
+    }
+    """
+    import threading
+    
+    # Imports for heal functionality
+    try:
+        from heal import heal_wallet, heal_all_wallets, HealResult, discover_all_wallets
+        from wallet_structure import get_wallet_path, DEFAULT_WALLET, MAILBOX_WALLET
+    except ImportError as e:
+        request_handler.send_json_response(500, {
+            "status": "error",
+            "error": "Heal module not available",
+            "details": str(e)
+        })
+        return
+    
+    app_ctx = request_handler.server_instance.app_context
+    logger = getattr(app_ctx, 'logger', None)
+    
+    # Parse request body
+    body = context.json if context.json else {}
+    
+    # Get parameters with defaults
+    wallet_param = body.get('wallet', 'all')
+    max_iterations = body.get('max_iterations', 3)
+    run_async = body.get('async', False)
+    
+    # Validate max_iterations
+    try:
+        max_iterations = int(max_iterations)
+        if max_iterations < 1 or max_iterations > 10:
+            raise ValueError("out of range")
+    except (ValueError, TypeError):
+        request_handler.send_json_response(400, {
+            "status": "error",
+            "error": "Invalid max_iterations",
+            "details": "max_iterations must be an integer between 1 and 10"
+        })
+        return
+    
+    # Validate wallet parameter
+    valid_wallets = ['Default', 'Mailbox', 'all']
+    if wallet_param not in valid_wallets:
+        # Check if it's a custom wallet path
+        if not isinstance(wallet_param, str) or '..' in wallet_param:
+            request_handler.send_json_response(400, {
+                "status": "error",
+                "error": "Invalid wallet parameter",
+                "details": f"Must be one of: {valid_wallets} or a valid wallet name"
+            })
+            return
+    
+    def execute_heal():
+        """Execute the healing process and return results."""
+        results = {}
+        
+        if wallet_param == 'all':
+            # Heal all wallets
+            results = heal_all_wallets(max_iterations=max_iterations)
+        else:
+            # Heal specific wallet
+            wallet_path = get_wallet_path(wallet_param)
+            result = heal_wallet(wallet_path, max_iterations=max_iterations)
+            results[wallet_path] = result
+        
+        return results
+    
+    def format_results(results):
+        """Format healing results for API response."""
+        total_fracked = 0
+        total_fixed = 0
+        total_failed = 0
+        total_limbo = 0
+        total_limbo_recovered = 0
+        details = []
+        has_errors = False
+        
+        for wallet_path, result in results.items():
+            import os
+            wallet_name = os.path.basename(wallet_path)
+            
+            total_fracked += result.total_fracked
+            total_fixed += result.total_fixed
+            total_failed += result.total_failed
+            total_limbo += result.total_limbo
+            total_limbo_recovered += result.total_limbo_recovered
+            
+            if result.errors:
+                has_errors = True
+            
+            details.append({
+                "wallet": wallet_name,
+                "wallet_path": wallet_path,
+                "fracked": result.total_fracked,
+                "fixed": result.total_fixed,
+                "failed": result.total_failed,
+                "limbo": result.total_limbo,
+                "limbo_recovered": result.total_limbo_recovered,
+                "errors": result.errors
+            })
+        
+        # Determine overall status
+        if has_errors and total_fixed == 0:
+            status = "error"
+        elif has_errors or total_failed > 0:
+            status = "partial"
+        else:
+            status = "success"
+        
+        return {
+            "status": status,
+            "wallets_processed": len(results),
+            "total_fracked": total_fracked,
+            "total_fixed": total_fixed,
+            "total_failed": total_failed,
+            "total_limbo": total_limbo,
+            "total_limbo_recovered": total_limbo_recovered,
+            "details": details,
+            "timestamp": int(time.time())
+        }
+    
+    if run_async:
+        # Async mode - start background task and return immediately
+        try:
+            from task_manager import (
+                init_task_manager, create_task, start_task, 
+                complete_task, fail_task, update_task_progress
+            )
+        except ImportError as e:
+            request_handler.send_json_response(500, {
+                "status": "error",
+                "error": "Task manager not available",
+                "details": str(e)
+            })
+            return
+        
+        # Get or create task manager
+        task_manager = getattr(app_ctx, 'task_manager', None)
+        if task_manager is None:
+            task_manager = init_task_manager()
+            app_ctx.task_manager = task_manager
+        
+        # Create task
+        err, task_id = create_task(
+            task_manager,
+            "wallet_heal",
+            {"wallet": wallet_param, "max_iterations": max_iterations},
+            "Starting wallet healing..."
+        )
+        
+        if err != 0:  # TaskErrorCode.SUCCESS
+            request_handler.send_json_response(500, {
+                "status": "error",
+                "error": "Failed to create healing task"
+            })
+            return
+        
+        def heal_worker():
+            """Background worker for async healing."""
+            try:
+                start_task(task_manager, task_id)
+                update_task_progress(task_manager, task_id, 10, "Loading wallets...")
+                
+                results = execute_heal()
+                
+                update_task_progress(task_manager, task_id, 90, "Formatting results...")
+                formatted = format_results(results)
+                
+                complete_task(task_manager, task_id, formatted, "Healing complete")
+            except Exception as e:
+                fail_task(task_manager, task_id, str(e), "Healing failed")
+        
+        # Start background thread
+        thread = threading.Thread(target=heal_worker, daemon=True)
+        thread.start()
+        
+        request_handler.send_json_response(202, {
+            "status": "started",
+            "task_id": task_id,
+            "message": "Healing started in background. Use GET /api/task/status/{task_id} to check progress."
+        })
+    else:
+        # Synchronous mode - execute and wait for results
+        try:
+            results = execute_heal()
+            formatted = format_results(results)
+            
+            # Use appropriate status code based on results
+            status_code = 200 if formatted["status"] == "success" else 207  # Multi-Status
+            request_handler.send_json_response(status_code, formatted)
+            
+        except Exception as e:
+            if logger:
+                log_error(logger, "HealAPI", f"Healing failed: {e}")
+            request_handler.send_json_response(500, {
+                "status": "error",
+                "error": "Healing operation failed",
+                "details": str(e)
+            })
+
+
+def handle_wallet_heal_status(request_handler, context):
+    """
+    GET /api/wallet/heal/status - Get current wallet health status without healing
+    
+    This endpoint checks the status of coins in wallets without performing
+    any healing operations. Useful for monitoring and pre-heal assessment.
+    
+    Query Parameters:
+        wallet: "Default" | "Mailbox" | "all" (default: "all")
+    
+    Response:
+    {
+        "status": "success",
+        "wallets": [
+            {
+                "wallet": "Default",
+                "bank_coins": 50,
+                "fracked_coins": 5,
+                "limbo_coins": 2,
+                "counterfeit_coins": 0,
+                "total_value": 500.0,
+                "health_percentage": 90.9
+            },
+            ...
+        ],
+        "summary": {
+            "total_bank": 100,
+            "total_fracked": 10,
+            "total_limbo": 3,
+            "overall_health_percentage": 88.5
+        },
+        "timestamp": 1735000000
+    }
+    """
+    import os
+    import glob
+    
+    try:
+        from wallet_structure import get_wallet_path, DEFAULT_WALLET, MAILBOX_WALLET
+        from heal_file_io import (
+            FOLDER_BANK, FOLDER_FRACKED, FOLDER_LIMBO, FOLDER_COUNTERFEIT
+        )
+    except ImportError as e:
+        request_handler.send_json_response(500, {
+            "status": "error",
+            "error": "Required modules not available",
+            "details": str(e)
+        })
+        return
+    
+    # Get wallet parameter
+    wallet_param = context.query_params.get('wallet', 'all')
+    
+    # Determine which wallets to check
+    if wallet_param == 'all':
+        wallets_to_check = [DEFAULT_WALLET, MAILBOX_WALLET]
+    else:
+        wallets_to_check = [wallet_param]
+    
+    def count_coins_in_folder(folder_path):
+        """Count .bin files and calculate total value in a folder."""
+        if not os.path.exists(folder_path):
+            return 0, 0.0
+        
+        count = 0
+        total_value = 0.0
+        
+        for filename in os.listdir(folder_path):
+            if filename.endswith('.bin'):
+                count += 1
+                # Try to extract denomination from filename (format: SSSSSSS.D.bin)
+                try:
+                    parts = filename.replace('.bin', '').split('.')
+                    if len(parts) >= 2:
+                        denom = int(parts[1])
+                        if denom != 11:  # 11 = special/zero value
+                            total_value += 10.0 ** denom
+                except (ValueError, IndexError):
+                    pass  # Skip if can't parse denomination
+        
+        return count, total_value
+    
+    wallets_status = []
+    total_bank = 0
+    total_fracked = 0
+    total_limbo = 0
+    total_counterfeit = 0
+    total_value = 0.0
+    
+    for wallet_name in wallets_to_check:
+        wallet_path = get_wallet_path(wallet_name)
+        
+        if not os.path.exists(wallet_path):
+            continue
+        
+        # Count coins in each folder
+        bank_count, bank_value = count_coins_in_folder(
+            os.path.join(wallet_path, FOLDER_BANK))
+        fracked_count, fracked_value = count_coins_in_folder(
+            os.path.join(wallet_path, FOLDER_FRACKED))
+        limbo_count, limbo_value = count_coins_in_folder(
+            os.path.join(wallet_path, FOLDER_LIMBO))
+        counterfeit_count, _ = count_coins_in_folder(
+            os.path.join(wallet_path, FOLDER_COUNTERFEIT))
+        
+        # Calculate health percentage
+        total_coins = bank_count + fracked_count + limbo_count
+        if total_coins > 0:
+            # Bank coins are healthy, fracked can be fixed, limbo is uncertain
+            health_pct = (bank_count / total_coins) * 100
+        else:
+            health_pct = 100.0  # No coins = 100% healthy
+        
+        wallet_total_value = bank_value + fracked_value + limbo_value
+        
+        wallets_status.append({
+            "wallet": wallet_name,
+            "wallet_path": wallet_path,
+            "bank_coins": bank_count,
+            "fracked_coins": fracked_count,
+            "limbo_coins": limbo_count,
+            "counterfeit_coins": counterfeit_count,
+            "total_value": wallet_total_value,
+            "health_percentage": round(health_pct, 2),
+            "needs_healing": fracked_count > 0 or limbo_count > 0
+        })
+        
+        total_bank += bank_count
+        total_fracked += fracked_count
+        total_limbo += limbo_count
+        total_counterfeit += counterfeit_count
+        total_value += wallet_total_value
+    
+    # Calculate overall health
+    total_coins = total_bank + total_fracked + total_limbo
+    if total_coins > 0:
+        overall_health = (total_bank / total_coins) * 100
+    else:
+        overall_health = 100.0
+    
+    response = {
+        "status": "success",
+        "wallets": wallets_status,
+        "summary": {
+            "total_bank": total_bank,
+            "total_fracked": total_fracked,
+            "total_limbo": total_limbo,
+            "total_counterfeit": total_counterfeit,
+            "total_value": total_value,
+            "overall_health_percentage": round(overall_health, 2),
+            "needs_healing": total_fracked > 0 or total_limbo > 0
+        },
+        "timestamp": int(time.time())
+    }
+    
+    request_handler.send_json_response(200, response)
+
+
+def handle_wallet_discover(request_handler, context):
+    """
+    POST /api/wallet/discover - Discover true status of Bank coins
+    
+    This endpoint triggers discovery of Bank coin status without full healing.
+    Coins with unknown ('u') RAIDA status will be authenticated to determine
+    their true state and moved to appropriate folders (Fracked/Counterfeit).
+    
+    Request Body (optional):
+    {
+        "wallet": "Default" | "Mailbox" | "all"  // Default: "all"
+    }
+    
+    Response:
+    {
+        "status": "success",
+        "wallets": [
+            {
+                "wallet": "Default",
+                "coins_checked": 10,
+                "coins_moved": 3,
+                "details": "3 coins moved to Fracked for healing"
+            }
+        ],
+        "timestamp": 1735000000
+    }
+    """
+    try:
+        from heal import discover_bank_coin_status
+        from wallet_structure import get_wallet_path, DEFAULT_WALLET, MAILBOX_WALLET
+        from heal_protocol import HealErrorCode
+    except ImportError as e:
+        request_handler.send_json_response(500, {
+            "status": "error",
+            "error": "Required modules not available",
+            "details": str(e)
+        })
+        return
+    
+    app_ctx = request_handler.server_instance.app_context
+    logger = getattr(app_ctx, 'logger', None)
+    
+    body = context.json if context.json else {}
+    wallet_param = body.get('wallet', 'all')
+    
+    # Determine which wallets to discover
+    if wallet_param == 'all':
+        wallets_to_check = [DEFAULT_WALLET, MAILBOX_WALLET]
+    else:
+        wallets_to_check = [wallet_param]
+    
+    results = []
+    total_checked = 0
+    total_moved = 0
+    
+    for wallet_name in wallets_to_check:
+        wallet_path = get_wallet_path(wallet_name)
+        
+        try:
+            err, checked, moved = discover_bank_coin_status(wallet_path)
+            
+            total_checked += checked
+            total_moved += moved
+            
+            if moved > 0:
+                details = f"{moved} coins moved to Fracked for healing"
+            elif checked > 0:
+                details = f"All {checked} coins verified as authentic"
+            else:
+                details = "No coins with unknown status found"
+            
+            results.append({
+                "wallet": wallet_name,
+                "wallet_path": wallet_path,
+                "coins_checked": checked,
+                "coins_moved": moved,
+                "details": details,
+                "error": None if err == HealErrorCode.SUCCESS else str(err)
+            })
+        except Exception as e:
+            if logger:
+                log_error(logger, "DiscoverAPI", f"Discovery failed for {wallet_name}: {e}")
+            results.append({
+                "wallet": wallet_name,
+                "wallet_path": wallet_path,
+                "coins_checked": 0,
+                "coins_moved": 0,
+                "details": None,
+                "error": str(e)
+            })
+    
+    response = {
+        "status": "success" if not any(r.get("error") for r in results) else "partial",
+        "wallets": results,
+        "summary": {
+            "total_checked": total_checked,
+            "total_moved": total_moved
+        },
+        "timestamp": int(time.time())
+    }
+    
+    request_handler.send_json_response(200, response)
+
 
 # ============================================================================
 # ROUTE REGISTRATION HELPER
@@ -2862,6 +3378,9 @@ def register_all_routes(server):
 
     # Wallet operations
     server.register_route('GET', '/api/wallet/balance', handle_wallet_balance)
+    server.register_route('POST', '/api/wallet/heal', handle_wallet_heal)
+    server.register_route('GET', '/api/wallet/heal/status', handle_wallet_heal_status)
+    server.register_route('POST', '/api/wallet/discover', handle_wallet_discover)
 
     # Locker operations
     server.register_route('POST', '/api/locker/download',
@@ -2911,3 +3430,6 @@ if __name__ == "__main__":
     print("  POST /api/admin/servers/parity  - Set parity server")
     print("  GET  /api/task/status/{id}      - Task status")
     print("  POST /api/task/cancel/{id}      - Cancel task")
+    print("  POST /api/wallet/heal           - Manual coin healing")
+    print("  GET  /api/wallet/heal/status    - Wallet health status")
+    print("  POST /api/wallet/discover       - Discover Bank coin status")

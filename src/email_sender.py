@@ -44,6 +44,7 @@ from network import connect_to_server, send_request, disconnect
 from payment import calculate_storage_cost, request_locker_code, calculate_total_payment
 from logger import log_info, log_error, log_warning, log_debug
 from config import get_raida_server_config
+from locker_download import download_from_locker, LockerDownloadResult
 
 
 import os
@@ -55,6 +56,163 @@ from locker_put import put_to_locker, CoinForPut, PutResult
 from key_manager import get_keys_from_locker_code
 
 
+async def _attempt_refund_async(
+    locker_code: bytes,
+    wallet_path: str,
+    db_handle: object,
+    logger_handle: object,
+    max_attempts: int = 2
+) -> Tuple[bool, int]:
+    """
+    Attempt to refund coins from locker after upload failure.
+    
+    This function tries to recover coins that were locked for payment
+    but never consumed by the server due to upload failure.
+    
+    Args:
+        locker_code: The 8-byte locker code (e.g., b'AES-12KM')
+        wallet_path: Path to wallet for saving recovered coins
+        db_handle: Database handle for RAIDA server lookup
+        logger_handle: Logger
+        max_attempts: Maximum refund attempts (default 2)
+    
+    Returns:
+        Tuple of (success: bool, coins_recovered: int)
+    """
+    # Import locally to avoid circular dependencies
+    from locker_download import download_from_locker, LockerDownloadResult
+    
+    REFUND_CONTEXT = "RefundHandler"
+    
+    if not locker_code or len(locker_code) < 8:
+        log_error(logger_handle, REFUND_CONTEXT, 
+                  "Cannot refund: invalid locker code")
+        return False, 0
+    
+    for attempt in range(max_attempts):
+        try:
+            # Decode locker code for logging (safe decode)
+            locker_str = locker_code[:8].decode('ascii', errors='ignore')
+            
+            log_info(logger_handle, REFUND_CONTEXT,
+                     f"Refund attempt {attempt + 1}/{max_attempts} "
+                     f"for locker {locker_str}")
+            
+            result, recovered_coins = await download_from_locker(
+                locker_code=locker_code,
+                wallet_path=wallet_path,
+                db_handle=db_handle,
+                logger_handle=logger_handle
+            )
+            
+            if result == LockerDownloadResult.SUCCESS:
+                coin_count = len(recovered_coins)
+                total_value = sum(
+                    10.0 ** c.denomination for c in recovered_coins
+                    if hasattr(c, 'denomination') and c.denomination != 11
+                )
+                log_info(logger_handle, REFUND_CONTEXT,
+                         f"Refund SUCCESS: {coin_count} coins recovered "
+                         f"(~{total_value:.6f} CC)")
+                return True, coin_count
+            
+            elif result == LockerDownloadResult.ERR_LOCKER_EMPTY:
+                # Locker is empty - either already refunded or payment was consumed
+                log_warning(logger_handle, REFUND_CONTEXT,
+                            "Locker is empty - coins may have been consumed by server")
+                return False, 0
+            
+            elif result == LockerDownloadResult.ERR_INSUFFICIENT_RESPONSES:
+                # Network issue - worth retrying
+                log_warning(logger_handle, REFUND_CONTEXT,
+                            f"Insufficient RAIDA responses, attempt {attempt + 1}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(2)  # Wait before retry
+                continue
+            
+            else:
+                log_error(logger_handle, REFUND_CONTEXT,
+                          f"Refund failed with code: {result}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(1)
+                continue
+                
+        except Exception as e:
+            log_error(logger_handle, REFUND_CONTEXT,
+                      f"Refund attempt {attempt + 1} exception: {e}")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(1)
+            continue
+    
+    # Decode locker code for final error message
+    locker_str = locker_code[:8].decode('ascii', errors='ignore')
+    log_error(logger_handle, REFUND_CONTEXT,
+              f"Refund FAILED after {max_attempts} attempts. "
+              f"Manual recovery may be needed for locker: {locker_str}")
+    return False, 0
+
+
+def _attempt_refund(
+    locker_code: bytes,
+    wallet_path: str,
+    db_handle: object,
+    logger_handle: object,
+    max_attempts: int = 2
+) -> Tuple[bool, int]:
+    """
+    Synchronous wrapper for _attempt_refund_async.
+    Handles the asyncio event loop correctly for worker threads.
+    
+    Args:
+        locker_code: The 8-byte locker code (e.g., b'AES-12KM')
+        wallet_path: Path to wallet for saving recovered coins
+        db_handle: Database handle for RAIDA server lookup
+        logger_handle: Logger
+        max_attempts: Maximum refund attempts (default 2)
+    
+    Returns:
+        Tuple of (success: bool, coins_recovered: int)
+    """
+    import asyncio
+    
+    try:
+        # Try to get the running loop (Python 3.10+)
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're already in an async context, we can't use run_until_complete
+            # This shouldn't happen in our thread pool case, but handle it gracefully
+            log_warning(logger_handle, "RefundHandler", 
+                        "Already in async context, creating new task")
+            future = asyncio.ensure_future(_attempt_refund_async(
+                locker_code, wallet_path, db_handle, logger_handle, max_attempts
+            ))
+            # We can't await the result here in sync mode without blocking badly,
+            # so we return False to indicate immediate status is unknown.
+            # The async task will run in background.
+            return False, 0
+        except RuntimeError:
+            # No running loop - this is the expected case for worker threads
+            pass
+        
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            result = loop.run_until_complete(
+                _attempt_refund_async(
+                    locker_code, wallet_path, db_handle, logger_handle, max_attempts
+                )
+            )
+            return result
+        finally:
+            # Clean up the loop
+            loop.close()
+            
+    except Exception as e:
+        log_error(logger_handle, "RefundHandler", 
+                  f"Failed to run refund: {e}")
+        return False, 0
 
 async def create_recipient_locker(
     wallet_path: str,
@@ -756,64 +914,70 @@ def upload_stripe_to_server(
     file_group_guid: bytes,
     locker_code: bytes,
     storage_duration: int,
-    logger_handle: Optional[object] = None
+    logger_handle: Optional[object] = None,
+    verify_only: bool = False  # <--- NEW PARAMETER
 ) -> UploadResult:
     """
-    Upload a single stripe with Adaptive Idempotency and Plaintext Support.
-    FIXED: Uses build_complete_upload_request + send_raw_request to avoid Double Header bug.
+    Upload a single stripe with Adaptive Idempotency.
+    
+    Args:
+        verify_only: If True, starts by sending Zero-Code to check if file exists 
+                     (used for retrying previously successful uploads).
+                     If verification fails (166), it falls back to payment.
     """
-    from network import connect_to_server, send_raw_request, disconnect, ServerInfo, NetworkErrorCode, StatusCode
+    from network import connect_to_server, send_raw_request, disconnect, ServerInfo, NetworkErrorCode
     from protocol import build_complete_upload_request
     
     result = UploadResult()
     result.server_id = str(server_id)
     result.stripe_index = stripe_index
 
-    # 1. AN Slicing (Ensure the server gets its specific 16-byte slice)
+    # 1. AN Slicing
     hex_an = getattr(identity, 'authenticity_number', '')
     if len(hex_an) == 800:
         start_hex = server_id * 32
         target_hex = hex_an[start_hex : start_hex + 32]
         _, target_an, _ = _safe_hex_to_bytes(target_hex, 16, f"an_raida{server_id}", logger_handle)
     else:
-        # Fallback for single key
         _, target_an, _ = _safe_hex_to_bytes(hex_an, 16, "authenticity_number", logger_handle)
 
     # --- ADAPTIVE RETRY STATE ---
-    current_locker_code = locker_code
-    last_was_timeout = False
+    # If verify_only is True, we start with Zero-Code to avoid double-payment
+    # If verify_only is False, we start with Real Code (normal upload)
+    current_locker_code = bytes(8) if verify_only else locker_code
+    
+    # We treat the first "verify_only" attempt like a timeout recovery
+    # so that if it fails (166), the logic below knows to switch to real code.
+    using_zero_code = verify_only
 
     for attempt in range(MAX_RETRIES):
         try:
-            
-            # 2. Build the request manually (Forcing Type 0 for Plaintext testing)
-            # This solves the Double Header bug by creating the binary packet here.
+            # 2. Build Request
             err_proto, request_bytes, challenge, nonce = build_complete_upload_request(
-            raida_id=server_id,
-            denomination=identity.denomination,
-            serial_number=identity.serial_number,
-            device_id=identity.device_id,
-            an=target_an,
-            file_group_guid=file_group_guid,
-            locker_code=current_locker_code,  # FIXED
-            storage_duration=storage_duration,
-            stripe_data=stripe_data,  # FIXED: moved after storage_duration
-            encryption_type=0,
-            logger_handle=logger_handle
+                raida_id=server_id,
+                denomination=identity.denomination,
+                serial_number=identity.serial_number,
+                device_id=identity.device_id,
+                an=target_an,
+                file_group_guid=file_group_guid,
+                locker_code=current_locker_code,
+                storage_duration=storage_duration,
+                stripe_data=stripe_data,
+                encryption_type=0,
+                logger_handle=logger_handle
             )
            
             if err_proto != 0:
                 result.error_message = "Protocol Build Error"
                 return result
 
-            # 3. Connect and Send Raw
+            # 3. Connect and Send
             s_info = ServerInfo(host=server_address, port=server_port, raida_id=server_id)
             err_conn, conn = connect_to_server(s_info, logger_handle=logger_handle)
 
             if err_conn != NetworkErrorCode.SUCCESS or not conn:
-                continue # Retry connection
+                continue 
 
-            # FIXED: Using send_raw_request ensures we don't add a second header
             net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
             status_code = resp.status if resp else 0
             disconnect(conn)
@@ -824,20 +988,23 @@ def upload_stripe_to_server(
                 result.status_code = status_code
                 return result
 
-            # --- AMBIGUITY RESOLVER (Idempotency) ---
-            if net_err in [NetworkErrorCode.ERR_TIMEOUT, NetworkErrorCode.ERR_SEND_FAILED]:
-                log_warning(logger_handle, SENDER_CONTEXT, 
-                            f"Timeout on RAIDA {server_id}. Testing if server has file via Zero-Code.")
-                # Next attempt will use 8 null bytes for locker_code
-                current_locker_code = bytes(8)
-                last_was_timeout = True
+            # --- LOGIC: ZERO-CODE REJECTION (SCENARIO 2 Fallback) ---
+            # If we tried Zero-Code (either because verify_only=True OR previous timeout)
+            # and server said "Payment Required" (166), we must PAY.
+            if using_zero_code and status_code == 166:
+                log_info(logger_handle, SENDER_CONTEXT, 
+                         f"Zero-Code probe rejected by {server_id} (Status 166). Switching to Real Payment.")
+                current_locker_code = locker_code # Switch to Real Code
+                using_zero_code = False
                 continue
 
-            if last_was_timeout and status_code == 166: # 166 = Payment Required
-                log_info(logger_handle, SENDER_CONTEXT, 
-                         f"Zero-Code check failed on {server_id}. Re-uploading with real code.")
-                current_locker_code = locker_code
-                last_was_timeout = False
+            # --- LOGIC: AMBIGUOUS FAILURE (SCENARIO 1) ---
+            # If Real Code timed out, we don't know if it worked. Probe with Zero-Code next.
+            if net_err in [NetworkErrorCode.ERR_TIMEOUT, NetworkErrorCode.ERR_SEND_FAILED]:
+                log_warning(logger_handle, SENDER_CONTEXT, 
+                            f"Timeout on RAIDA {server_id}. Probing with Zero-Code next.")
+                current_locker_code = bytes(8)
+                using_zero_code = True
                 continue
 
         except Exception as e:
@@ -847,6 +1014,7 @@ def upload_stripe_to_server(
     result.error_message = "Max retries reached."
     return result
 
+
 def upload_file_to_servers(
     file_info: FileUploadInfo,
     servers: List[Dict],
@@ -855,16 +1023,22 @@ def upload_file_to_servers(
     locker_code: bytes,
     storage_duration: int,
     thread_pool: Optional[ThreadPoolExecutor] = None,
-    logger_handle: Optional[object] = None
+    logger_handle: Optional[object] = None,
+    skip_payment_indices: List[int] = None  # <--- NEW PARAMETER
 ) -> Tuple[ErrorCode, List[UploadResult]]:
     """
     Upload a file's stripes to all servers in parallel.
-    FIXED: Handles both Dictionary (DB) and Object (Config) server items safely.
+    
+    Args:
+        skip_payment_indices: List of stripe indices (0-4) that have already succeeded 
+                              in a previous run. These will be sent with Zero-Code first.
     """
     all_stripes = file_info.stripes + [file_info.parity_stripe]
     results = []
+    
+    # Safe set for checking indices
+    skip_indices = set(skip_payment_indices) if skip_payment_indices else set()
 
-    # Ensure we have enough servers
     if len(servers) < len(all_stripes):
         log_error(logger_handle, SENDER_CONTEXT, "upload_file_to_servers failed",
                   f"Not enough servers: {len(servers)} < {len(all_stripes)}")
@@ -873,22 +1047,18 @@ def upload_file_to_servers(
     def upload_single(args):
         stripe_idx, stripe_data, server = args
         
-        # --- ROBUST ACCESS FIX ---
-        # 1. Try dictionary access first (most likely scenario from DB)
+        # Determine if we should start in "Verify Only" mode for this specific stripe
+        should_verify = stripe_idx in skip_indices
+        
+        # --- ROBUST ACCESS ---
         if isinstance(server, dict):
             s_addr = server.get('ip_address', server.get('host', 'localhost'))
             s_port = server.get('port', 50000 + stripe_idx)
-            # Use 'server_index' or 'server_id' or fallback to stripe_idx
             s_id = server.get('server_index', server.get('server_id', stripe_idx))
-            
-            # If server_id is a string "RAIDAx", try to parse it, otherwise use index
             if isinstance(s_id, str) and s_id.startswith("RAIDA"):
-                try:
-                    s_id = int(s_id.replace("RAIDA", ""))
-                except:
-                    s_id = stripe_idx
+                try: s_id = int(s_id.replace("RAIDA", ""))
+                except: s_id = stripe_idx
         else:
-            # 2. Fallback to object attribute access (Config objects)
             s_addr = getattr(server, 'address', getattr(server, 'host', 'localhost'))
             s_port = getattr(server, 'port', 50000 + stripe_idx)
             s_id = getattr(server, 'index', getattr(server, 'server_id', stripe_idx))
@@ -903,18 +1073,18 @@ def upload_file_to_servers(
             file_group_guid=file_group_guid,
             locker_code=locker_code,
             storage_duration=storage_duration,
-            logger_handle=logger_handle
+            logger_handle=logger_handle,
+            verify_only=should_verify  # Pass the flag down
         )
 
-    # Prepare upload tasks
+    # Prepare tasks
     tasks = [
         (i, all_stripes[i], servers[i])
         for i in range(len(all_stripes))
     ]
 
-    # Execute uploads
+    # Execute
     if thread_pool:
-        # Parallel execution
         futures = [thread_pool.submit(upload_single, task) for task in tasks]
         for future in as_completed(futures):
             try:
@@ -923,45 +1093,46 @@ def upload_file_to_servers(
                 log_error(logger_handle, SENDER_CONTEXT, "Upload task failed", str(e))
                 results.append(UploadResult(success=False, error_message=str(e)))
     else:
-        # Sequential execution
         for task in tasks:
             results.append(upload_single(task))
 
-    # Check results
     success_count = sum(1 for r in results if r.success)
     
     log_info(logger_handle, SENDER_CONTEXT,
              f"File upload complete: {success_count}/{len(results)} stripes succeeded")
 
-    # Need at least NUM_DATA_STRIPES successful uploads for recovery
     if success_count < NUM_DATA_STRIPES:
         return ErrorCode.ERR_NETWORK, results
 
     return ErrorCode.SUCCESS, results
-
-
 # ============================================================================
 # MAIN ORCHESTRATION FUNCTIONS
 # ============================================================================
 
+class UploadException(Exception):
+    """Raised when upload fails and refund should be attempted."""
+    pass
 def send_email_async(
-        request: 'SendEmailRequest',
-        identity: 'IdentityConfig',
-        db_handle: object,
-        servers: List[Dict],
-        thread_pool: Optional[ThreadPoolExecutor] = None,
-        task_callback: Optional[callable] = None,
-        logger_handle: Optional[object] = None,
-        cc_handle: object = None,
-        config: object = None  # ADD THIS LINE
-    ) -> Tuple[SendEmailErrorCode, SendEmailResult]:
+    request: 'SendEmailRequest',
+    identity: 'IdentityConfig',
+    db_handle: object,
+    servers: List[Dict],
+    thread_pool: Optional[ThreadPoolExecutor] = None,
+    task_callback: Optional[callable] = None,
+    logger_handle: Optional[object] = None,
+    cc_handle: object = None,
+    config: object = None
+) -> Tuple[SendEmailErrorCode, SendEmailResult]:
     """
     Send an email asynchronously.
-    FIXED: Integrates binary .key file loading and server-specific AN verification.
+    UPDATED: Implements 'Encryption Before Payment', 'Batch Retry Loop', and 'Refund on Total Failure'.
     """
     result = SendEmailResult()
     state = SendTaskState()
     state.task_id = f"send_{int(time.time() * 1000)}"
+    
+    # Track if payment was made (for refund decision)
+    payment_made = False
 
     def update_state(status: str, progress: int, message: str):
         state.status = status
@@ -972,7 +1143,7 @@ def send_email_async(
         log_info(logger_handle, SENDER_CONTEXT, f"[{state.task_id}] {status}: {message}")
 
     try:
-        # Step 1: Validate request
+        # --- 1. Validate Request ---
         update_state("VALIDATING", 5, "Validating request...")
         err, err_msg = validate_request(request, logger_handle)
         if err != SendEmailErrorCode.SUCCESS:
@@ -980,48 +1151,40 @@ def send_email_async(
             result.error_message = err_msg
             update_state("FAILED", 0, err_msg)
             return err, result
-        
 
-       # Load identity coin using content-based search (resilient to renaming)
-        from coin_scanner import find_identity_coin
+        # --- 2. Load Identity ---
+        from coin_scanner import find_identity_coin, load_coin_from_file
         
-       # Check Mailbox/Bank first, fallback to Default/Bank
         mailbox_bank = "Data/Wallets/Mailbox/Bank"
         default_bank = "Data/Wallets/Default/Bank"
 
         identity_coin = find_identity_coin(mailbox_bank, identity.serial_number)
-        #just a fallback // should never reach here
         if not identity_coin:
             identity_coin = find_identity_coin(default_bank, identity.serial_number)
         
         if not identity_coin:
-            log_error(logger_handle, SENDER_CONTEXT, 
-                     f"Identity coin not found: SN={identity.serial_number}")
+            msg = f"Identity coin not found for SN {identity.serial_number}"
+            log_error(logger_handle, SENDER_CONTEXT, msg)
             result.error_code = SendEmailErrorCode.ERR_ENCRYPTION_FAILED
-            result.error_message = f"Identity coin file not found for SN {identity.serial_number}"
+            result.error_message = msg
             update_state("FAILED", 0, result.error_message)
             return result.error_code, result
         
-        # Convert 25 ANs to hex string (800 hex chars = 25 * 16 bytes * 2)
-        # --- ROBUST AN EXTRACTION ---
-  # --- ROBUST AN EXTRACTION FIX ---
+        # Robust AN Extraction
         raw_ans = None
         file_path = "unknown"
 
-        # Handle Dict vs Object return from scanner
         if isinstance(identity_coin, dict):
             raw_ans = identity_coin.get('ans')
             file_path = identity_coin.get('file_path', 'unknown')
         else:
-            # Assume Object
             raw_ans = getattr(identity_coin, 'ans', None)
             file_path = getattr(identity_coin, 'file_path', 'unknown')
 
-        # FINAL CHECK
         if not raw_ans:
-            # Try reloading it manually using local function if scanner failed
+            # Try reloading manually if scanner failed
             log_warning(logger_handle, SENDER_CONTEXT, f"Scanner failed to read ANs. Trying manual load: {file_path}")
-            manual_coin = load_coin_from_file(file_path) # Uses local function at top of file
+            manual_coin = load_coin_from_file(file_path)
             if manual_coin:
                 raw_ans = manual_coin.ans
         
@@ -1029,7 +1192,7 @@ def send_email_async(
             log_error(logger_handle, SENDER_CONTEXT, f"Coin IS corrupted or empty. Path: {file_path}")
             return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
 
-        # Convert 25 ANs to hex string
+        # Convert to hex string for protocol usage
         try:
             hex_an_list = [an.hex() if isinstance(an, bytes) else str(an) for an in raw_ans]
             identity.authenticity_number = "".join(hex_an_list)
@@ -1037,40 +1200,64 @@ def send_email_async(
             log_error(logger_handle, SENDER_CONTEXT, f"Failed to format ANs: {e}")
             return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
 
-        log_info(logger_handle, SENDER_CONTEXT,
-                f"Loaded identity from: {os.path.basename(file_path)}")
+        log_info(logger_handle, SENDER_CONTEXT, f"Loaded identity from: {os.path.basename(file_path)}")
 
-        # Step 3: Generate file group GUID
+        # --- 3. Setup Task ---
         state.file_group_guid = uuid.uuid4().bytes
         result.file_group_guid = state.file_group_guid
-
-        # Count files
         attachment_count = len(request.attachment_paths) if request.attachment_paths else 0
         state.total_files = 1 + attachment_count 
         result.file_count = state.total_files
 
-        # Step 4: Calculate payment
-     # 4. Payment
-        update_state("CALCULATING", 10, "Calculating payment")
+        # ============================================================
+        # STEP 4: PREPARE FILES (MOVED BEFORE PAYMENT)
+        # ============================================================
+        # Encrypt files now. If this fails, no money is lost.
+        update_state("PROCESSING", 10, "Encrypting files...")
         
-        # Collect file sizes
-        file_sizes = [len(request.email_file)]
-        for path in (request.attachment_paths or []): 
-            try:
-                file_sizes.append(os.path.getsize(path))
-            except OSError:
-                pass # Should have been caught by validation, but safe to ignore here
+        # Helper to get encryption key (first 16 bytes of RAIDA 0 AN)
+        encryption_key = bytes.fromhex(identity.authenticity_number[:32])
+
+        # Prepare Body
+        err, body_info = prepare_file_for_upload(
+            request.email_file, "email_body.cbdf", FILE_INDEX_BODY,
+            encryption_key, logger_handle
+        )
+        if err != ErrorCode.SUCCESS:
+            result.error_message = "Failed to encrypt email body"
+            return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
+
+        # Prepare Attachments
+        prepared_attachments = []
+        for i, path in enumerate(request.attachment_paths or []):
+            is_valid, res = _validate_file_path(path, logger_handle)
+            if not is_valid: continue
+            
+            with open(res, 'rb') as f: 
+                file_data = f.read()
+            
+            err, att_info = prepare_file_for_upload(
+                file_data, os.path.basename(res), FILE_INDEX_ATTACHMENT_START + i,
+                encryption_key, logger_handle
+            )
+            if err == ErrorCode.SUCCESS:
+                prepared_attachments.append(att_info)
+
+        # ============================================================
+        # STEP 5: CALCULATE & CREATE LOCKER (RAIDA Interaction)
+        # ============================================================
+        update_state("CALCULATING", 15, "Calculating payment...")
         
-        # Collect ALL recipients into a single list
+        # Calculate cost based on the ENCRYPTED sizes
+        file_sizes = [body_info.file_size] + [att.file_size for att in prepared_attachments]
         all_recipients = (request.to_recipients or []) + \
                          (request.cc_recipients or []) + \
                          (request.bcc_recipients or [])
         
-        # CALL WITH LIST, NOT COUNT
         err, payment_calc = calculate_total_payment(
             file_sizes, 
             request.storage_weeks, 
-            all_recipients,  # <--- PASS THE LIST HERE
+            all_recipients,
             db_handle, 
             logger_handle
         )
@@ -1078,74 +1265,148 @@ def send_email_async(
         if err != ErrorCode.SUCCESS: 
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
         
-        update_state("PAYMENT", 15, f"Requesting locker code ({payment_calc.total_cost} CC)")
+        # --- EXECUTE LOCKER PUT ---
+        update_state("PAYMENT", 20, f"Locking funds ({payment_calc.total_cost} CC)...")
         err, locker_code = request_locker_code(
-        payment_calc.total_cost, db_handle, logger_handle, config, identity.serial_number
-    )
+            payment_calc.total_cost, db_handle, logger_handle, config, identity.serial_number
+        )
         if err != ErrorCode.SUCCESS: 
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
-            
+        
+        # --- CRITICAL: LOCKER CREATED ---
+        # The money is now on the RAIDA. If we fail to connect to QMail after this, we MUST refund.
         state.locker_code = locker_code
+        payment_made = True 
+        
+        locker_str_safe = locker_code[:8].decode('ascii', errors='ignore')
+        log_info(logger_handle, SENDER_CONTEXT, f"Payment successful. Locker: {locker_str_safe}")
+        
         storage_duration = weeks_to_duration_code(request.storage_weeks)
 
-        # --- Master Encryption Key Selection ---
-        # Use RAIDA 0's 16-byte AN (the first 32 hex chars) for local file encryption.
-        success_an, all_ans_bytes, _ = _safe_hex_to_bytes(
-            identity.authenticity_number, 400, "authenticity_number", logger_handle
-        )
-        encryption_key = all_ans_bytes[0:16] # 16 bytes for AES
+        # ============================================================
+        # STEP 6: UPLOAD TO QMAIL (REFUND PROTECTED + RETRY LOOP)
+        # ============================================================
+        try:
+            update_state("UPLOADING", 25, "Uploading to QMail servers...")
+            
+            # --- ROBUST UPLOAD LOOP ---
+            # Track which stripe indices have successfully uploaded
+            successful_body_stripes = set()
+            MAX_BATCH_RETRIES = 3
+            
+            for attempt in range(MAX_BATCH_RETRIES):
+                # If retrying, we skip payment for stripes that already succeeded.
+                # They will be sent with "Zero-Code" to verify presence.
+                skip_indices = list(successful_body_stripes)
+                
+                if attempt > 0:
+                    log_warning(logger_handle, SENDER_CONTEXT, 
+                                f"Retrying upload batch (Attempt {attempt+1}/{MAX_BATCH_RETRIES}). "
+                                f"Verifying payment for: {skip_indices}")
 
-        # Step 6: Process email body
-        update_state("UPLOADING", 20, "Processing email body...")
+                # Upload Body
+                err, upload_results = upload_file_to_servers(
+                    body_info, servers, identity, state.file_group_guid,
+                    state.locker_code, storage_duration, thread_pool, logger_handle,
+                    skip_payment_indices=skip_indices  # Pass the state down
+                )
+                
+                # Accumulate results
+                result.upload_results.extend(upload_results)
+                
+                # Update success set
+                for r in upload_results:
+                    if getattr(r, 'success', False):
+                        successful_body_stripes.add(r.stripe_index)
+                
+                # Check consensus (Need 4 or 5 out of 5)
+                if len(successful_body_stripes) >= 4:
+                    break
+                
+                # Wait before retry if not done
+                if attempt < MAX_BATCH_RETRIES - 1:
+                    time.sleep(2)
 
-        err, body_info = prepare_file_for_upload(
-            request.email_file, "email_body.cbdf", FILE_INDEX_BODY,
-            encryption_key, logger_handle
-        )
-        if err != ErrorCode.SUCCESS:
-            result.error_code = SendEmailErrorCode.ERR_ENCRYPTION_FAILED
-            result.error_message = "Failed to process email body"
-            update_state("FAILED", 0, "Email body processing failed")
-            return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
+            # --- CHECK FINAL BODY SUCCESS ---
+            body_success_count = len(successful_body_stripes)
+            
+            # SCENARIO 1: TOTAL FAILURE (Refund Trigger)
+            # If 0 servers accepted the file after retries, the payment is stranded on RAIDA.
+            if body_success_count == 0:
+                raise UploadException("Connection failed: 0/5 servers accepted the email.")
 
-        # Upload email body - Ensure this uses your updated upload_file_to_servers
-        err, upload_results = upload_file_to_servers(
-            body_info, servers, identity, state.file_group_guid,
-            state.locker_code, storage_duration, thread_pool, logger_handle
-        )
-        result.upload_results.extend(upload_results)
-        state.files_uploaded = 1
+            # SCENARIO 2: PARTIAL FAILURE (No Refund)
+            # If 1-3 servers accepted, the payment was likely consumed. 
+            # We fail without refunding, relying on write-over logic for future retries.
+            if body_success_count < 4:
+                result.success = False
+                result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
+                result.error_message = f"Consensus failed after retries: {body_success_count}/5 servers (No refund)"
+                update_state("FAILED", 0, result.error_message)
+                return result.error_code, result
 
-        # Step 7: Process attachments
-        for i, path in enumerate(request.attachment_paths or []):
-            file_index = FILE_INDEX_ATTACHMENT_START + i
-            progress = 20 + int(70 * (i + 1) / state.total_files)
-            update_state("UPLOADING", progress, f"Processing attachment {i+1}...")
+            # Upload Attachments (Only if body succeeded)
+            # Note: You could apply the same retry loop here if desired, 
+            # but for simplicity we keep the standard single-pass for attachments.
+            state.files_uploaded = 1
+            for att_info in prepared_attachments:
+                err, att_results = upload_file_to_servers(
+                    att_info, servers, identity, state.file_group_guid,
+                    state.locker_code, storage_duration, thread_pool, logger_handle
+                )
+                result.upload_results.extend(att_results)
+                state.files_uploaded += 1
+            
+            # Final verification
+            # (We only strictly check body success above; attachments are best-effort or checked here)
+            
+        except (UploadException, Exception) as upload_error:
+            # ============================================================
+            # REFUND HANDLER
+            # ============================================================
+            log_error(logger_handle, SENDER_CONTEXT, f"Upload failed: {upload_error}")
+            
+            if payment_made and state.locker_code:
+                update_state("REFUNDING", 50, "Upload failed, recovering payment from RAIDA...")
+                
+                # Small delay to ensure server state settles
+                time.sleep(2)
+                
+                # Attempt refund using synchronous wrapper
+                refund_success, coins_recovered = _attempt_refund(
+                    locker_code=state.locker_code,
+                    wallet_path="Data/Wallets/Default",
+                    db_handle=db_handle,
+                    logger_handle=logger_handle,
+                    max_attempts=2
+                )
+                
+                # Decode locker code for error message
+                locker_str = state.locker_code[:8].decode('ascii', errors='ignore')
+                
+                if refund_success:
+                    result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
+                    result.error_message = (
+                        f"Upload failed but payment recovered ({coins_recovered} coins). "
+                        f"Please try again."
+                    )
+                else:
+                    result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
+                    result.error_message = (
+                        f"Upload failed and refund failed. "
+                        f"Locker code: {locker_str}"
+                    )
+                
+                update_state("FAILED", 0, result.error_message)
+                return SendEmailErrorCode.ERR_PARTIAL_FAILURE, result
+            
+            # If no locker was created, just return error
+            result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
+            result.error_message = str(upload_error)
+            update_state("FAILED", 0, result.error_message)
+            return SendEmailErrorCode.ERR_PARTIAL_FAILURE, result
 
-            is_valid, result_or_error = _validate_file_path(path, logger_handle)
-            if not is_valid:
-                continue
-
-            real_path = result_or_error
-            with open(real_path, 'rb') as f:
-                file_data = f.read()
-
-            file_name = os.path.basename(real_path)
-
-            err, att_info = prepare_file_for_upload(
-                file_data, file_name, file_index, encryption_key, logger_handle
-            )
-            if err != ErrorCode.SUCCESS:
-                continue
-
-            err, upload_results = upload_file_to_servers(
-                att_info, servers, identity, state.file_group_guid,
-                state.locker_code, storage_duration, thread_pool, logger_handle
-            )
-            result.upload_results.extend(upload_results)
-            state.files_uploaded += 1
-
-        # Step 8: Complete Notifications and Storage
+        # --- 7. NOTIFICATIONS & STORAGE (Success Path) ---
         update_state("NOTIFYING", 92, "Sending notifications...")
         send_tell_notifications(
             request=request, file_group_guid=state.file_group_guid,
@@ -1157,16 +1418,6 @@ def send_email_async(
         update_state("STORING", 95, "Storing locally...")
         store_sent_email(request, state.file_group_guid, result.upload_results, db_handle, logger_handle)
 
-        # Final Success Check (Require at least 4 successful stripes)
-        success_count = sum(1 for r in result.upload_results if getattr(r, 'success', False))
-        
-        if success_count < 4:
-            result.success = False
-            result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
-            result.error_message = f"Upload failed: only {success_count}/5 stripes succeeded"
-            update_state("FAILED", 0, result.error_message)
-            return SendEmailErrorCode.ERR_PARTIAL_FAILURE, result
-            
         result.success = True
         result.error_code = SendEmailErrorCode.SUCCESS
         update_state("COMPLETED", 100, "Email sent successfully")
@@ -1174,10 +1425,22 @@ def send_email_async(
         return SendEmailErrorCode.SUCCESS, result
 
     except Exception as e:
-        log_error(logger_handle, SENDER_CONTEXT, "send_email_async failed", str(e))
+        # Global Crash Handler
+        log_error(logger_handle, SENDER_CONTEXT, "send_email_async crashed", str(e))
+        
+        # If we crashed AFTER creating the locker, try to save the user's money
+        if payment_made and state.locker_code:
+            try:
+                log_warning(logger_handle, SENDER_CONTEXT, "Attempting emergency refund...")
+                _attempt_refund(state.locker_code, "Data/Wallets/Default", db_handle, logger_handle)
+                result.error_message = f"Crashed but payment recovered. Error: {e}"
+            except:
+                result.error_message = f"Crashed and refund failed. Error: {e}"
+        else:
+            result.error_message = str(e)
+            
         update_state("FAILED", 0, str(e))
         return SendEmailErrorCode.ERR_PARTIAL_FAILURE, result
-
 # ============================================================================
 # STUB FUNCTIONS (to be implemented)
 # ============================================================================

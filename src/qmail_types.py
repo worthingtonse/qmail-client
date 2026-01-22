@@ -870,6 +870,8 @@ class SendEmailErrorCode(IntEnum):
     ERR_CHALLENGE_FAILED = 207
     ERR_PARTIAL_FAILURE = 208
     ERR_ENCRYPTION_FAILED = 209
+    ERR_UPLOAD_FAILED_REFUND_SUCCESS = 210  # Upload failed but coins recovered
+    ERR_UPLOAD_FAILED_REFUND_FAILED = 211   # Upload failed AND refund failed
 
 
 @dataclass

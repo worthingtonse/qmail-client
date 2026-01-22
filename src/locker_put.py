@@ -330,6 +330,12 @@ async def put_to_locker(
     tasks = [put_single_raida(i) for i in range(RAIDA_COUNT)]
     await asyncio.gather(*tasks)
 
+
+
+# DEBUG: Log all results
+    for raida_id, (status, coin_results) in sorted(results.items()):
+        print(f"RAIDA {raida_id}: status={status} (0x{status:02x})" if status >= 0 else f"RAIDA {raida_id}: status={status}")
+       
     # Determine overall result
     pass_count = sum(1 for s, _ in results.values() if s == STATUS_ALL_PASS)
 

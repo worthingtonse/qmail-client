@@ -261,7 +261,8 @@ def get_server_fees(
     except Exception as e:
         log_error(logger_handle, PAYMENT_CONTEXT, "get_server_fees failed", str(e))
         return ErrorCode.ERR_INTERNAL, []
-async def _create_locker_async(
+# create locker async right now introduces dust threshold , the amount that we overpay (minute amount just to avoid a lot of make change calls )
+async def _create_locker_async( 
     amount: float, 
     wallet_path: str, 
     logger_handle: object,
@@ -270,17 +271,26 @@ async def _create_locker_async(
 ) -> Tuple[ErrorCode, bytes]:
     """
     Async implementation of locker creation with iterative coin breaking.
+    FIXED: 
+      1. Uses top-level imports for CoinForPut/PutResult (from locker_put).
+      2. Corrected put_to_locker call (2 args only) to avoid type errors.
+      3. Includes Dust Threshold and Loop limits for stability.
     """
     import math
     import secrets
     import string
+    import asyncio 
     
-    # Limit loops to prevent infinite cycles
-    MAX_LOOPS = 6
+    # Increased loops to handle deep recursive breaks (1.0 -> 0.0001)
+    MAX_LOOPS = 20
+    
+    # Threshold for "Close Enough". 
+    # If we are overpaying by less than 0.0001 (DN -4), just pay it.
+    DUST_THRESHOLD = 0.0001
     
     try:
         for _ in range(MAX_LOOPS):
-            # 1. Get coins (Now returns accumulated list >= amount)
+            # 1. Get coins
             coins = get_coins_by_value(wallet_path, amount, identity_sn=identity_sn)
             
             if not coins:
@@ -289,13 +299,21 @@ async def _create_locker_async(
                 return ErrorCode.ERR_NOT_FOUND, b''
             
             total_value_selected = sum(parse_denomination_code(c.denomination) for c in coins)
-            
-            # 2. Check for Exact Match (or close enough for floats)
-            if abs(total_value_selected - amount) < 0.00000001:
+            diff = total_value_selected - amount
+
+            # 2. Check for Match OR Acceptable Overpayment
+            # We accept if we have enough AND the excess is just dust.
+            if diff >= -0.00000001 and diff < DUST_THRESHOLD:
+                
+                log_info(logger_handle, PAYMENT_CONTEXT, 
+                         f"Locking {total_value_selected:.8f} for payment of {amount:.8f} (Overpayment: {diff:.8f})")
+
                 # --- MATCH FOUND: LOCK IT ---
                 random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits) 
                                        for _ in range(7))
                 locker_code_str = random_chars[:3] + '-' + random_chars[3:]
+                log_warning(logger_handle, PAYMENT_CONTEXT, 
+                         f"PAYMENT CREATED: Locker Code is {locker_code_str} (Save this in case of crash!)")
                 locker_keys = get_keys_from_locker_code(locker_code_str)
                 
                 coins_for_put = [
@@ -303,7 +321,12 @@ async def _create_locker_async(
                     for c in coins
                 ]
                 
-                put_result, _ = await put_to_locker(coins_for_put, locker_keys, config, logger_handle)
+                # --- FIX IS HERE ---
+                # 1. No invalid inner imports.
+                # 2. Pass ONLY coins and keys. 
+                #    The previous error "LoggerHandle... not integer" implies the 3rd arg 
+                #    is a timeout integer, not a logger or config object.
+                put_result, _ = await put_to_locker(coins_for_put, locker_keys)
                 
                 if put_result != PutResult.SUCCESS:
                     log_error(logger_handle, PAYMENT_CONTEXT, f"Locker PUT failed: {put_result}")
@@ -319,33 +342,16 @@ async def _create_locker_async(
                 locker_code_bytes = locker_code_str.encode('ascii').ljust(8, b'\x00')
                 return ErrorCode.SUCCESS, locker_code_bytes
 
-            # 3. OVERPAYMENT DETECTED: Must Break a Coin
-            elif total_value_selected > amount:
-                # We have multiple coins, or one large coin.
-                # Strategy: Keep coins that fit, break the one that overflows.
+            # 3. SIGNIFICANT OVERPAYMENT: Must Break a Coin
+            elif diff >= DUST_THRESHOLD:
+                # Sort ASCENDING (Smallest first)
+                coins.sort(key=lambda x: parse_denomination_code(x.denomination), reverse=False)
                 
-                # Sort descending (Largest first)
-                coins.sort(key=lambda x: parse_denomination_code(x.denomination), reverse=True)
-                
-                coin_to_break = None
-                current_stack = 0.0
-                
-                # Find the specific coin that pushes us over the limit
-                for c in coins:
-                    val = parse_denomination_code(c.denomination)
-                    if current_stack + val <= amount + 0.00000001:
-                        current_stack += val
-                    else:
-                        coin_to_break = c
-                        break
-                
-                # Fallback: Break the largest available if loop logic misses
-                if not coin_to_break:
-                    coin_to_break = coins[0]
+                coin_to_break = coins[0]
                 
                 log_info(logger_handle, PAYMENT_CONTEXT,
-                         f"Have {total_value_selected}, need {amount}. "
-                         f"Breaking coin SN {coin_to_break.sn}")
+                         f"Have {total_value_selected:.8f}, need {amount:.8f}. "
+                         f"Breaking smallest available coin: SN {coin_to_break.serial_number} (Val: {parse_denomination_code(coin_to_break.denomination)})")
                 
                 # Execute Break (Command 90)
                 break_result = await break_coin(coin_to_break, wallet_path, config, logger_handle)
@@ -359,7 +365,10 @@ async def _create_locker_async(
                     log_error(logger_handle, PAYMENT_CONTEXT, "Coin break failed during payment")
                     return ErrorCode.ERR_INTERNAL, b''
                 
-                # LOOP RESTARTS -> get_coins_by_value will be called again and will find the new change
+                # Wait for FS to sync
+                await asyncio.sleep(0.5)
+                
+                # LOOP RESTARTS -> get_coins_by_value will be called again
                 continue
                 
         # If loop finishes without returning

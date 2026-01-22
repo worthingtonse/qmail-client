@@ -330,7 +330,7 @@ def compute_coin_an(denomination: int, serial_number: int, seed: bytes) -> bytes
 
 async def _download_single_raida(
     raida_id: int,
-    locker_key: bytes,
+    locker_code_str: str,  # FIXED: Changed from locker_key: bytes
     seed: bytes,
     server: ServerInfo,
     timeout_ms: int = DEFAULT_DOWNLOAD_TIMEOUT_MS,
@@ -339,13 +339,13 @@ async def _download_single_raida(
     """
     Send DOWNLOAD request to a single RAIDA.
 
-    The DOWNLOAD command (85) replaces the old PEEK + REMOVE flow.
+    The DOWNLOAD command (8) replaces the old PEEK + REMOVE flow.
     It returns the list of coins in the locker, and the RAIDA updates
-    each coin's AN using MD5("{raida_id}{serial_number}{seed_hex}").
+    each coin's AN using the seed provided.
 
     Args:
         raida_id: RAIDA server ID (0-24)
-        locker_key: 16-byte derived locker key (with 0xFF padding)
+        locker_code_str: Locker code string (e.g., "ABC-1234") - NOT bytes!
         seed: 16-byte random seed for AN generation (unique per RAIDA!)
         server: ServerInfo for the RAIDA
         timeout_ms: Request timeout in milliseconds
@@ -356,31 +356,31 @@ async def _download_single_raida(
     """
     conn = None
     try:
-        # Build complete request (header + encrypted payload)
+        # Build complete request (header + payload)
+        # FIXED: Use locker_code_str parameter name to match protocol.py signature
         err, request, challenge, nonce = build_complete_locker_download_request(
             raida_id=raida_id,
-            locker_key=locker_key,
+            locker_code_str=locker_code_str,  # FIXED: Correct parameter name
             seed=seed,
             logger_handle=logger_handle
         )
         if err != ProtocolErrorCode.SUCCESS:
+            log_error(logger_handle, LOCKER_CONTEXT,
+                      f"RAIDA {raida_id} failed to build request", f"error={err}")
             return NetworkErrorCode.ERR_SEND_FAILED, []
 
         # DEBUG: Print raw request details
-        log_info(logger_handle, LOCKER_CONTEXT,
+        log_debug(logger_handle, LOCKER_CONTEXT,
                  f"RAIDA {raida_id} request: total={len(request)} bytes")
-        log_info(logger_handle, LOCKER_CONTEXT,
-                 f"RAIDA {raida_id} header (32 bytes): {request[:32].hex()}")
-        log_info(logger_handle, LOCKER_CONTEXT,
-                 f"RAIDA {raida_id} body ({len(request)-32} bytes): {request[32:].hex()}")
 
         # Connect to server
         err, conn = await connect_async(
             server_info=server,
-            timeout_ms=timeout_ms,
             logger_handle=logger_handle
         )
         if err != NetworkErrorCode.SUCCESS:
+            log_error(logger_handle, LOCKER_CONTEXT,
+                      f"RAIDA {raida_id} connection failed", f"error={err}")
             return err, []
 
         # Send raw pre-built request and receive response
@@ -391,32 +391,31 @@ async def _download_single_raida(
             logger_handle=logger_handle
         )
         if err != NetworkErrorCode.SUCCESS:
+            log_error(logger_handle, LOCKER_CONTEXT,
+                      f"RAIDA {raida_id} send/receive failed", f"error={err}")
             return err, []
 
-        # DEBUG: Show raw response header and status code
+        # Check response status
         if response_header:
             status_code = response_header.status
-            log_info(logger_handle, LOCKER_CONTEXT,
+            log_debug(logger_handle, LOCKER_CONTEXT,
                      f"RAIDA {raida_id} response: status={status_code} (0x{status_code:02x}), "
-                     f"body_size={response_header.body_size}, raida_id={response_header.raida_id}")
-            if response_body:
-                body_hex = response_body[:64].hex() if len(response_body) > 64 else response_body.hex()
-                log_info(logger_handle, LOCKER_CONTEXT,
-                         f"RAIDA {raida_id} response body ({len(response_body)} bytes): {body_hex}")
+                     f"body_size={response_header.body_size}")
+            
+            # Check for error status codes
+            if status_code not in (250, 241):  # SUCCESS or ALL_PASS
+                log_warning(logger_handle, LOCKER_CONTEXT,
+                           f"RAIDA {raida_id} returned status {status_code}")
+                # Don't fail immediately - locker might just be empty on this RAIDA
 
         # For encryption type 0 (no encryption), use response body directly
-        # The DOWNLOAD command uses unencrypted responses, so we skip decryption
-        # to avoid corrupting the plaintext data
         decrypted = response_body
 
-        # DEBUG: Show response body (plaintext for encryption type 0)
-        if decrypted:
-            log_info(logger_handle, LOCKER_CONTEXT,
-                     f"RAIDA {raida_id} response body (plaintext, {len(decrypted)} bytes): {decrypted.hex()}")
-
-        # Parse coin list (same format as PEEK response)
+        # Parse coin list
         err, coins = parse_locker_download_response(decrypted, logger_handle)
         if err != ProtocolErrorCode.SUCCESS:
+            log_error(logger_handle, LOCKER_CONTEXT,
+                      f"RAIDA {raida_id} failed to parse response", f"error={err}")
             return NetworkErrorCode.ERR_INVALID_RESPONSE, []
 
         log_debug(logger_handle, LOCKER_CONTEXT,
@@ -429,15 +428,16 @@ async def _download_single_raida(
         return NetworkErrorCode.ERR_TIMEOUT, []
     except Exception as e:
         log_error(logger_handle, LOCKER_CONTEXT,
-                  f"RAIDA {raida_id} DOWNLOAD error", str(e))
-        return NetworkErrorCode.ERR_UNKNOWN, []
+                  f"RAIDA {raida_id} DOWNLOAD exception", str(e))
+        # FIXED: Use ERR_INTERNAL instead of non-existent ERR_UNKNOWN
+        return NetworkErrorCode.ERR_INTERNAL, []
     finally:
         if conn:
             await disconnect_async(conn, logger_handle)
 
 
 async def _download_all_raidas(
-    locker_keys: List[bytes],
+    locker_code_str: str,  # FIXED: Changed from locker_keys: List[bytes]
     seeds: List[bytes],
     servers: List[ServerInfo],
     timeout_ms: int = DEFAULT_DOWNLOAD_TIMEOUT_MS,
@@ -447,7 +447,7 @@ async def _download_all_raidas(
     Send DOWNLOAD to all 25 RAIDAs in parallel.
 
     Args:
-        locker_keys: List of 25 derived locker keys
+        locker_code_str: The locker code string (e.g., "ABC-1234")
         seeds: List of 25 unique seeds (one per RAIDA for security!)
         servers: List of 25 ServerInfo objects
         timeout_ms: Request timeout
@@ -460,7 +460,7 @@ async def _download_all_raidas(
     for raida_id in range(RAIDA_COUNT):
         task = _download_single_raida(
             raida_id=raida_id,
-            locker_key=locker_keys[raida_id],
+            locker_code_str=locker_code_str,  # FIXED: Pass string, not bytes
             seed=seeds[raida_id],
             server=servers[raida_id],
             timeout_ms=timeout_ms,
@@ -485,12 +485,14 @@ async def _download_all_raidas(
         if err == NetworkErrorCode.SUCCESS:
             success_count += 1
             coin_lists_per_raida[raida_id] = coins
+        else:
+            log_debug(logger_handle, LOCKER_CONTEXT,
+                      f"RAIDA {raida_id} DOWNLOAD failed: {err}")
 
     log_info(logger_handle, LOCKER_CONTEXT,
              f"DOWNLOAD complete: {success_count}/{RAIDA_COUNT} success")
 
     return success_count, coin_lists_per_raida
-
 
 # ============================================================================
 # MAIN DOWNLOAD FUNCTION
@@ -662,36 +664,33 @@ async def _download_all_raidas(
 async def download_from_locker(
     locker_code: bytes,
     wallet_path: str,
-    db_handle: Any = None,
+    db_handle: Any,
     logger_handle: Optional[object] = None
-) -> Tuple[LockerDownloadResult, List[LockerCoin]]:
+) -> Tuple[LockerDownloadResult, List[Any]]:
     """
-    Download CloudCoins from a RAIDA locker using new DOWNLOAD command (85).
+    Download coins from a RAIDA locker using the new DOWNLOAD command (8).
 
-    This is the main async function for locker download. Suitable for
-    direct calls or API use.
-
-    Workflow (Updated for Command 8):
-    1. Validate locker code (must be 8 bytes)
-    2. Derive 25 locker keys using MD5(raida_id + locker_code) + 0xFF padding
-    3. Generate 25 unique seeds (one per RAIDA for security!)
-    4. Get RAIDA server list
-    5. Parallel DOWNLOAD to all 25 RAIDAs (replaces PEEK + REMOVE)
-    6. Check consensus (need >= 13 successful responses)
-    7. Merge coin lists and compute ANs locally
-    8. Grade coins and save to appropriate folders:
+    This function:
+    1. Validates the locker code
+    2. Converts locker code bytes to string for protocol
+    3. Generates 25 unique seeds (one per RAIDA)
+    4. Gets RAIDA server list
+    5. Sends parallel DOWNLOAD requests to all 25 RAIDAs
+    6. Checks consensus (need >= 13 successful responses)
+    7. Merges coin lists and computes ANs locally
+    8. Grades coins and saves to appropriate folders:
        - 25/25 passes -> Bank (authentic)
        - 13-24 passes -> Fracked (needs healing)
        - <13 passes -> Counterfeit
 
     Args:
-        locker_code: 8-byte locker code from Tell notification
+        locker_code: 8-byte locker code (e.g., b'ABC-1234')
         wallet_path: Path to wallet folder (coins go to Bank/Fracked/Counterfeit)
         db_handle: Database handle for RAIDA server lookup
         logger_handle: Optional logger handle
 
     Returns:
-        Tuple of (result_code, list_of_LockerCoin)
+        Tuple of (result_code, list_of_saved_coins)
         On success, coins are graded and saved to appropriate folders
     """
     log_info(logger_handle, LOCKER_CONTEXT,
@@ -706,26 +705,26 @@ async def download_from_locker(
     # Use first 8 bytes (strip null padding if present)
     locker_code = locker_code[:8]
 
-    # 2. Derive 25 locker keys
-    try:
-        locker_keys = get_keys_from_locker_code(locker_code)
-        if len(locker_keys) != RAIDA_COUNT:
-            raise ValueError(f"Expected {RAIDA_COUNT} keys, got {len(locker_keys)}")
-    except Exception as e:
+    # FIXED: Convert bytes to string for protocol.py
+    # The locker code is stored as b'ABC-1234' but protocol expects "ABC-1234"
+    locker_code_str = locker_code.decode('ascii', errors='ignore').strip().rstrip('\x00')
+    
+    log_info(logger_handle, LOCKER_CONTEXT,
+             f"Locker code string: {locker_code_str}")
+
+    # Validate format: should be XXX-XXXX (8 chars with hyphen at position 3)
+    if len(locker_code_str) < 7 or '-' not in locker_code_str:
         log_error(logger_handle, LOCKER_CONTEXT,
-                  "Key derivation failed", str(e))
-        return LockerDownloadResult.ERR_KEY_DERIVATION_FAILED, []
+                  "Invalid locker code format", f"expected 'XXX-XXXX', got '{locker_code_str}'")
+        return LockerDownloadResult.ERR_INVALID_LOCKER_CODE, []
 
-    log_debug(logger_handle, LOCKER_CONTEXT,
-              f"Derived {len(locker_keys)} locker keys")
-
-    # 3. Generate 25 unique seeds (one per RAIDA for security!)
+    # 2. Generate 25 unique seeds (one per RAIDA for security!)
     # Each RAIDA gets a unique seed so administrators can't compute other RAIDAs' ANs
     seeds = [secrets.token_bytes(AN_LENGTH) for _ in range(RAIDA_COUNT)]
     log_debug(logger_handle, LOCKER_CONTEXT,
               f"Generated {len(seeds)} unique seeds for AN generation")
 
-    # 4. Get RAIDA servers
+    # 3. Get RAIDA servers
     servers = await get_raida_servers(db_handle, logger_handle)
     if not servers or len(servers) != RAIDA_COUNT:
         log_error(logger_handle, LOCKER_CONTEXT,
@@ -733,19 +732,23 @@ async def download_from_locker(
                   f"got {len(servers) if servers else 0} servers")
         return LockerDownloadResult.ERR_NO_RAIDA_SERVERS, []
 
-    # 5. Parallel DOWNLOAD to all RAIDAs (single command replaces PEEK + REMOVE)
+    # 4. Parallel DOWNLOAD to all RAIDAs
+    # FIXED: Pass locker_code_str (string) instead of locker_keys (list of bytes)
     download_success, coin_lists_per_raida = await _download_all_raidas(
-        locker_keys, seeds, servers, logger_handle=logger_handle
+        locker_code_str=locker_code_str,  # FIXED: Pass string
+        seeds=seeds,
+        servers=servers,
+        logger_handle=logger_handle
     )
 
-    # 6. Check consensus
+    # 5. Check consensus
     if download_success < MINIMUM_PASS_COUNT:
         log_error(logger_handle, LOCKER_CONTEXT,
                   "Insufficient DOWNLOAD responses",
                   f"{download_success}/{RAIDA_COUNT} < {MINIMUM_PASS_COUNT}")
         return LockerDownloadResult.ERR_INSUFFICIENT_RESPONSES, []
 
-    # 7. Merge coin lists and determine which RAIDAs have each coin
+    # 6. Merge coin lists and determine which RAIDAs have each coin
     # Build: {(denom, sn): [raida_ids that returned this coin]}
     coin_raida_map: Dict[Tuple[int, int], List[int]] = {}
     for raida_id, coins in coin_lists_per_raida.items():
@@ -762,7 +765,7 @@ async def download_from_locker(
     log_info(logger_handle, LOCKER_CONTEXT,
              f"Found {len(coin_raida_map)} unique coins in locker")
 
-    # 8. For each coin, compute ANs, grade, and save to appropriate folder
+    # 7. For each coin, compute ANs, grade, and save to appropriate folder
     # Create all necessary folders
     bank_path = os.path.join(wallet_path, "Bank")
     fracked_path = os.path.join(wallet_path, "Fracked")
@@ -783,7 +786,10 @@ async def download_from_locker(
 
         # For each RAIDA that returned this coin, compute the AN
         for raida_id in raida_ids:
-            ans[raida_id] = compute_coin_an(raida_id, sn, seeds[raida_id])
+            # FIXED: compute_coin_an signature is (denomination, serial_number, seed)
+            # But looking at the original code, it was (raida_id, sn, seed) which is WRONG
+            # The correct call should be (denom, sn, seed) per the docstring
+            ans[raida_id] = compute_coin_an(denom, sn, seeds[raida_id])
             statuses[raida_id] = True
 
         # Create DownloadedCoin for conversion
@@ -815,7 +821,7 @@ async def download_from_locker(
         if pass_count == RAIDA_COUNT:
             # All 25 passed - authentic, goes to Bank
             dest_folder = bank_path
-            grade = "AUTHENTIC"
+            grade = "BANK"
             bank_count += 1
         elif pass_count >= MINIMUM_PASS_COUNT:
             # 13-24 passed - fracked, needs healing
@@ -833,25 +839,25 @@ async def download_from_locker(
         err = write_coin_file(filepath, locker_coin, logger_handle)
         if err == CloudCoinErrorCode.SUCCESS:
             saved_coins.append(locker_coin)
-            log_debug(logger_handle, LOCKER_CONTEXT,
-                      f"Saved coin SN={locker_coin.serial_number} "
-                      f"({pass_count}/25 passed) -> {grade}")
+            log_info(logger_handle, LOCKER_CONTEXT,
+                      f"Saved coin DN={denom} SN={sn} ({pass_count}/25) -> {grade}")
         else:
             log_error(logger_handle, LOCKER_CONTEXT,
-                      f"Failed to save coin SN={locker_coin.serial_number}",
-                      f"error={err}")
+                      f"Failed to save coin SN={sn}", f"error={err}")
 
     if not saved_coins:
         log_error(logger_handle, LOCKER_CONTEXT,
-                  "No coins saved", "all coins had 0 passes")
+                  "No coins saved", "all writes failed")
         return LockerDownloadResult.ERR_FILE_WRITE_ERROR, []
 
+    # Calculate total value
     total_value = sum(10.0 ** c.denomination for c in saved_coins
-                      if c.denomination != 11)
+                      if hasattr(c, 'denomination') and c.denomination != 11)
+
     log_info(logger_handle, LOCKER_CONTEXT,
-             f"Locker download complete: {len(saved_coins)} coins saved "
-             f"(Bank: {bank_count}, Fracked: {fracked_count}, Counterfeit: {counterfeit_count}), "
-             f"total value={total_value}")
+             f"Download complete: {len(saved_coins)} coins saved "
+             f"(Bank: {bank_count}, Fracked: {fracked_count}, Counterfeit: {counterfeit_count}) "
+             f"Total value: ~{total_value:.6f} CC")
 
     return LockerDownloadResult.SUCCESS, saved_coins
 
