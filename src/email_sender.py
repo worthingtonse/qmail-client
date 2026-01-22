@@ -1212,8 +1212,8 @@ def send_email_async(
         # ============================================================
         # STEP 4: PREPARE FILES (MOVED BEFORE PAYMENT)
         # ============================================================
-        # Encrypt files now. If this fails, no money is lost.
-        update_state("PROCESSING", 10, "Encrypting files...")
+        
+        update_state("PROCESSING", 10, "Processing files (Parity & Chunking)...")
         
         # Helper to get encryption key (first 16 bytes of RAIDA 0 AN)
         encryption_key = bytes.fromhex(identity.authenticity_number[:32])
