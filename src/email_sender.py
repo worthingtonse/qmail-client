@@ -1125,7 +1125,8 @@ def send_email_async(
 ) -> Tuple[SendEmailErrorCode, SendEmailResult]:
     """
     Send an email asynchronously.
-    UPDATED: Implements 'Encryption Before Payment', 'Batch Retry Loop', and 'Refund on Total Failure'.
+    UPDATED: Implements 'Encryption Before Payment' and 'Refund on Total Failure'.
+    Uses _safe_hex_to_bytes for correct Type 0 key derivation.
     """
     result = SendEmailResult()
     state = SendTaskState()
@@ -1212,11 +1213,18 @@ def send_email_async(
         # ============================================================
         # STEP 4: PREPARE FILES (MOVED BEFORE PAYMENT)
         # ============================================================
+        # Encrypt files now. If this fails, no money is lost.
+        update_state("PROCESSING", 10, "Processing files (Parity & Encryption)...")
         
-        update_state("PROCESSING", 10, "Processing files (Parity & Chunking)...")
-        
-        # Helper to get encryption key (first 16 bytes of RAIDA 0 AN)
-        encryption_key = bytes.fromhex(identity.authenticity_number[:32])
+        # --- Master Encryption Key Selection (Restored Old Logic) ---
+        # Use RAIDA 0's 16-byte AN (the first 32 hex chars) for local file encryption.
+        success_an, all_ans_bytes, _ = _safe_hex_to_bytes(
+            identity.authenticity_number, 400, "authenticity_number", logger_handle
+        )
+        if not success_an:
+             return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
+             
+        encryption_key = all_ans_bytes[0:16] # 16 bytes for AES
 
         # Prepare Body
         err, body_info = prepare_file_for_upload(
@@ -1311,9 +1319,6 @@ def send_email_async(
                     skip_payment_indices=skip_indices  # Pass the state down
                 )
                 
-                # Accumulate results
-                result.upload_results.extend(upload_results)
-                
                 # Update success set
                 for r in upload_results:
                     if getattr(r, 'success', False):
@@ -1321,6 +1326,7 @@ def send_email_async(
                 
                 # Check consensus (Need 4 or 5 out of 5)
                 if len(successful_body_stripes) >= 4:
+                    result.upload_results.extend(upload_results)
                     break
                 
                 # Wait before retry if not done
@@ -1346,8 +1352,7 @@ def send_email_async(
                 return result.error_code, result
 
             # Upload Attachments (Only if body succeeded)
-            # Note: You could apply the same retry loop here if desired, 
-            # but for simplicity we keep the standard single-pass for attachments.
+            # Standard single pass for attachments (can be improved with similar retry logic if needed)
             state.files_uploaded = 1
             for att_info in prepared_attachments:
                 err, att_results = upload_file_to_servers(
@@ -1357,8 +1362,7 @@ def send_email_async(
                 result.upload_results.extend(att_results)
                 state.files_uploaded += 1
             
-            # Final verification
-            # (We only strictly check body success above; attachments are best-effort or checked here)
+            # Final verification of attachments could go here
             
         except (UploadException, Exception) as upload_error:
             # ============================================================
