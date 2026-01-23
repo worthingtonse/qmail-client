@@ -14,6 +14,7 @@ Date: 2025-12-16
 Phase: I (Stub Implementation)
 """
 
+import asyncio
 import threading
 from config import load_config, validate_config, print_config_summary, get_default_config_path
 from logger import init_logger, close_logger, log_info, log_error, log_warning, LogLevel
@@ -954,7 +955,7 @@ def main():
                     if is_guid_in_database(app_context.db_handle, file_guid):
                         continue
 
-                    # 3. IT'S NEW: Ab log karein aur memory mein add karein
+                    # 3. IT'S NEW: log db and add to memory
                     sender_sn = getattr(notification, 'sender_sn', 0)
                     err_db, s_info = get_contact_by_id(app_context.db_handle, sender_sn)
                     sender_display = s_info['auto_address'] if err_db == 0 else f"SN {sender_sn}"
@@ -1034,6 +1035,8 @@ def main():
                         failed_count += 1
                         continue
 
+                    
+
                     # 5. STORE STRIPE LOCATIONS (received_stripes table)
                     # This maps which RAIDA servers actually have the data.
                     server_list = getattr(notification, 'server_list', [])
@@ -1067,6 +1070,23 @@ def main():
                     log_info(
                         logger, "Beacon", f"Successfully cached metadata for {file_guid[:8]} with {stripes_stored} server locations.")
                     successful_count += 1
+
+                    if locker_code and len(locker_code) >= 8:
+                    # Check if it's not all zeros (no payment)
+                     if locker_code != b'\x00' * len(locker_code):
+                        try:
+                            from download_handler import download_locker_payment
+                            log_info(logger, "Beacon", f"Claiming inbox fee for {file_guid[:8]}...")
+                            err, _ = asyncio.run(download_locker_payment(
+                                app_context, file_guid, logger
+                            ))
+                            if err == 0:
+                                log_info(logger, "Beacon", f"✓ Inbox fee claimed for {file_guid[:8]}")
+                            else:
+                                log_warning(logger, "Beacon", f"Failed to claim inbox fee: error {err}")
+                        except Exception as e:
+                            log_warning(logger, "Beacon", f"Inbox fee claim exception: {e}")
+
 
                 except Exception as e:
                     log_error(

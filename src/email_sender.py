@@ -497,7 +497,7 @@ except ImportError:
         server_id: int = 0
         ip_address: str = ""
         port: int = 0
-        locker_code: bytes = b''  # 8-byte locker code for this stripe
+    
 
     @dataclass
     class TellResult:
@@ -1055,6 +1055,8 @@ def upload_file_to_servers(
             s_addr = server.get('ip_address', server.get('host', 'localhost'))
             s_port = server.get('port', 50000 + stripe_idx)
             s_id = server.get('server_index', server.get('server_id', stripe_idx))
+            # Get per-server locker code, fallback to passed locker_code
+            s_locker = server.get('locker_code', locker_code)
             if isinstance(s_id, str) and s_id.startswith("RAIDA"):
                 try: s_id = int(s_id.replace("RAIDA", ""))
                 except: s_id = stripe_idx
@@ -1062,6 +1064,7 @@ def upload_file_to_servers(
             s_addr = getattr(server, 'address', getattr(server, 'host', 'localhost'))
             s_port = getattr(server, 'port', 50000 + stripe_idx)
             s_id = getattr(server, 'index', getattr(server, 'server_id', stripe_idx))
+            s_locker = getattr(server, 'locker_code', locker_code)
 
         return upload_stripe_to_server(
             server_address=s_addr,
@@ -1071,10 +1074,10 @@ def upload_file_to_servers(
             stripe_index=stripe_idx,
             identity=identity,
             file_group_guid=file_group_guid,
-            locker_code=locker_code,
+            locker_code=s_locker,  # Use per-server locker code
             storage_duration=storage_duration,
             logger_handle=logger_handle,
-            verify_only=should_verify  # Pass the flag down
+            verify_only=should_verify
         )
 
     # Prepare tasks
@@ -1251,43 +1254,60 @@ def send_email_async(
             if err == ErrorCode.SUCCESS:
                 prepared_attachments.append(att_info)
 
+       # ============================================================
+        # STEP 5: PREPARE PER-SERVER STORAGE PAYMENTS (RAIDA Interaction)
         # ============================================================
-        # STEP 5: CALCULATE & CREATE LOCKER (RAIDA Interaction)
-        # ============================================================
-        update_state("CALCULATING", 15, "Calculating payment...")
+        update_state("CALCULATING", 15, "Calculating and preparing per-server payments...")
         
-        # Calculate cost based on the ENCRYPTED sizes
+        # Calculate total file size from ENCRYPTED sizes
         file_sizes = [body_info.file_size] + [att.file_size for att in prepared_attachments]
-        all_recipients = (request.to_recipients or []) + \
-                         (request.cc_recipients or []) + \
-                         (request.bcc_recipients or [])
+        total_size = sum(file_sizes)
         
-        err, payment_calc = calculate_total_payment(
-            file_sizes, 
-            request.storage_weeks, 
-            all_recipients,
-            db_handle, 
-            logger_handle
+        # Use new per-server payment preparation (storage fees only)
+        # Recipient fees are handled separately in send_tell_notifications()
+        from payment import prepare_server_payments, ServerPayment
+        
+        err, payments = prepare_server_payments(
+            db_handle=db_handle,
+            total_file_size_bytes=total_size,
+            storage_weeks=request.storage_weeks,
+            wallet_path="Data/Wallets/Default",
+            logger_handle=logger_handle,
+            config=config,
+            identity_sn=identity.serial_number
         )
         
-        if err != ErrorCode.SUCCESS: 
+        if err != ErrorCode.SUCCESS or not payments:
+            log_error(logger_handle, SENDER_CONTEXT, f"Payment preparation failed: {err}")
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
         
-        # --- EXECUTE LOCKER PUT ---
-        update_state("PAYMENT", 20, f"Locking funds ({payment_calc.total_cost} CC)...")
-        err, locker_code = request_locker_code(
-            payment_calc.total_cost, db_handle, logger_handle, config, identity.serial_number
-        )
-        if err != ErrorCode.SUCCESS: 
+        # Check all payments succeeded
+        failed_payments = [p for p in payments if not p.success]
+        if failed_payments:
+            log_error(logger_handle, SENDER_CONTEXT,
+                      f"{len(failed_payments)}/{len(payments)} payment PUTs failed")
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
         
-        # --- CRITICAL: LOCKER CREATED ---
-        # The money is now on the RAIDA. If we fail to connect to QMail after this, we MUST refund.
-        state.locker_code = locker_code
-        payment_made = True 
+        # --- CRITICAL: PAYMENTS CREATED ---
+        payment_made = True
         
-        locker_str_safe = locker_code[:8].decode('ascii', errors='ignore')
-        log_info(logger_handle, SENDER_CONTEXT, f"Payment successful. Locker: {locker_str_safe}")
+        # Build server info list from payments (has IP, port, locker code from DB)
+        servers = []
+        for p in payments:
+            servers.append({
+                'server_index': p.server_index,
+                'server_id': p.server_id,
+                'ip_address': p.ip_address,
+                'port': p.port,
+                'locker_code': p.locker_code  # Per-server locker code
+            })
+        
+        # Use first locker code for state tracking (for refund if needed)
+        state.locker_code = payments[0].locker_code if payments else b'\x00' * 8
+        
+        locker_str_safe = payments[0].locker_code_str if payments else "N/A"
+        log_info(logger_handle, SENDER_CONTEXT, 
+                 f"All {len(payments)} storage payments successful. Primary locker: {locker_str_safe}")
         
         storage_duration = weeks_to_duration_code(request.storage_weeks)
 
@@ -1315,7 +1335,7 @@ def send_email_async(
                 # Upload Body
                 err, upload_results = upload_file_to_servers(
                     body_info, servers, identity, state.file_group_guid,
-                    state.locker_code, storage_duration, thread_pool, logger_handle,
+                    None, storage_duration, thread_pool, logger_handle,
                     skip_payment_indices=skip_indices  # Pass the state down
                 )
                 
@@ -1509,65 +1529,79 @@ def send_tell_notifications(
         return ErrorCode.SUCCESS
 
     # 4. Build Server List (Locations of the uploaded file)
-    tell_servers = _build_tell_servers(upload_results, servers, locker_code, logger_handle)
+    tell_servers = _build_tell_servers(upload_results, servers, logger_handle)
 
     # 5. Process Each Recipient (Payment + Send)
     tells_sent = 0
     tells_failed = 0
     timestamp = int(time.time())
     wallet_path = "Data/Wallets/Default"
-
     for address, r_type in all_recipients:
         try:
             # --- A. Resolve User & Beacon ---
-            beacon_id = 'raida11' # Default
-            sending_fee = 0.1     # Default
+            beacon_id = 'raida11'  # Default
+            beacon_fee = 0.1      # Default beacon delivery fee
+            recipient_inbox_fee = 0.0  # Default recipient fee
             
             err, user = get_user_by_address(db_handle, address)
             if err == DatabaseErrorCode.SUCCESS and user:
                 if user.get('beacon_id'):
                     beacon_id = user['beacon_id']
-                if user.get('sending_fee'):
+                if user.get('beacon_fee'):  # Fee to pay beacon
                     try:
-                        sending_fee = float(user['sending_fee'])
+                        beacon_fee = float(user['beacon_fee'])
                     except: 
-                        sending_fee = 0.1
+                        beacon_fee = 0.1
+                if user.get('inbox_fee'):  # Fee to pay recipient
+                    try:
+                        recipient_inbox_fee = float(user['inbox_fee'])
+                    except:
+                        recipient_inbox_fee = 0.0
 
-            # --- B. Create Locker (Strict Notification Fee Payment) ---
-            # This creates a NEW locker (e.g. 0.1 CC) specifically to pay the Beacon.
-            # This is NOT the file storage locker.
-            err_code, locker_hex = asyncio.run(create_recipient_locker(
-                wallet_path, sending_fee, identity.serial_number, logger_handle
+            # --- B. Create Locker for BEACON PAYMENT ---
+            err_code, beacon_locker_hex = asyncio.run(create_recipient_locker(
+                wallet_path, beacon_fee, identity.serial_number, logger_handle
             ))
 
-            if err_code != 0 or not locker_hex:
+            if err_code != 0 or not beacon_locker_hex:
                 log_error(logger_handle, SENDER_CONTEXT, 
-                          f"Skipping Tell for {address}: Notification Fee Payment failed (Code {err_code})")
+                          f"Skipping Tell for {address}: Beacon Payment failed (Code {err_code})")
                 tells_failed += 1
                 continue
 
-            locker_key_bytes = bytes.fromhex(locker_hex)
+            beacon_locker_bytes = bytes.fromhex(beacon_locker_hex)[:8]  # 8 bytes for beacon
 
-            # --- C. Build Recipient Struct ---
-            # Parse 0006.4.12355 -> coin_id=6, denom=4, sn=12355
+            # --- C. Create Locker for RECIPIENT INBOX FEE ---
+            recipient_locker_bytes = bytes(16)  # Default: no payment
+            if recipient_inbox_fee > 0.00000001:
+                err_code, recipient_locker_hex = asyncio.run(create_recipient_locker(
+                    wallet_path, recipient_inbox_fee, identity.serial_number, logger_handle
+                ))
+                
+                if err_code != 0 or not recipient_locker_hex:
+                    log_warning(logger_handle, SENDER_CONTEXT, 
+                                f"Recipient inbox fee payment failed for {address}, continuing without it")
+                else:
+                    recipient_locker_bytes = bytes.fromhex(recipient_locker_hex)[:16]  # 16 bytes for recipient
+
+            # --- D. Build Recipient Struct ---
             coin_id, denom, serial_number = _parse_qmail_address(address)
 
-            # Uses the imported TellRecipient class
             tell_recipient = TellRecipient(
                 address_type=r_type,
                 coin_id=coin_id,
                 denomination=denom,
                 domain_id=0, 
                 serial_number=serial_number,
-                locker_payment_key=locker_key_bytes # The 0.1 CC key we just created
+                locker_payment_key=recipient_locker_bytes  # Recipient's inbox fee payment
             )
 
-            # --- D. Send Notification ---
+            # --- E. Send Notification ---
             beacon_raida_id = _beacon_id_to_raida_index(beacon_id)
 
             err = _send_single_tell(
                 beacon_raida_id, beacon_id, tell_recipient, file_group_guid,
-                tell_servers, locker_code, identity, timestamp, logger_handle
+                tell_servers, beacon_locker_bytes, identity, timestamp, logger_handle
             )
 
             if err == ErrorCode.SUCCESS:
@@ -1631,19 +1665,19 @@ def _send_single_tell(
     # locker_code: The File Access Code (allows recipient to download file)
     # recipient.locker_payment_key: The Notification Fee (0.1 CC for this Tell)
     err, request_bytes, challenge, nonce = build_complete_tell_request(
-        raida_id=raida_id,
-        denomination=getattr(identity, 'denomination', 1),
-        serial_number=getattr(identity, 'serial_number', 0),
-        device_id=0,
-        an=target_an,
-        file_group_guid=file_group_guid,
-        locker_code=locker_code,
-        timestamp=timestamp,
-        tell_type=TELL_TYPE_QMAIL,
-        recipients=[recipient],
-        servers=servers,
-        logger_handle=logger_handle
-    )
+    raida_id=raida_id,
+    denomination=getattr(identity, 'denomination', 1),
+    serial_number=getattr(identity, 'serial_number', 0),
+    device_id=0,
+    an=target_an,
+    file_group_guid=file_group_guid,
+    beacon_payment_locker=locker_code,  # This is the beacon payment (was just 'locker_code')
+    timestamp=timestamp,
+    tell_type=TELL_TYPE_QMAIL,
+    recipients=[recipient],
+    servers=servers,
+    logger_handle=logger_handle
+)
 
     if err != 0:
         return ErrorCode.ERR_PROTOCOL
@@ -1722,7 +1756,6 @@ def _send_udp_request(
 def _build_tell_servers(
     upload_results: List['UploadResult'],
     servers: List[Dict],
-    locker_code: bytes = None,
     logger_handle: Optional[object] = None
 ) -> List['TellServer']:
     """
@@ -1731,24 +1764,15 @@ def _build_tell_servers(
     Args:
         upload_results: List of UploadResult from uploads
         servers: List of server configurations
-        locker_code: 8-byte locker code for stripe decryption (required for recipients)
         logger_handle: Optional logger handle
 
     Returns:
-        List of TellServer objects with locker_code set for decryption
+        List of TellServer objects (server locations for stripe download)
     """
     tell_servers = []
 
     if not upload_results:
         return tell_servers
-
-    # Ensure locker_code is valid bytes
-    if locker_code is None:
-        locker_code = bytes(8)
-        log_warning(logger_handle, SENDER_CONTEXT,
-                    "No locker_code provided to _build_tell_servers - recipients won't be able to decrypt")
-    elif len(locker_code) < 8:
-        locker_code = locker_code.ljust(8, b'\x00')
 
     # Create server lookup dict
     server_lookup = {}
@@ -1781,8 +1805,8 @@ def _build_tell_servers(
             stripe_type=0 if stripe_index < 4 else 1,  # 0=Data, 1=Parity
             server_id=0,
             ip_address=ip,
-            port=port,
-            locker_code=locker_code[:8]  # Include locker code for recipient decryption
+            port=port
+            # No locker_code - not in protocol
         ))
 
     return tell_servers

@@ -108,7 +108,7 @@ class ServerFees:
     """
     server_id: str
     cost_per_mb: float = 1.0
-    cost_per_8_weeks: float = 1.0  # <--- FIXED FIELD NAME
+    cost_per_8_weeks: float = 1.0  
     is_available: bool = True
 
 @dataclass
@@ -125,6 +125,19 @@ class PaymentCalculation:
     def __post_init__(self):
         if self.server_breakdown is None:
             self.server_breakdown = {}
+
+
+@dataclass 
+class ServerPayment:
+    """Payment prepared for a single QMail server."""
+    server_index: int           # Index from database
+    server_id: str              # e.g., "RAIDA1" from database  
+    ip_address: str             # Server IP for upload
+    port: int                   # Server port for upload
+    amount: float               # Amount in CC
+    locker_code: bytes          # 8-byte locker code
+    locker_code_str: str        # String form "XXX-XXXX"
+    success: bool = False
 
 
 # ============================================================================
@@ -402,6 +415,185 @@ def request_locker_code(
     except Exception as e:
         log_error(logger_handle, PAYMENT_CONTEXT, "request_locker_code failed", str(e))
         return ErrorCode.ERR_INTERNAL, b''
+    
+
+
+
+async def _prepare_server_payments_async(
+    db_handle: object,
+    total_file_size_bytes: int,
+    storage_weeks: int,
+    wallet_path: str,
+    logger_handle: Optional[object] = None,
+    config: Optional[object] = None,
+    identity_sn: int = 0
+) -> Tuple[ErrorCode, List[ServerPayment]]:
+    """
+    Prepare payments for ALL available QMail storage servers from database.
+    
+    REUSES _create_locker_async() for each server's payment.
+    
+    Flow:
+    1. Fetch ALL available servers from DATABASE
+    2. Calculate amount per server based on its fees
+    3. Call _create_locker_async() for each server sequentially
+    4. Return list of ServerPayment with locker codes
+    """
+    CONTEXT = "MultiPayment"
+    
+    # --- 1. Fetch ALL available servers from DATABASE ---
+    try:
+        from database import get_all_servers, DatabaseErrorCode
+    except ImportError:
+        try:
+            from .database import get_all_servers, DatabaseErrorCode
+        except ImportError:
+            log_error(logger_handle, CONTEXT, "Cannot import database module")
+            return ErrorCode.ERR_INTERNAL, []
+    
+    err, db_servers = get_all_servers(db_handle, available_only=True)
+    
+    if err != DatabaseErrorCode.SUCCESS or not db_servers:
+        log_error(logger_handle, CONTEXT, "Failed to get servers from database")
+        return ErrorCode.ERR_NOT_FOUND, []
+    
+    num_servers = len(db_servers)
+    
+    if num_servers == 0:
+        log_error(logger_handle, CONTEXT, "No available servers in database")
+        return ErrorCode.ERR_NOT_FOUND, []
+    
+    log_info(logger_handle, CONTEXT,
+             f"Preparing payments for {num_servers} servers from database")
+    
+    # --- 2. Calculate amount for each server based on ITS fees ---
+    size_mb = total_file_size_bytes / (1024 * 1024)
+    duration_blocks = storage_weeks / 8.0
+    
+    server_amounts = []  # List of (server_dict, amount)
+    total_needed = 0.0
+    
+    for srv in db_servers:
+        cost_per_mb = float(srv.get('cost_per_mb', 1.0) or 1.0)
+        cost_per_8_weeks = float(srv.get('cost_per_8_weeks', 1.0) or 1.0)
+        
+        amount = (size_mb * cost_per_mb) + (duration_blocks * cost_per_8_weeks)
+        server_amounts.append((srv, amount))
+        total_needed += amount
+        
+        log_debug(logger_handle, CONTEXT,
+                  f"Server {srv.get('server_id')}: {amount:.8f} CC "
+                  f"(MB: {cost_per_mb}, 8wk: {cost_per_8_weeks})")
+    
+    log_info(logger_handle, CONTEXT,
+             f"Total payment needed: {total_needed:.8f} CC across {num_servers} servers")
+    
+    # --- 3. Create locker for each server using existing _create_locker_async ---
+    payments = []
+    
+    for srv, amount in server_amounts:
+        server_id = srv.get('server_id', '')
+        server_index = srv.get('server_index', 0)
+        ip_address = srv.get('ip_address', '')
+        port = srv.get('port', 0)
+        
+        if amount <= 0.00000001:
+            # Zero cost - generate placeholder locker code
+            code_str = "000-0000"
+            
+            payments.append(ServerPayment(
+                server_index=server_index,
+                server_id=server_id,
+                ip_address=ip_address,
+                port=port,
+                amount=0.0,
+                locker_code=code_str.encode('ascii'),
+                locker_code_str=code_str,
+                success=True
+            ))
+            log_debug(logger_handle, CONTEXT,
+                      f"Zero-cost for {server_id}, skipping payment")
+            continue
+        
+        # Use existing _create_locker_async for this server's payment
+        log_info(logger_handle, CONTEXT,
+                 f"Creating locker for {server_id}: {amount:.8f} CC")
+        
+        err, locker_code = await _create_locker_async(
+            amount=amount,
+            wallet_path=wallet_path,
+            logger_handle=logger_handle,
+            config=config,
+            identity_sn=identity_sn
+        )
+        
+        if err != ErrorCode.SUCCESS or not locker_code:
+            log_error(logger_handle, CONTEXT,
+                      f"Failed to create locker for {server_id}: {err}")
+            # Return partial list - caller can decide to refund
+            return err, payments
+        
+        # Extract string form from bytes
+        locker_str = locker_code[:8].decode('ascii', errors='ignore').strip('\x00')
+        
+        payments.append(ServerPayment(
+            server_index=server_index,
+            server_id=server_id,
+            ip_address=ip_address,
+            port=port,
+            amount=amount,
+            locker_code=locker_code,
+            locker_code_str=locker_str,
+            success=True
+        ))
+        
+        log_info(logger_handle, CONTEXT,
+                 f"Locker created for {server_id}: {locker_str}")
+    
+    log_info(logger_handle, CONTEXT,
+             f"All {len(payments)} server payments prepared successfully")
+    
+    return ErrorCode.SUCCESS, payments
+
+
+def prepare_server_payments(
+    db_handle: object,
+    total_file_size_bytes: int,
+    storage_weeks: int,
+    wallet_path: str = "Data/Wallets/Default",
+    logger_handle: Optional[object] = None,
+    config: Optional[object] = None,
+    identity_sn: int = 0
+) -> Tuple[ErrorCode, List[ServerPayment]]:
+    """
+    Synchronous wrapper for _prepare_server_payments_async.
+    
+    Handles event loop detection to avoid nested asyncio.run() errors.
+    """
+    try:
+        # Check if we're already in an async context
+        try:
+            loop = asyncio.get_running_loop()
+            # We're in an async context - use ThreadPoolExecutor
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    _prepare_server_payments_async(
+                        db_handle, total_file_size_bytes, storage_weeks,
+                        wallet_path, logger_handle, config, identity_sn
+                    )
+                )
+                return future.result(timeout=120)
+        except RuntimeError:
+            # No running loop - safe to use asyncio.run()
+            return asyncio.run(_prepare_server_payments_async(
+                db_handle, total_file_size_bytes, storage_weeks,
+                wallet_path, logger_handle, config, identity_sn
+            ))
+    except Exception as e:
+        log_error(logger_handle, PAYMENT_CONTEXT, f"prepare_server_payments failed: {e}")
+        return ErrorCode.ERR_INTERNAL, []
 
 def calculate_total_payment(
     file_sizes: List[int],
