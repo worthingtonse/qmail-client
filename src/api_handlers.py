@@ -92,57 +92,76 @@ from task_manager import create_task, start_task, complete_task, fail_task, stak
 # ============================================================================
 # HEALTH / STATUS ENDPOINTS
 # ============================================================================
-
-def handle_health(request_handler, context):
-    """
-    GET /api/health - Health check endpoint
-
-    Returns server status and version information.
-    """
-    response = {
-        "status": "healthy",
-        "service": "QMail Client Core",
-        "version": "1.0.0-phase1",
-        "timestamp": int(time.time())
-    }
-    request_handler.send_json_response(200, response)
-
-
 def handle_account_identity(request_handler, context):
     """
-    GET /api/account/identity - Get the user's own identity/email address
-
-    Returns the configured identity including the pretty email address.
+    GET /api/account/identity - Get the user's identity with verification
+    
+    Returns pretty email address in format: FirstName.LastName@Description#Base32.Class
+    For unregistered users: User.User@Unregistered#Base32.Class
     """
+    import os
+    from database import execute_query
+    from data_sync import convert_to_custom_base32
+    
     app_ctx = request_handler.server_instance.app_context
     identity = app_ctx.config.identity
 
-    # Check if identity is configured
     if not identity.serial_number:
         return request_handler.send_json_response(404, {
             "error": "Identity not configured",
             "message": "Use POST /api/setup/import-credentials to set up your identity"
         })
 
-    # If email_address is not set, try to look it up from the database
-    email_address = identity.email_address
-    if not email_address and identity.serial_number:
-        from src.database import execute_query
-        err, rows = execute_query(
-            app_ctx.db_handle,
-            "SELECT auto_address FROM Users WHERE SerialNumber = ?",
-            (identity.serial_number,)
-        )
-        if err == 0 and rows:
-            email_address = rows[0]['auto_address']
-            # Update runtime config
-            identity.email_address = email_address
+    # --- 1. VERIFY IDENTITY COIN FILE EXISTS IN BANK ---
+    identity_file = None
+    mailbox_bank = "Data/Wallets/Mailbox/Bank"
+    
+    if os.path.exists(mailbox_bank):
+        for f in os.listdir(mailbox_bank):
+            if f.endswith('.bin') and str(identity.serial_number) in f:
+                identity_file = f
+                break
 
+    # --- 2. GET PRETTY EMAIL ADDRESS FROM DATABASE ---
+    pretty_address = None
+    display_name = None
+    
+    err, rows = execute_query(
+        app_ctx.db_handle,
+        "SELECT auto_address, first_name, last_name FROM Users WHERE SerialNumber = ?",
+        (identity.serial_number,)
+    )
+    
+    if err == 0 and rows:
+        pretty_address = rows[0].get('auto_address')
+        first_name = rows[0].get('first_name', '')
+        last_name = rows[0].get('last_name', '')
+        if first_name or last_name:
+            display_name = f"{first_name} {last_name}".strip()
+    
+    # --- 3. GENERATE FALLBACK FOR UNREGISTERED USERS ---
+    if not pretty_address:
+        # Denomination to class name mapping
+        class_names = {0: 'Bit', 1: 'Byte', 2: 'Kilo', 3: 'Mega', 4: 'Giga'}
+        class_name = class_names.get(identity.denomination, 'Bit')
+        base32_sn = convert_to_custom_base32(identity.serial_number)
+        
+        # Format: User.User@Unregistered#Base32.Class
+        pretty_address = f"User.User@Unregistered#{base32_sn}.{class_name}"
+        display_name = "Unregistered User"
+
+    # --- 4. BUILD TECHNICAL ADDRESS ---
+    technical_address = f"0006.{identity.denomination}.{identity.serial_number}"
+
+    # --- 5. RETURN COMPLETE IDENTITY INFO ---
     return request_handler.send_json_response(200, {
         "serial_number": identity.serial_number,
         "denomination": identity.denomination,
-        "email_address": email_address,
         "device_id": identity.device_id,
+        "email_address": pretty_address,
+        "technical_address": technical_address,
+        "display_name": display_name,
+        "identity_file": identity_file,
         "configured": True
     })
 
@@ -188,10 +207,10 @@ def handle_ping(request_handler, context):
     import asyncio
     import time
     # Internal imports to avoid start-up crashes
-    from src.protocol import build_complete_ping_request, parse_tell_response, custom_sn_to_int
-    from src.network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
-    from src.network import ServerInfo
-    from src.logger import log_error, log_info
+    from protocol import build_complete_ping_request, parse_tell_response, custom_sn_to_int
+    from network_async import connect_async, disconnect_async, send_raw_request_async, NetworkErrorCode
+    from network import ServerInfo
+    from logger import log_error, log_info
 
     app_ctx = getattr(request_handler.server_instance, 'app_context', None)
     if not app_ctx:
@@ -215,7 +234,7 @@ def handle_ping(request_handler, context):
         an_bytes = an_block[start : start + 16] if len(an_block) >= (start + 16) else an_block[:16]
             
     except Exception as e:
-        from src.app import move_identity_to_fracked
+        from app import move_identity_to_fracked
         log_error(logger, "API", f"Identity AN load failure: {str(e)}. Moving to Fracked.")
         move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
         return request_handler.send_json_response(401, {"status": "healing", "details": str(e)})
@@ -243,7 +262,7 @@ def handle_ping(request_handler, context):
                 return {"status": "error", "message": "network_failure"}
 
             if resp_h.status == 200:
-                from src.app import move_identity_to_fracked
+                from app import move_identity_to_fracked
                 move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
                 return {"status": "healing", "message": "auth_failed"}
 
@@ -372,7 +391,7 @@ def handle_mail_send(request_handler, context):
                 # Reactive Healing check
                 is_fracked = any(getattr(r, 'status', 0) == 200 for r in (result.upload_results or []))
                 if is_fracked:
-                    from src.app import move_identity_to_fracked
+                    from app import move_identity_to_fracked
                     move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
 
                 fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
@@ -419,7 +438,7 @@ def handle_mail_download(request_handler, context):
 
         # --- REACTIVE HEALING INTEGRATION ---
         if status == 200:
-            from src.app import move_identity_to_fracked
+            from app import move_identity_to_fracked
             log_error(logger, "API",
                       "Download failed (200). Initiating healing.")
             move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
@@ -490,7 +509,7 @@ def handle_mail_payment_download(request_handler, context):
     Get locker code for downloading payment coins for a received email.
     Returns both ASCII and hex formats for user convenience.
     """
-    from src.logger import log_error
+    from logger import log_error
 
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
@@ -594,8 +613,8 @@ def _get_an_for_download(app_ctx):
     """
     FIXED: Added Non-empty checks to prevent 'NoneType' subscript errors.
     """
-    from src.coin_scanner import find_identity_coin
-    from src.protocol import custom_sn_to_int
+    from coin_scanner import find_identity_coin
+    from protocol import custom_sn_to_int
 
     identity = app_ctx.config.identity
     numeric_sn = custom_sn_to_int(identity.serial_number)
@@ -643,7 +662,7 @@ def handle_mail_list(request_handler, context):
         limit, offset = 50, 0
 
     # list_emails ab join karke 'contact_pretty' la raha hai
-    from src.database import list_emails, get_email_count, DatabaseErrorCode
+    from database import list_emails, get_email_count, DatabaseErrorCode
     err, emails = list_emails(db_handle, folder=folder, limit=limit, offset=offset)
 
     if err != DatabaseErrorCode.SUCCESS:
@@ -674,9 +693,9 @@ def handle_import_credentials(request_handler, request_context):
 
     The locker code must be exactly 8 characters in format XXX-XXXX (hyphen at index 3).
     """
-    from src.task_manager import stake_locker_identity
-    from src.coin_scanner import find_identity_coin
-    from src.logger import log_info, log_error
+    from task_manager import stake_locker_identity
+    from coin_scanner import find_identity_coin
+    from logger import log_info, log_error
     import re, os, json
 
     app_ctx = request_handler.server_instance.app_context
@@ -736,7 +755,7 @@ def handle_import_credentials(request_handler, request_context):
         dn = int(identity_coin.get('denomination', identity_coin.get('dn', 0)))
 
         # 3. PRETTY IDENTITY RESOLUTION (Lookup in Directory)
-        from src.database import execute_query
+        from database import execute_query
         err, rows = execute_query(app_ctx.db_handle, "SELECT auto_address FROM Users WHERE SerialNumber = ?", (sn,))
 
         if err == 0 and rows:
@@ -3329,7 +3348,7 @@ def register_all_routes(server):
         server: APIServer instance from api_server.py
     """
     # Health / Status
-    server.register_route('GET', '/api/health', handle_health)
+    # server.register_route('GET', '/api/health', handle_health)
     server.register_route("GET", '/api/admin/version-check', handle_version_check)
     server.register_route('GET', '/api/qmail/ping', handle_ping)
 

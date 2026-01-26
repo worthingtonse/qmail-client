@@ -346,13 +346,17 @@ def initialize_application(args):
     if identity_coin:
         detected_sn = identity_coin['serial_number']
         detected_dn = identity_coin.get('denomination', 0)
- 
-        # Agar config mein purana SN (9405) hai toh usey 2843 se badlein
         if config.identity.serial_number != detected_sn:
-            log_info(logger, "App", f"Personality Fix: Updating Config SN from {config.identity.serial_number} to {detected_sn}")
             config.identity.serial_number = detected_sn
-            # Pretty Address update karein (e.g., C23/C25)
-            config.identity.email_address = f"User#{convert_to_custom_base32(detected_sn)}"
+            config.identity.denomination = detected_dn
+            # Generate consistent pretty address format
+            from data_sync import convert_to_custom_base32
+            class_names = {0: 'Bit', 1: 'Byte', 2: 'Kilo', 3: 'Mega', 4: 'Giga'}
+            class_name = class_names.get(detected_dn, 'Bit')
+            base32_sn = convert_to_custom_base32(detected_sn)
+            config.identity.email_address = f"User.User@Unregistered#{base32_sn}.{class_name}"
+            from src.config import save_config
+            save_config(config, "config/qmail.toml")
             # CLEAR STALE STATE: Purani identity ka state naye SN par nahi chal sakta
             if os.path.exists(state_file_path):
                 try:
@@ -1210,6 +1214,8 @@ def main():
         f"  GET  {base_url}/api/wallet/heal/status      - Wallet health status")
     print(
         f"  POST {base_url}/api/wallet/discover         - Discover Bank coin status")
+    print(
+        f"  GET  {base_url}/api/account/identity        - Get your email address") 
     print(
         f"  POST {base_url}/api/task/cancel/{{id}}      - Cancel a pending task")
     print()
