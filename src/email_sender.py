@@ -743,8 +743,8 @@ FILE_INDEX_BODY = 1
 FILE_INDEX_ATTACHMENT_START = 10
 
 # Server configuration
-NUM_SERVERS = 5
-NUM_DATA_STRIPES = 4
+DEFAULT_NUM_SERVERS = 5 # for fall back only
+DEFAULT_NUM_DATA_STRIPES = 4 # for fall back only
 MAX_RETRIES = 3
 RETRY_BACKOFF_MS = 1000
 
@@ -862,12 +862,22 @@ def prepare_file_for_upload(
     file_data: bytes,
     file_name: str,
     file_index: int,
-    encryption_key: bytes, # Param kept for signature but ignored
-    logger_handle: Optional[object] = None
+    encryption_key: bytes,  # Param kept for signature but ignored
+    logger_handle: Optional[object] = None,
+    num_servers: int = 5  # NEW PARAMETER: Number of QMail servers
 ) -> Tuple[ErrorCode, Optional[FileUploadInfo]]:
     """
     Prepare a file for upload (stripe and calculate parity).
     
+    Creates (num_servers - 1) data stripes + 1 parity stripe = num_servers total stripes.
+    
+    Args:
+        file_data: Raw file bytes
+        file_name: Name of the file
+        file_index: Index for this file in the email package
+        encryption_key: (Unused) Kept for signature compatibility
+        logger_handle: Optional logger
+        num_servers: Number of QMail servers (determines stripe count)
     
     Implementation: Encryption is bypassed to ensure recipients can reassemble stripes
     and read content immediately.
@@ -884,15 +894,16 @@ def prepare_file_for_upload(
     # DIRECTIVE: Use raw data for striping. Encryption is transport-only (Type 0).
     info.encrypted_data = file_data 
 
-    # Create stripes (4 data stripes)
-    err, stripes = create_upload_stripes(info.encrypted_data, 5, logger_handle)
+    # Create data stripes based on server count
+    # create_upload_stripes creates (num_servers - 1) data stripes
+    err, stripes = create_upload_stripes(info.encrypted_data, num_servers, logger_handle)
     if err != ErrorCode.SUCCESS:
         log_error(logger_handle, "Sender", f"Striping failed for index {file_index}")
         return err, None
 
     info.stripes = stripes
 
-    # Calculate parity stripe
+    # Calculate parity stripe (XOR of all data stripes)
     err, parity = calculate_parity_from_bytes(stripes, logger_handle)
     if err != ErrorCode.SUCCESS:
         log_error(logger_handle, "Sender", f"Parity failed for index {file_index}")
@@ -900,9 +911,11 @@ def prepare_file_for_upload(
 
     info.parity_stripe = parity
 
-    log_debug(logger_handle, "Sender", f"Prepared '{file_name}' (plaintext) - 5 stripes total.")
+    total_stripes = len(stripes) + 1  # data stripes + parity
+    log_debug(logger_handle, "Sender", 
+              f"Prepared '{file_name}' (plaintext) - {total_stripes} stripes "
+              f"({len(stripes)} data + 1 parity) for {num_servers} servers.")
     return ErrorCode.SUCCESS, info
-
 
 def upload_stripe_to_server(
     server_address: str,
@@ -1039,9 +1052,9 @@ def upload_file_to_servers(
     # Safe set for checking indices
     skip_indices = set(skip_payment_indices) if skip_payment_indices else set()
 
-    if len(servers) < len(all_stripes):
+    if len(servers) != len(all_stripes):
         log_error(logger_handle, SENDER_CONTEXT, "upload_file_to_servers failed",
-                  f"Not enough servers: {len(servers)} < {len(all_stripes)}")
+                  f"Server/stripe count mismatch: {len(servers)} servers, {len(all_stripes)} stripes")
         return ErrorCode.ERR_INVALID_PARAM, []
 
     def upload_single(args):
@@ -1213,11 +1226,40 @@ def send_email_async(
         state.total_files = 1 + attachment_count 
         result.file_count = state.total_files
 
+       # ============================================================
+        # STEP 4: GET SERVER COUNT & PREPARE FILES
         # ============================================================
-        # STEP 4: PREPARE FILES (MOVED BEFORE PAYMENT)
-        # ============================================================
-        # Encrypt files now. If this fails, no money is lost.
-        update_state("PROCESSING", 10, "Processing files (Parity & Encryption)...")
+        # Get server count FIRST (needed for dynamic stripe creation)
+        update_state("PROCESSING", 10, "Getting server configuration...")
+        
+        # Import database functions
+        try:
+            from database import get_all_servers, DatabaseErrorCode
+        except ImportError:
+            from .database import get_all_servers, DatabaseErrorCode
+        
+        # Get available servers from database
+        err_db, db_servers = get_all_servers(db_handle, available_only=True)
+        
+        if err_db != DatabaseErrorCode.SUCCESS or not db_servers:
+            log_error(logger_handle, SENDER_CONTEXT, "Failed to get servers from database")
+            result.error_message = "No QMail servers available"
+            return SendEmailErrorCode.ERR_SERVER_UNREACHABLE, result
+        
+        num_servers = len(db_servers)
+        
+        if num_servers < 2:
+            log_error(logger_handle, SENDER_CONTEXT, 
+                      f"Not enough servers: {num_servers} (minimum 2 required)")
+            result.error_message = "Not enough QMail servers available"
+            return SendEmailErrorCode.ERR_SERVER_UNREACHABLE, result
+        
+        log_info(logger_handle, SENDER_CONTEXT, 
+                 f"Using {num_servers} servers for upload "
+                 f"({num_servers - 1} data stripes + 1 parity stripe)")
+
+        # Now prepare files with correct stripe count
+        update_state("PROCESSING", 12, "Processing files (Parity & Encryption)...")
         
         # --- Master Encryption Key Selection (Restored Old Logic) ---
         # Use RAIDA 0's 16-byte AN (the first 32 hex chars) for local file encryption.
@@ -1227,18 +1269,19 @@ def send_email_async(
         if not success_an:
              return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
              
-        encryption_key = all_ans_bytes[0:16] # 16 bytes for AES
+        encryption_key = all_ans_bytes[0:16]  # 16 bytes for AES
 
-        # Prepare Body
+        # Prepare Body with dynamic stripe count
         err, body_info = prepare_file_for_upload(
             request.email_file, "email_body.cbdf", FILE_INDEX_BODY,
-            encryption_key, logger_handle
+            encryption_key, logger_handle,
+            num_servers=num_servers  # Pass server count for stripe creation
         )
         if err != ErrorCode.SUCCESS:
-            result.error_message = "Failed to encrypt email body"
+            result.error_message = "Failed to prepare email body"
             return SendEmailErrorCode.ERR_ENCRYPTION_FAILED, result
 
-        # Prepare Attachments
+        # Prepare Attachments with same stripe count
         prepared_attachments = []
         for i, path in enumerate(request.attachment_paths or []):
             is_valid, res = _validate_file_path(path, logger_handle)
@@ -1249,12 +1292,13 @@ def send_email_async(
             
             err, att_info = prepare_file_for_upload(
                 file_data, os.path.basename(res), FILE_INDEX_ATTACHMENT_START + i,
-                encryption_key, logger_handle
+                encryption_key, logger_handle,
+                num_servers=num_servers  # Pass server count for stripe creation
             )
             if err == ErrorCode.SUCCESS:
                 prepared_attachments.append(att_info)
 
-       # ============================================================
+        # ============================================================
         # STEP 5: PREPARE PER-SERVER STORAGE PAYMENTS (RAIDA Interaction)
         # ============================================================
         update_state("CALCULATING", 15, "Calculating and preparing per-server payments...")
@@ -1276,9 +1320,18 @@ def send_email_async(
             config=config,
             identity_sn=identity.serial_number
         )
-        
+
         if err != ErrorCode.SUCCESS or not payments:
             log_error(logger_handle, SENDER_CONTEXT, f"Payment preparation failed: {err}")
+            
+            # User-friendly error message
+            if err == ErrorCode.ERR_NOT_FOUND:
+                result.error_message = "Insufficient CloudCoins. Please add more coins to your wallet or try a smaller file."
+            else:
+                result.error_message = "Payment failed due to network issues. Please check your connection and try again."
+            
+            result.error_code = SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS
+            update_state("FAILED", 0, result.error_message)
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
         
         # Check all payments succeeded
@@ -1286,7 +1339,13 @@ def send_email_async(
         if failed_payments:
             log_error(logger_handle, SENDER_CONTEXT,
                       f"{len(failed_payments)}/{len(payments)} payment PUTs failed")
+            
+            result.error_message = "Payment to servers failed. Your coins are safe - please try again in a few minutes."
+            result.error_code = SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS
+            update_state("FAILED", 0, result.error_message)
             return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
+        
+
         
         # --- CRITICAL: PAYMENTS CREATED ---
         payment_made = True
@@ -1482,83 +1541,137 @@ def send_tell_notifications(
 ) -> ErrorCode:
     """
     Send Tell notifications to all recipients.
-    FIXED: Imports TellRecipient/TellServer from qmail_types (not protocol).
+    
+    IMPROVED: Pre-flight coin verification before recipient payment loop.
+    
+    Flow:
+    1. Collect all recipients
+    2. Calculate TOTAL fees needed (beacon + inbox for all)
+    3. PRE-FLIGHT: Verify Bank coins, heal if needed
+    4. Process each recipient (payment + send)
     """
     import asyncio
     import time
     import json
     import os
     
-    # --- FIXED IMPORTS ---
     from qmail_types import ErrorCode, TellRecipient, TellServer
     from logger import log_info, log_debug, log_warning, log_error
     from database import get_user_by_address, insert_pending_tell, DatabaseErrorCode
-    
-    # Ensure helper functions are available
-    # from email_sender import create_recipient_locker, _build_tell_servers, _parse_qmail_address, _beacon_id_to_raida_index
 
-    SENDER_CONTEXT = "EmailSender"
+    SENDER_CONTEXT = "TellNotify"
 
+    # ================================================================
     # 1. Collect Recipients
+    # ================================================================
     all_recipients = []
-    for r in (request.to_recipients or []): all_recipients.append((r, 0)) # 0 = To
-    for r in (request.cc_recipients or []): all_recipients.append((r, 1)) # 1 = CC
-    for r in (request.bcc_recipients or []): all_recipients.append((r, 2)) # 2 = BCC
+    for r in (request.to_recipients or []): 
+        all_recipients.append((r, 0))  # 0 = To
+    for r in (request.cc_recipients or []): 
+        all_recipients.append((r, 1))  # 1 = CC
+    for r in (request.bcc_recipients or []): 
+        all_recipients.append((r, 2))  # 2 = BCC
 
     if not all_recipients:
         log_debug(logger_handle, SENDER_CONTEXT, "No recipients for Tell notifications")
         return ErrorCode.SUCCESS
 
-    log_info(logger_handle, SENDER_CONTEXT, f"Processing Tell notifications for {len(all_recipients)} recipients")
+    log_info(logger_handle, SENDER_CONTEXT, 
+             f"Processing Tell notifications for {len(all_recipients)} recipients")
 
-    # 2. Process Pending (Best Effort)
+    # ================================================================
+    # 2. Process Pending Tells (Best Effort)
+    # ================================================================
     if db_handle and cc_handle:
         try:
             _process_pending_tells(db_handle, cc_handle, identity, logger_handle)
         except Exception:
             pass
 
+    # ================================================================
     # 3. Validation
+    # ================================================================
     if db_handle is None:
         log_warning(logger_handle, SENDER_CONTEXT, "No database handle - cannot look up beacons")
         return ErrorCode.SUCCESS 
     
-    # Locker Code is required for the recipient to eventually DOWNLOAD the file
     if locker_code is None or len(locker_code) < 8:
-        log_warning(logger_handle, SENDER_CONTEXT, "No File Locker Code - recipients will not be able to download")
+        log_warning(logger_handle, SENDER_CONTEXT, 
+                    "No File Locker Code - recipients will not be able to download")
         return ErrorCode.SUCCESS
 
-    # 4. Build Server List (Locations of the uploaded file)
+    # ================================================================
+    # 4. Calculate TOTAL fees needed for PRE-FLIGHT
+    # ================================================================
+    wallet_path = "Data/Wallets/Default"
+    total_fees_needed = 0.0
+    recipient_fee_info = []  # Store (address, r_type, beacon_id, beacon_fee, inbox_fee)
+    
+    for address, r_type in all_recipients:
+        beacon_id = 'raida11'
+        beacon_fee = 0.1
+        inbox_fee = 0.0
+        
+        err, user = get_user_by_address(db_handle, address)
+        if err == DatabaseErrorCode.SUCCESS and user:
+            if user.get('beacon_id'):
+                beacon_id = user['beacon_id']
+            if user.get('beacon_fee'):
+                try:
+                    beacon_fee = float(user['beacon_fee'])
+                except:
+                    beacon_fee = 0.1
+            if user.get('inbox_fee'):
+                try:
+                    inbox_fee = float(user['inbox_fee'])
+                except:
+                    inbox_fee = 0.0
+        
+        total_fees_needed += beacon_fee
+        if inbox_fee > 0.00000001:
+            total_fees_needed += inbox_fee
+        
+        recipient_fee_info.append((address, r_type, beacon_id, beacon_fee, inbox_fee))
+    
+    log_info(logger_handle, SENDER_CONTEXT,
+             f"Total recipient fees needed: {total_fees_needed:.8f} CC "
+             f"({len(all_recipients)} recipients)")
+
+    # ================================================================
+    # 5. PRE-FLIGHT: Verify Bank coins and heal if needed
+    # ================================================================
+    if total_fees_needed > 0.00000001:
+        log_info(logger_handle, SENDER_CONTEXT, "PRE-FLIGHT: Verifying Bank coins for recipient fees...")
+        
+        preflight_ok = _preflight_verify_for_tells(
+            wallet_path=wallet_path,
+            total_amount_needed=total_fees_needed,
+            identity_sn=identity.serial_number,
+            logger_handle=logger_handle
+        )
+        
+        if not preflight_ok:
+            log_warning(logger_handle, SENDER_CONTEXT,
+                        f"PRE-FLIGHT WARNING: May not have enough coins for {total_fees_needed:.8f} CC. "
+                        f"Will attempt anyway...")
+        else:
+            log_info(logger_handle, SENDER_CONTEXT, "PRE-FLIGHT: Bank coins verified ✓")
+
+    # ================================================================
+    # 6. Build Server List (file locations)
+    # ================================================================
     tell_servers = _build_tell_servers(upload_results, servers, logger_handle)
 
-    # 5. Process Each Recipient (Payment + Send)
+    # ================================================================
+    # 7. Process Each Recipient (Payment + Send)
+    # ================================================================
     tells_sent = 0
     tells_failed = 0
     timestamp = int(time.time())
-    wallet_path = "Data/Wallets/Default"
-    for address, r_type in all_recipients:
+    
+    for address, r_type, beacon_id, beacon_fee, inbox_fee in recipient_fee_info:
         try:
-            # --- A. Resolve User & Beacon ---
-            beacon_id = 'raida11'  # Default
-            beacon_fee = 0.1      # Default beacon delivery fee
-            recipient_inbox_fee = 0.0  # Default recipient fee
-            
-            err, user = get_user_by_address(db_handle, address)
-            if err == DatabaseErrorCode.SUCCESS and user:
-                if user.get('beacon_id'):
-                    beacon_id = user['beacon_id']
-                if user.get('beacon_fee'):  # Fee to pay beacon
-                    try:
-                        beacon_fee = float(user['beacon_fee'])
-                    except: 
-                        beacon_fee = 0.1
-                if user.get('inbox_fee'):  # Fee to pay recipient
-                    try:
-                        recipient_inbox_fee = float(user['inbox_fee'])
-                    except:
-                        recipient_inbox_fee = 0.0
-
-            # --- B. Create Locker for BEACON PAYMENT ---
+            # --- A. Create Locker for BEACON PAYMENT ---
             err_code, beacon_locker_hex = asyncio.run(create_recipient_locker(
                 wallet_path, beacon_fee, identity.serial_number, logger_handle
             ))
@@ -1569,22 +1682,22 @@ def send_tell_notifications(
                 tells_failed += 1
                 continue
 
-            beacon_locker_bytes = bytes.fromhex(beacon_locker_hex)[:8]  # 8 bytes for beacon
+            beacon_locker_bytes = bytes.fromhex(beacon_locker_hex)[:8]
 
-            # --- C. Create Locker for RECIPIENT INBOX FEE ---
+            # --- B. Create Locker for RECIPIENT INBOX FEE ---
             recipient_locker_bytes = bytes(16)  # Default: no payment
-            if recipient_inbox_fee > 0.00000001:
+            if inbox_fee > 0.00000001:
                 err_code, recipient_locker_hex = asyncio.run(create_recipient_locker(
-                    wallet_path, recipient_inbox_fee, identity.serial_number, logger_handle
+                    wallet_path, inbox_fee, identity.serial_number, logger_handle
                 ))
                 
                 if err_code != 0 or not recipient_locker_hex:
                     log_warning(logger_handle, SENDER_CONTEXT, 
                                 f"Recipient inbox fee payment failed for {address}, continuing without it")
                 else:
-                    recipient_locker_bytes = bytes.fromhex(recipient_locker_hex)[:16]  # 16 bytes for recipient
+                    recipient_locker_bytes = bytes.fromhex(recipient_locker_hex)[:16]
 
-            # --- D. Build Recipient Struct ---
+            # --- C. Build Recipient Struct ---
             coin_id, denom, serial_number = _parse_qmail_address(address)
 
             tell_recipient = TellRecipient(
@@ -1593,10 +1706,10 @@ def send_tell_notifications(
                 denomination=denom,
                 domain_id=0, 
                 serial_number=serial_number,
-                locker_payment_key=recipient_locker_bytes  # Recipient's inbox fee payment
+                locker_payment_key=recipient_locker_bytes
             )
 
-            # --- E. Send Notification ---
+            # --- D. Send Notification ---
             beacon_raida_id = _beacon_id_to_raida_index(beacon_id)
 
             err = _send_single_tell(
@@ -1629,8 +1742,77 @@ def send_tell_notifications(
             log_error(logger_handle, SENDER_CONTEXT, f"Exception processing Tell for {address}: {e}")
             tells_failed += 1
 
-    log_info(logger_handle, SENDER_CONTEXT, f"Tell notifications: {tells_sent} sent, {tells_failed} failed")
+    log_info(logger_handle, SENDER_CONTEXT, 
+             f"Tell notifications: {tells_sent} sent, {tells_failed} failed")
     return ErrorCode.SUCCESS
+
+
+def _preflight_verify_for_tells(
+    wallet_path: str,
+    total_amount_needed: float,
+    identity_sn: int,
+    logger_handle: object
+) -> bool:
+    """
+    PRE-FLIGHT: Verify Bank coins for recipient Tell payments.
+    
+    Similar to payment pre-flight but simpler - just verify and heal.
+    
+    Returns:
+        True if enough healthy coins available
+        False if insufficient (but we'll try anyway)
+    """
+    CONTEXT = "TellPreFlight"
+    
+    try:
+        from heal import verify_bank_coins, heal_wallet
+        from coin_scanner import get_coins_by_value, parse_denomination_code
+    except ImportError:
+        try:
+            from .heal import verify_bank_coins, heal_wallet
+            from .coin_scanner import get_coins_by_value, parse_denomination_code
+        except ImportError:
+            log_warning(logger_handle, CONTEXT, "Cannot import heal module - skipping pre-flight")
+            return True  # Continue without pre-flight
+    
+    try:
+        # Step 1: Verify Bank coins
+        log_info(logger_handle, CONTEXT, "Verifying Bank coins...")
+        err, checked, moved = verify_bank_coins(wallet_path)
+        
+        log_info(logger_handle, CONTEXT, 
+                 f"Verified: {checked} coins checked, {moved} moved to Fracked")
+        
+        # Step 2: Heal if fracked found
+        if moved > 0:
+            log_info(logger_handle, CONTEXT, f"Found {moved} fracked coins. Healing...")
+            
+            result = heal_wallet(wallet_path, max_iterations=2)
+            
+            log_info(logger_handle, CONTEXT,
+                     f"Healed: {result.total_fixed}/{result.total_fracked} coins fixed")
+            
+            # Small wait for filesystem sync
+            import time
+            time.sleep(1.0)
+        
+        # Step 3: Check available coins
+        coins = get_coins_by_value(wallet_path, total_amount_needed, identity_sn=identity_sn)
+        
+        if not coins:
+            log_warning(logger_handle, CONTEXT,
+                        f"Insufficient healthy coins for {total_amount_needed:.8f} CC")
+            return False
+        
+        total_available = sum(parse_denomination_code(c.denomination) for c in coins)
+        log_info(logger_handle, CONTEXT,
+                 f"Available: {total_available:.8f} CC (need {total_amount_needed:.8f} CC) ✓")
+        
+        return True
+        
+    except Exception as e:
+        log_warning(logger_handle, CONTEXT, f"Pre-flight check failed: {e}")
+        return True  # Continue anyway
 
 def _send_single_tell(
     raida_id: int,

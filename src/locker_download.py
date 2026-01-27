@@ -311,15 +311,22 @@ def compute_coin_an(denomination: int, serial_number: int, seed: bytes) -> bytes
     """
     Computes the NEW Authenticity Number for a downloaded coin.
     Matches server formula: MD5(binary: 1-byte Denom + 4-byte SN + 16-byte Seed) + 0xFFFFFFFF
-    """
-    # 1. Binary concatenation: 1 byte Denom + 4 byte SN + 16 byte Seed = 21 bytes
-    # Use '>' for Big Endian to match the server's 'put_u32'
-    binary_input = struct.pack(">B", denomination) + struct.pack(">I", serial_number) + seed
     
-    # 2. Hash the 21-byte buffer
+    NOTE: Denomination can be negative (e.g., -1 for 0.1 CC).
+    We convert to unsigned byte using & 0xFF to match server behavior.
+    """
+    # 1. Convert signed denomination to unsigned byte
+    # -1 -> 255, -2 -> 254, 0 -> 0, 1 -> 1, etc.
+    denom_unsigned = denomination & 0xFF
+    
+    # 2. Binary concatenation: 1 byte Denom + 4 byte SN + 16 byte Seed = 21 bytes
+    # Use '>' for Big Endian to match the server's 'put_u32'
+    binary_input = struct.pack(">B", denom_unsigned) + struct.pack(">I", serial_number) + seed
+    
+    # 3. Hash the 21-byte buffer
     digest = bytearray(hashlib.md5(binary_input).digest())
     
-    # 3. CRUCIAL: Set the last 4 bytes to 0xFF for locker compatibility
+    # 4. CRUCIAL: Set the last 4 bytes to 0xFF for locker compatibility
     digest[12:16] = b'\xff\xff\xff\xff'
     
     return bytes(digest)

@@ -396,12 +396,16 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
     logger.info(
         f"Wallet folders verified: Bank, Fracked, Limbo, Fraud, Suspect, Grade")
 
-    # STEP 0: DISCOVER BANK COIN STATUS
-    # Check if Bank coins have unknown status and discover their true state
-    # This may move some coins to Fracked folder if they need healing
-    err, checked, moved = discover_bank_coin_status(wallet_path)
+   # STEP 0: MOVE FRACKED BANK COINS TO FRACKED FOLDER
+    # Check all Bank coins for 'f', 'n', or 'u' status and move them for healing
+    err, checked, moved = verify_bank_coins(wallet_path)
     if moved > 0:
-        logger.info(f"Discovered {moved} coins in Bank that need attention")
+        logger.info(f"Moved {moved} fracked Bank coins to Fracked folder for healing")
+    
+    # STEP 0.5: DISCOVER BANK COIN STATUS (for remaining unknown via network check)
+    err, checked2, moved2 = discover_bank_coin_status(wallet_path)
+    if moved2 > 0:
+        logger.info(f"Discovered {moved2} additional coins that need attention")
 
     # STEP 1-2: CHECK ENCRYPTION (DON'T FAIL IF ALL BROKEN - FIX AFTER HEALING)
     err, encryption_health = check_encryption(wallet_path)
@@ -608,6 +612,83 @@ def discover_bank_coin_status(wallet_path: str) -> Tuple[HealErrorCode, int, int
 # ============================================================================
 # MULTI-WALLET HEALING
 # ============================================================================
+
+def verify_bank_coins(wallet_path: str) -> Tuple[HealErrorCode, int, int]:
+    """
+    STEP 0.5: Move Bank coins with FRACKED status to Fracked folder for healing.
+    
+    Uses the same grading logic as Go code:
+    - Need 14+ passes (MIN_PASSED_NUM_TO_BE_AUTHENTIC)
+    - 0 fails
+    - 0 errors
+    - 'n' (no-response) and 'u' (untried) are NEUTRAL (ignored)
+    
+    Args:
+        wallet_path: Path to wallet folder
+        
+    Returns:
+        Tuple of (error_code, coins_checked, coins_moved_to_fracked)
+    """
+    logger.info("STEP 0.5: Checking Bank coins for fracked status...")
+    
+    bank_folder = os.path.join(wallet_path, FOLDER_BANK)
+    err, bank_coins = load_coins_from_folder(bank_folder)
+    
+    if err != HealErrorCode.SUCCESS or not bank_coins:
+        logger.info("  -> No coins in Bank folder")
+        return HealErrorCode.SUCCESS, 0, 0
+    
+    # Find coins that are FRACKED (using Go grading logic)
+    needs_healing = []
+    for coin in bank_coins:
+        pown = coin.pown or ''
+        pass_count = pown.count('p')
+        fail_count = pown.count('f')
+        error_count = pown.count('e')
+        
+        # Coin is FRACKED if:
+        # - Less than 14 passes, OR
+        # - Has any fails, OR
+        # - Has any errors
+        is_fracked = (pass_count < 14) or (fail_count > 0) or (error_count > 0)
+        
+        if is_fracked:
+            needs_healing.append(coin)
+    
+    if not needs_healing:
+        logger.info(f"  -> All {len(bank_coins)} Bank coins are healthy (14+ passes, 0 fails)")
+        return HealErrorCode.SUCCESS, len(bank_coins), 0
+    
+    logger.info(f"  -> Found {len(needs_healing)} fracked coins needing healing")
+    
+    # Move to Fracked folder
+    fracked_folder = os.path.join(wallet_path, FOLDER_FRACKED)
+    coins_moved = 0
+    
+    for coin in needs_healing:
+        pown = coin.pown or ''
+        pass_count = pown.count('p')
+        fail_count = pown.count('f')
+        error_count = pown.count('e')
+        no_resp = pown.count('n')
+        unknown = pown.count('u')
+        
+        reason = []
+        if pass_count < 14:
+            reason.append(f"only {pass_count} passes")
+        if fail_count > 0:
+            reason.append(f"{fail_count} fails")
+        if error_count > 0:
+            reason.append(f"{error_count} errors")
+        
+        logger.info(f"  -> Coin {coin.serial_number}: {pass_count}p/{fail_count}f/{no_resp}n/{unknown}u -> FRACKED ({', '.join(reason)})")
+        err = move_coin_file(coin, fracked_folder)
+        if err == HealErrorCode.SUCCESS:
+            coins_moved += 1
+    
+    logger.info(f"  -> Moved {coins_moved} coins to Fracked folder for healing")
+    return HealErrorCode.SUCCESS, len(bank_coins), coins_moved
+
 
 def get_wallets_base_path() -> str:
     """

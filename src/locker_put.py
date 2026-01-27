@@ -210,7 +210,7 @@ def send_put_request(
     host: str,
     port: int,
     request: bytes,
-    timeout: float = 10.0
+    timeout: float = 20.0
 ) -> Optional[bytes]:
     """Send PUT request and receive response."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

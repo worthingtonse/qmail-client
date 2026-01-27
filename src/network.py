@@ -317,7 +317,7 @@ def _build_request_header(
     header = bytearray(32)
 
     # Bytes 0-7: Routing bytes
-    header[0] = 0x00  # VR - Version (0)
+    header[0] = 0x01  # VR - Version (0) changed to one although the server never checks it anymore as that code was commented on server
     header[1] = 0x00  # SP - Split (0)
     header[2] = raida_id & 0xFF  # RI - RAIDA ID
     header[3] = 0x00  # SH - Shard (0)

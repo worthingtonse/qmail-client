@@ -85,7 +85,7 @@ except ImportError:
 # ============================================================================
 
 # QMail Command Group and Codes
-CMD_GROUP_FILES = 6       # Command Group for file operations
+
 CMD_GROUP_QMAIL = 6       # Alias for backward compatibility
 CMD_UPLOAD = 60           # PUT/Upload command code (0x3C)
 CMD_TELL = 61             # TELL command code - notify beacon of new message
@@ -216,12 +216,8 @@ def build_ping_body(denomination: int, serial_number: int, device_id: int, an: b
     body = bytearray(size)
     
     # 1. Identity Block Preamble (48 bytes)
-    challenge_data = os.urandom(12)
-    crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
-    body[0:12] = challenge_data
-    struct.pack_into('>I', body, 12, crc) 
-    
-    challenge = bytes(body[0:16])
+    challenge = _generate_challenge()
+    body[0:16] = challenge
     body[16:24] = bytes(8) 
     struct.pack_into('>H', body, 24, 0x0006) 
     body[26] = denomination & 0xFF
@@ -244,12 +240,8 @@ def build_peek_body(denomination: int, serial_number: int, device_id: int, an: b
     """Builds the 54-byte PEEK body with CRC-32 preamble and identity block."""
     body = bytearray(54)
     # 1. 48-byte Preamble (Identity Block)
-    challenge_data = os.urandom(12)
-    crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
-    body[0:12] = challenge_data
-    struct.pack_into('>I', body, 12, crc) 
-    
-    challenge = bytes(body[0:16])
+    challenge = _generate_challenge()
+    body[0:16] = challenge
     body[16:24] = bytes(8)
     struct.pack_into('>H', body, 24, 0x0006) 
     body[26] = denomination & 0xFF
@@ -386,7 +378,7 @@ def build_peek_header(
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
-    encryption_type: int = ENC_SHARED_SECRET, # Added for flexibility
+    encryption_type: int = ENC_NONE, # will change to ENC_SHARED_SECRET once we move to encrypted requests
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
@@ -434,7 +426,7 @@ def build_ping_header(
     body_length: int,
     denomination: int = 0,
     serial_number: int = 0,
-    encryption_type: int = ENC_SHARED_SECRET, # Added for flexibility
+    encryption_type: int = ENC_NONE, # will use ENC_SHARED_SECRET once we decide to use encrypted requests 
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes]:
     """
@@ -467,49 +459,40 @@ def build_ping_header(
 def build_peek_locker_request(
     raida_id: int,
     locker_id: bytes
-) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:
+) -> Tuple[int, bytes, bytes, bytes]:
     """
-    Build PEEK LOCKER command (0x53) to verify locker contents.
-    
-    Based on cmd_peek in cmd_locker.c line 395.
-    
-    Request format:
-    - Header (32 bytes): Standard RAIDA header with command 0x53
-    - Body (16 bytes): Locker ID (AN)
-    - EOF marker (2 bytes): 0xFF 0xFF
-    
-    Total: 50 bytes
-    
-    Args:
-        raida_id: RAIDA server index (0-24)
-        locker_id: 16-byte locker ID for this RAIDA
-        
-    Returns:
-        Tuple of (error_code, request_packet, challenge, nonce)
+    Build PEEK LOCKER command (83) using your specific byte-array construction method.
     """
-    if len(locker_id) != 16:
+    if not locker_id or len(locker_id) != 16:
         return ProtocolErrorCode.ERR_INVALID_PARAM, b'', b'', b''
-    
-    # Build header (32 bytes)
+
+    # 1. Prepare Header (32 bytes)
     header = bytearray(32)
-    header[0] = 0x53  # PEEK command
-    header[1] = raida_id
-    # Bytes 2-31: Reserved/zeros
     
-    # Build body (16 bytes locker ID + 2 bytes EOF)
-    body = bytearray(18)
-    body[0:16] = locker_id
-    body[16] = 0xFF  # EOF marker
-    body[17] = 0xFF
+    header[0] = 0x01                                  # Version (required)
+    header[1] = 0x00                                  # Split ID
+    header[2] = raida_id & 0xFF                       # RAIDA ID
+    # Byte 3 is Shard ID (default 0)
+    header[4] = CMD_GROUP_LOCKER                      # CG: 8
+    header[5] = CMD_LOCKER_PEEK                       # CM: 83 (0x53)
+    struct.pack_into('>H', header, 6, COIN_TYPE)      # Coin ID: 0x0006 (Bytes 6-7)
+    # Bytes 8-15 Reserved
+    header[16] = ENC_NONE                             # Encryption Type 0
+    # Bytes 17-21 Enc Meta/Reserved
+
+    # 2. Prepare Body
+    # Challenge (16) + Locker ID (16) + Terminator (2)
+    challenge = _generate_challenge()                 # Generates the required CRC structure
+    body = challenge + locker_id + TERMINATOR         # 0x3E3E terminator
     
-    # Combine
-    request = bytes(header + body)
-    
-    # Challenge and nonce (not used for PEEK)
-    challenge = bytes(16)
-    nonce = bytes(16)
-    
-    return ProtocolErrorCode.SUCCESS, request, challenge, nonce
+    # 3. Finalize Header Length
+    struct.pack_into('>H', header, 22, len(body))     # Body length (34) at bytes 22-23
+
+    # 4. Combine
+    request_packet = bytes(header + body)
+
+    # Return: Success, Packet, Challenge (for validation), Nonce (Empty for Type 0)
+    return ProtocolErrorCode.SUCCESS, request_packet, challenge, bytes(16)
 
 
 def parse_peek_locker_response(response_body: bytes) -> Tuple[int, List[Dict]]:
@@ -798,7 +781,7 @@ def build_upload_header(
     header[1] = 0x00                   # SP: Split ID (not used)
     header[2] = raida_id               # RI: RAIDA ID
     header[3] = 0x00                   # SH: Shard ID (not used)
-    header[4] = CMD_GROUP_FILES        # CG: Command Group (6 = Files)
+    header[4] = CMD_GROUP_QMAIL        # CG: Command Group (6)
     header[5] = CMD_UPLOAD             # CM: Command (60 = Upload)
     struct.pack_into('>H', header, 6, COIN_TYPE)              # ID: Coin ID
 
@@ -1287,13 +1270,8 @@ def build_tell_payload(
     # SECTION 1: 48-BYTE PREAMBLE (Identity Block)
     # =========================================================================
     # RAIDA requires a 12-byte random challenge followed by a 4-byte CRC-32
-    challenge_data = os.urandom(12)
-    crc = zlib.crc32(challenge_data) & 0xFFFFFFFF
-    
-    payload[0:12] = challenge_data
-    struct.pack_into('>I', payload, 12, crc) # Big-Endian CRC at bytes 12-15
-    
-    full_challenge = bytes(payload[0:16]) # Used for server response verification
+    challenge = _generate_challenge()
+    payload[0:16] = challenge
 
     # Preamble Identity (Binary format expected by RAIDA C-structs)
     struct.pack_into('>H', payload, 24, 0x0006) # Coin Type 
@@ -1492,7 +1470,7 @@ def build_download_header(
     header[1] = 0x00                              # SP: Split ID (not used)
     header[2] = raida_id                          # RI: RAIDA ID (0-24)
     header[3] = 0x00                              # SH: Shard ID (not used)
-    header[4] = CMD_GROUP_FILES                   # CG: Command Group (6 = Files)
+    header[4] = CMD_GROUP_QMAIL                 # CG: Command Group (6)
     header[5] = CMD_DOWNLOAD                      # CM: Command (64 = Download)
     struct.pack_into('>H', header, 6, COIN_TYPE)  # ID: Coin ID (0x0006)
 
@@ -1573,7 +1551,7 @@ def build_download_payload(
     payload = bytearray(payload_size)
 
     # 1. Preamble (48 bytes) - Challenge & Identity
-    challenge = os.urandom(16)
+    challenge = _generate_challenge()
     payload[0:16] = challenge
     
     # Session ID (8 bytes) - zeros for now

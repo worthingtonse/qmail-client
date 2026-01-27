@@ -281,47 +281,53 @@ async def _create_locker_async(
     logger_handle: object,
     config: object = None,
     identity_sn: int = 0
-) -> Tuple[ErrorCode, bytes]:
+) -> Tuple[ErrorCode, bytes, List]:
     """
     Async implementation of locker creation with iterative coin breaking.
-    FIXED: 
-      1. Uses top-level imports for CoinForPut/PutResult (from locker_put).
-      2. Corrected put_to_locker call (2 args only) to avoid type errors.
-      3. Includes Dust Threshold and Loop limits for stability.
+    
+    NOTE: Pre-flight healing is done BEFORE this function is called.
+    This function focuses on coin selection, breaking, and PUT.
+    
+    Returns:
+        Tuple of (error_code, locker_code_bytes, failed_coins)
+        - failed_coins: List of coins that failed PUT (for healing by caller)
     """
     import math
     import secrets
     import string
     import asyncio 
     
-    # Increased loops to handle deep recursive breaks (1.0 -> 0.0001)
-    MAX_LOOPS = 20
-    
-    # Threshold for "Close Enough". 
-    # If we are overpaying by less than 0.0001 (DN -4), just pay it.
-    DUST_THRESHOLD = 0.0001
+    MAX_LOOPS = 50
+    MIN_PASSES_FOR_SUCCESS = 13 # Matches Go: MIN_PASSED_NUM_TO_BE_AUTHENTIC
     
     try:
         for _ in range(MAX_LOOPS):
-            # 1. Get coins
+            # 1. Get coins (only healthy coins based on file POWN)
             coins = get_coins_by_value(wallet_path, amount, identity_sn=identity_sn)
             
             if not coins:
-                log_error(logger_handle, PAYMENT_CONTEXT, 
-                          f"Insufficient funds for amount {amount}")
-                return ErrorCode.ERR_NOT_FOUND, b''
+                 try:
+                     all_coins = get_coins_by_value(wallet_path, 0.0, identity_sn=identity_sn)
+                     available = sum(parse_denomination_code(c.denomination) for c in all_coins) if all_coins else 0.0
+                 except:
+                     available = 0.0    
+                 log_error(logger_handle, PAYMENT_CONTEXT,
+                            f"INSUFFICIENT_FUNDS: Need {amount:.8f} CC, have {available:.8f} CC")
+                 return ErrorCode.ERR_NOT_FOUND, b'', []
+
             
             total_value_selected = sum(parse_denomination_code(c.denomination) for c in coins)
             diff = total_value_selected - amount
 
             # 2. Check for Match OR Acceptable Overpayment
-            # We accept if we have enough AND the excess is just dust.
-            if diff >= -0.00000001 and diff < DUST_THRESHOLD:
+            acceptable_overpay = max(0.001, amount * 0.05)
+            
+            if diff >= -0.00000001 and diff < acceptable_overpay:
                 
                 log_info(logger_handle, PAYMENT_CONTEXT, 
                          f"Locking {total_value_selected:.8f} for payment of {amount:.8f} (Overpayment: {diff:.8f})")
 
-                # --- MATCH FOUND: LOCK IT ---
+                # Generate locker code
                 random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits) 
                                        for _ in range(7))
                 locker_code_str = random_chars[:3] + '-' + random_chars[3:]
@@ -334,63 +340,97 @@ async def _create_locker_async(
                     for c in coins
                 ]
                 
-                # --- FIX IS HERE ---
-                # 1. No invalid inner imports.
-                # 2. Pass ONLY coins and keys. 
-                #    The previous error "LoggerHandle... not integer" implies the 3rd arg 
-                #    is a timeout integer, not a logger or config object.
-                put_result, _ = await put_to_locker(coins_for_put, locker_keys)
+                # Attempt PUT
+                put_result, raida_results = await put_to_locker(coins_for_put, locker_keys)
                 
-                if put_result != PutResult.SUCCESS:
-                    log_error(logger_handle, PAYMENT_CONTEXT, f"Locker PUT failed: {put_result}")
-                    return ErrorCode.ERR_INTERNAL, b''
+                # ============================================================
+                # ANALYZE PUT RESULTS
+                # ============================================================
+                pass_count = sum(1 for s, _ in raida_results.values() if s == 241)
+                fail_count = sum(1 for s, _ in raida_results.values() if s == 242)
+                timeout_count = sum(1 for s, _ in raida_results.values() if s == -1)
+                other_count = 25 - pass_count - fail_count - timeout_count
+                
+                log_info(logger_handle, PAYMENT_CONTEXT,
+                         f"PUT results: {pass_count} pass, {fail_count} fail, "
+                         f"{timeout_count} timeout, {other_count} other")
+                
+                # ============================================================
+                # SUCCESS: Need at least 14 passes (matches Go code)
+                # ============================================================
+                if pass_count >= MIN_PASSES_FOR_SUCCESS:
+                    log_info(logger_handle, PAYMENT_CONTEXT,
+                             f"PUT SUCCESS with {pass_count}/25 passes (threshold: {MIN_PASSES_FOR_SUCCESS})")
+                    
+                    # Delete coins from disk
+                    for c in coins:
+                        try:
+                            if os.path.exists(c.file_path):
+                                os.remove(c.file_path)
+                        except: 
+                            pass
 
-                # Cleanup
-                for c in coins:
-                    try:
-                        if os.path.exists(c.file_path):
-                            os.remove(c.file_path)
-                    except: pass
-
-                locker_code_bytes = locker_code_str.encode('ascii').ljust(8, b'\x00')
-                return ErrorCode.SUCCESS, locker_code_bytes
+                    locker_code_bytes = locker_code_str.encode('ascii').ljust(8, b'\x00')
+                    return ErrorCode.SUCCESS, locker_code_bytes, []
+                
+                # ============================================================
+                # FAILURE: Not enough passes - analyze WHY
+                # ============================================================
+                log_error(logger_handle, PAYMENT_CONTEXT, 
+                          f"PUT FAILED: Only {pass_count} passes (need {MIN_PASSES_FOR_SUCCESS})")
+                
+                # Case A: Too many timeouts - network issue, don't blame coins
+                if timeout_count > 11:  # More than 11 timeouts = network problem
+                    log_error(logger_handle, PAYMENT_CONTEXT, 
+                              "PUT failed due to network issues (too many timeouts). "
+                              "Please check internet connection.")
+                    return ErrorCode.ERR_INTERNAL, b'', []
+                
+                # Case B: Too many fails - coins have wrong ANs, need healing
+                # Only heal if fails are the PRIMARY reason for failure
+                if fail_count > 11:  # More than 11 fails = coins are bad
+                    log_warning(logger_handle, PAYMENT_CONTEXT,
+                                f"PUT failed - coins have wrong ANs on {fail_count} RAIDAs. "
+                                f"Moving to Fracked for healing.")
+                    return ErrorCode.ERR_INTERNAL, b'', coins  # Return coins for healing
+                
+                # Case C: Mixed/inconclusive - retry without healing
+                # Could be temporary network + a few bad RAIDAs
+                log_warning(logger_handle, PAYMENT_CONTEXT,
+                            f"PUT inconclusive: {pass_count}p/{fail_count}f/{timeout_count}t. "
+                            f"Will retry...")
+                return ErrorCode.ERR_INTERNAL, b'', []
 
             # 3. SIGNIFICANT OVERPAYMENT: Must Break a Coin
-            elif diff >= DUST_THRESHOLD:
-                # Sort ASCENDING (Smallest first)
-                coins.sort(key=lambda x: parse_denomination_code(x.denomination), reverse=False)
-                
+            elif diff >= acceptable_overpay:
+                coins.sort(key=lambda x: parse_denomination_code(x.denomination), reverse=True)
                 coin_to_break = coins[0]
                 
                 log_info(logger_handle, PAYMENT_CONTEXT,
                          f"Have {total_value_selected:.8f}, need {amount:.8f}. "
-                         f"Breaking smallest available coin: SN {coin_to_break.serial_number} (Val: {parse_denomination_code(coin_to_break.denomination)})")
+                         f"Breaking coin SN={coin_to_break.serial_number}")
                 
-                # Execute Break (Command 90)
                 break_result = await break_coin(coin_to_break, wallet_path, config, logger_handle)
                 
-                # Check success (Handle object vs list result)
                 success = False
-                if hasattr(break_result, 'success'): success = break_result.success
-                elif isinstance(break_result, list) and break_result: success = True
+                if hasattr(break_result, 'success'): 
+                    success = break_result.success
+                elif isinstance(break_result, list) and break_result: 
+                    success = True
                 
                 if not success:
-                    log_error(logger_handle, PAYMENT_CONTEXT, "Coin break failed during payment")
-                    return ErrorCode.ERR_INTERNAL, b''
+                    log_error(logger_handle, PAYMENT_CONTEXT, "Coin break failed")
+                    return ErrorCode.ERR_INTERNAL, b'', []
                 
-                # Wait for FS to sync
                 await asyncio.sleep(0.5)
-                
-                # LOOP RESTARTS -> get_coins_by_value will be called again
                 continue
                 
-        # If loop finishes without returning
         log_error(logger_handle, PAYMENT_CONTEXT, "Unable to make exact change after max attempts")
-        return ErrorCode.ERR_INTERNAL, b''
+        return ErrorCode.ERR_INTERNAL, b'', []
 
     except Exception as e:
         log_error(logger_handle, PAYMENT_CONTEXT, f"Async locker creation crashed: {e}")
-        return ErrorCode.ERR_INTERNAL, b''
+        return ErrorCode.ERR_INTERNAL, b'', []
 def request_locker_code(
     amount: float,
     db_handle: Optional[object] = None,
@@ -417,8 +457,6 @@ def request_locker_code(
         return ErrorCode.ERR_INTERNAL, b''
     
 
-
-
 async def _prepare_server_payments_async(
     db_handle: object,
     total_file_size_bytes: int,
@@ -431,15 +469,39 @@ async def _prepare_server_payments_async(
     """
     Prepare payments for ALL available QMail storage servers from database.
     
-    REUSES _create_locker_async() for each server's payment.
+    ATOMIC GUARANTEE: Either ALL payments succeed or NONE.
+    
+    Features:
+    - PRE-FLIGHT: Verify/heal Bank coins ONCE before payment loop
+    - Retry on PUT failure (1 retry before rollback)
+    - Automatic rollback if any locker creation fails
+    - Move coins to Fracked and heal when PUT fails (AN mismatch)
     
     Flow:
     1. Fetch ALL available servers from DATABASE
-    2. Calculate amount per server based on its fees
-    3. Call _create_locker_async() for each server sequentially
-    4. Return list of ServerPayment with locker codes
+    2. Calculate TOTAL amount needed
+    3. PRE-FLIGHT: Verify Bank coins, heal if needed
+    4. Create locker for each server (with retry)
+    5. If ANY fails: ROLLBACK all successful lockers
     """
     CONTEXT = "MultiPayment"
+    
+    # Retry configuration
+    PUT_MAX_ATTEMPTS = 2
+    PUT_RETRY_DELAY = 2.0
+    ROLLBACK_MAX_ATTEMPTS = 2
+    ROLLBACK_RETRY_DELAY = 2.0
+    HEAL_WAIT_TIME = 1.0
+    
+    # Import locker download for rollback capability
+    try:
+        from locker_download import download_from_locker, LockerDownloadResult
+    except ImportError:
+        try:
+            from .locker_download import download_from_locker, LockerDownloadResult
+        except ImportError:
+            log_error(logger_handle, CONTEXT, "Cannot import locker_download module")
+            return ErrorCode.ERR_INTERNAL, []
     
     # --- 1. Fetch ALL available servers from DATABASE ---
     try:
@@ -466,7 +528,7 @@ async def _prepare_server_payments_async(
     log_info(logger_handle, CONTEXT,
              f"Preparing payments for {num_servers} servers from database")
     
-    # --- 2. Calculate amount for each server based on ITS fees ---
+    # --- 2. Calculate TOTAL amount needed for ALL servers ---
     size_mb = total_file_size_bytes / (1024 * 1024)
     duration_blocks = storage_weeks / 8.0
     
@@ -488,8 +550,27 @@ async def _prepare_server_payments_async(
     log_info(logger_handle, CONTEXT,
              f"Total payment needed: {total_needed:.8f} CC across {num_servers} servers")
     
-    # --- 3. Create locker for each server using existing _create_locker_async ---
+    # --- 3. PRE-FLIGHT: Verify Bank coins and heal if needed ---
+    log_info(logger_handle, CONTEXT, "PRE-FLIGHT: Verifying Bank coins...")
+    
+    preflight_success = await _preflight_verify_and_heal(
+        wallet_path=wallet_path,
+        total_amount_needed=total_needed,
+        identity_sn=identity_sn,
+        logger_handle=logger_handle
+    )
+    
+    if not preflight_success:
+        log_error(logger_handle, CONTEXT, 
+                  f"PRE-FLIGHT FAILED: Not enough healthy coins for {total_needed:.8f} CC")
+        return ErrorCode.ERR_NOT_FOUND, []
+    
+    log_info(logger_handle, CONTEXT, "PRE-FLIGHT: Bank coins verified ✓")
+    
+    # --- 4. Create locker for each server (with retry and rollback on failure) ---
     payments = []
+    failed_server_id = None
+    failure_error = None
     
     for srv, amount in server_amounts:
         server_id = srv.get('server_id', '')
@@ -497,8 +578,8 @@ async def _prepare_server_payments_async(
         ip_address = srv.get('ip_address', '')
         port = srv.get('port', 0)
         
+        # --- Handle zero-cost servers ---
         if amount <= 0.00000001:
-            # Zero cost - generate placeholder locker code
             code_str = "000-0000"
             
             payments.append(ServerPayment(
@@ -515,25 +596,61 @@ async def _prepare_server_payments_async(
                       f"Zero-cost for {server_id}, skipping payment")
             continue
         
-        # Use existing _create_locker_async for this server's payment
-        log_info(logger_handle, CONTEXT,
-                 f"Creating locker for {server_id}: {amount:.8f} CC")
+        # --- Create locker with retry ---
+        locker_code = None
+        last_error = None
         
-        err, locker_code = await _create_locker_async(
-            amount=amount,
-            wallet_path=wallet_path,
-            logger_handle=logger_handle,
-            config=config,
-            identity_sn=identity_sn
-        )
+        for attempt in range(PUT_MAX_ATTEMPTS):
+            if attempt > 0:
+                log_warning(logger_handle, CONTEXT,
+                            f"Retrying locker creation for {server_id} "
+                            f"(attempt {attempt + 1}/{PUT_MAX_ATTEMPTS})...")
+                await asyncio.sleep(PUT_RETRY_DELAY)
+            
+            log_info(logger_handle, CONTEXT,
+                     f"Creating locker for {server_id}: {amount:.8f} CC")
+            
+            err, locker_code, failed_coins = await _create_locker_async(
+                amount=amount,
+                wallet_path=wallet_path,
+                logger_handle=logger_handle,
+                config=config,
+                identity_sn=identity_sn
+            )
+            
+            if err == ErrorCode.SUCCESS and locker_code:
+                # Success - break out of retry loop
+                break
+            
+            # --- Handle PUT failure due to AN mismatch ---
+            if failed_coins and len(failed_coins) > 0:
+                log_warning(logger_handle, CONTEXT,
+                            f"PUT failed - coins have wrong ANs. Moving to Fracked and healing...")
+                
+                # Move coins to Fracked
+                await _move_coins_to_fracked(failed_coins, wallet_path, logger_handle)
+                
+                # Heal
+                await _attempt_heal_wallet(wallet_path, logger_handle)
+                
+                # Wait for filesystem sync
+                await asyncio.sleep(HEAL_WAIT_TIME)
+            
+            last_error = err
+            locker_code = None
+            log_warning(logger_handle, CONTEXT,
+                        f"Locker creation failed for {server_id}: {err} "
+                        f"(attempt {attempt + 1}/{PUT_MAX_ATTEMPTS})")
         
-        if err != ErrorCode.SUCCESS or not locker_code:
+        # --- Check if all attempts failed ---
+        if locker_code is None:
             log_error(logger_handle, CONTEXT,
-                      f"Failed to create locker for {server_id}: {err}")
-            # Return partial list - caller can decide to refund
-            return err, payments
+                      f"Failed to create locker for {server_id} after {PUT_MAX_ATTEMPTS} attempts")
+            failed_server_id = server_id
+            failure_error = last_error
+            break  # Exit loop to trigger rollback
         
-        # Extract string form from bytes
+        # --- Success - add to payments list ---
         locker_str = locker_code[:8].decode('ascii', errors='ignore').strip('\x00')
         
         payments.append(ServerPayment(
@@ -550,10 +667,224 @@ async def _prepare_server_payments_async(
         log_info(logger_handle, CONTEXT,
                  f"Locker created for {server_id}: {locker_str}")
     
+    # --- 5. Check if we need to rollback ---
+    if failed_server_id is not None:
+        payments_to_rollback = [p for p in payments if p.amount > 0]
+        
+        if payments_to_rollback:
+            log_warning(logger_handle, CONTEXT,
+                        f"Payment failed at {failed_server_id}. "
+                        f"Rolling back {len(payments_to_rollback)} successful lockers...")
+            
+            # --- ROLLBACK with retry ---
+            rollback_success_count = 0
+            rollback_fail_count = 0
+            failed_lockers = []
+            
+            for p in payments_to_rollback:
+                rollback_succeeded = False
+                
+                for attempt in range(ROLLBACK_MAX_ATTEMPTS):
+                    if attempt > 0:
+                        log_warning(logger_handle, CONTEXT,
+                                    f"Retrying rollback for {p.server_id} "
+                                    f"(attempt {attempt + 1}/{ROLLBACK_MAX_ATTEMPTS})...")
+                        await asyncio.sleep(ROLLBACK_RETRY_DELAY)
+                    
+                    try:
+                        log_info(logger_handle, CONTEXT,
+                                 f"Rollback: Recovering coins from {p.server_id} ({p.locker_code_str})")
+                        
+                        result, recovered_coins = await download_from_locker(
+                            locker_code=p.locker_code,
+                            wallet_path=wallet_path,
+                            db_handle=db_handle,
+                            logger_handle=logger_handle
+                        )
+                        
+                        if result == LockerDownloadResult.SUCCESS:
+                            coin_count = len(recovered_coins) if recovered_coins else 0
+                            log_info(logger_handle, CONTEXT,
+                                     f"Rollback SUCCESS for {p.server_id}: {coin_count} coins recovered")
+                            rollback_succeeded = True
+                            break
+                            
+                        elif result == LockerDownloadResult.ERR_LOCKER_EMPTY:
+                            log_warning(logger_handle, CONTEXT,
+                                        f"Rollback: Locker {p.locker_code_str} is empty")
+                            rollback_succeeded = True
+                            break
+                            
+                        else:
+                            log_warning(logger_handle, CONTEXT,
+                                        f"Rollback attempt {attempt + 1} failed: {result}")
+                            
+                    except Exception as e:
+                        log_warning(logger_handle, CONTEXT,
+                                    f"Rollback attempt {attempt + 1} exception: {e}")
+                
+                if rollback_succeeded:
+                    rollback_success_count += 1
+                else:
+                    rollback_fail_count += 1
+                    failed_lockers.append(p)
+            
+            # Log rollback summary
+            if rollback_fail_count > 0:
+                log_error(logger_handle, CONTEXT,
+                          f"ROLLBACK INCOMPLETE: {rollback_success_count} recovered, "
+                          f"{rollback_fail_count} failed. Manual recovery required!")
+                log_error(logger_handle, CONTEXT, "=" * 50)
+                log_error(logger_handle, CONTEXT, "MANUAL RECOVERY - SAVE THESE LOCKER CODES:")
+                for p in failed_lockers:
+                    log_error(logger_handle, CONTEXT,
+                              f"  Locker: {p.locker_code_str} | Server: {p.server_id} | Amount: {p.amount:.8f} CC")
+                log_error(logger_handle, CONTEXT, "=" * 50)
+            else:
+                log_info(logger_handle, CONTEXT,
+                         f"ROLLBACK COMPLETE: All {rollback_success_count} lockers recovered")
+        else:
+            log_info(logger_handle, CONTEXT,
+                     f"Payment failed at {failed_server_id}, but no paid lockers to rollback")
+        
+        return failure_error or ErrorCode.ERR_INTERNAL, []
+    
+    # --- 6. All payments successful ---
     log_info(logger_handle, CONTEXT,
              f"All {len(payments)} server payments prepared successfully")
     
     return ErrorCode.SUCCESS, payments
+
+
+async def _preflight_verify_and_heal(
+    wallet_path: str,
+    total_amount_needed: float,
+    identity_sn: int,
+    logger_handle: object
+) -> bool:
+    """
+    PRE-FLIGHT CHECK: Verify Bank coins are healthy and heal if needed.
+    
+    This runs ONCE before the payment loop to ensure all coins are ready.
+    
+    Returns:
+        True if enough healthy coins are available (after healing if needed)
+        False if insufficient funds even after healing
+    """
+    CONTEXT = "PreFlight"
+    
+    try:
+        from heal import verify_bank_coins, heal_wallet
+    except ImportError:
+        try:
+            from .heal import verify_bank_coins, heal_wallet
+        except ImportError:
+            log_warning(logger_handle, CONTEXT, "Cannot import heal module - skipping pre-flight")
+            return True  # Continue without pre-flight
+    
+    try:
+        # Step 1: Verify Bank coins and move fracked ones to Fracked folder
+        log_info(logger_handle, CONTEXT, "Verifying Bank coins...")
+        err, checked, moved = verify_bank_coins(wallet_path)
+        
+        log_info(logger_handle, CONTEXT, 
+                 f"Verified: {checked} coins checked, {moved} moved to Fracked")
+        
+        # Step 2: If fracked coins found, heal them
+        if moved > 0:
+            log_info(logger_handle, CONTEXT, 
+                     f"Found {moved} fracked coins. Healing...")
+            
+            result = heal_wallet(wallet_path, max_iterations=2)
+            
+            log_info(logger_handle, CONTEXT,
+                     f"Healed: {result.total_fixed}/{result.total_fracked} coins fixed")
+            
+            # Wait for filesystem to sync
+            await asyncio.sleep(1.0)
+        
+        # Step 3: Check if we have enough healthy coins now
+        coins = get_coins_by_value(wallet_path, total_amount_needed, identity_sn=identity_sn)
+        
+        if not coins:
+            log_error(logger_handle, CONTEXT,
+                      f"Insufficient healthy coins for {total_amount_needed:.8f} CC")
+            return False
+        
+        total_available = sum(parse_denomination_code(c.denomination) for c in coins)
+        log_info(logger_handle, CONTEXT,
+                 f"Available: {total_available:.8f} CC (need {total_amount_needed:.8f} CC) ✓")
+        
+        return True
+        
+    except Exception as e:
+        log_error(logger_handle, CONTEXT, f"Pre-flight check failed: {e}")
+        return False
+
+
+async def _move_coins_to_fracked( # this is only working as a helper to the prepare payment function otherwise a different function is mostly used for this purpose this is kind of redundant but serves the purpose
+    coins: List, 
+    wallet_path: str, 
+    logger_handle: object
+) -> int:
+    """Move coins from Bank to Fracked folder."""
+    import shutil
+    
+    CONTEXT = "CoinMove"
+    fracked_path = os.path.join(wallet_path, "Fracked")
+    os.makedirs(fracked_path, exist_ok=True)
+    
+    moved_count = 0
+    for c in coins:
+        try:
+            if os.path.exists(c.file_path):
+                dest = os.path.join(fracked_path, os.path.basename(c.file_path))
+                shutil.move(c.file_path, dest)
+                moved_count += 1
+                log_debug(logger_handle, CONTEXT, f"Moved SN={c.serial_number} to Fracked")
+        except Exception as e:
+            log_warning(logger_handle, CONTEXT, f"Failed to move SN={c.serial_number}: {e}")
+    
+    log_info(logger_handle, CONTEXT, f"Moved {moved_count}/{len(coins)} coins to Fracked")
+    return moved_count
+
+
+async def _attempt_heal_wallet(
+    wallet_path: str, 
+    logger_handle: object
+) -> bool:
+    """Attempt to heal fracked coins in wallet."""
+    CONTEXT = "Heal"
+    
+    try:
+        from heal import heal_wallet
+    except ImportError:
+        try:
+            from .heal import heal_wallet
+        except ImportError:
+            log_warning(logger_handle, CONTEXT, "Cannot import heal module")
+            return False
+    
+    try:
+        log_info(logger_handle, CONTEXT, "Starting heal process...")
+        result = heal_wallet(wallet_path, max_iterations=2)
+        
+        if result.total_fixed > 0:
+            log_info(logger_handle, CONTEXT,
+                     f"Healed {result.total_fixed}/{result.total_fracked} coins")
+            return True
+        elif result.total_fracked == 0:
+            log_info(logger_handle, CONTEXT, "No fracked coins to heal")
+            return True
+        else:
+            log_warning(logger_handle, CONTEXT,
+                        f"Healing incomplete: 0/{result.total_fracked} fixed")
+            return True
+            
+    except Exception as e:
+        log_error(logger_handle, CONTEXT, f"Healing failed: {e}")
+        return False
+
 
 
 def prepare_server_payments(

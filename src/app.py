@@ -825,12 +825,7 @@ def main():
     config = app_context.config
     logger = app_context.logger
 
-    # Print configuration summary
-    print()
-    print_config_summary(config)
-    print()
-
-    # Perform data sync (unless --skip-sync flag is used)
+        # Perform data sync (unless --skip-sync flag is used)
     if not args.skip_sync:
         print("[INIT] Syncing user and server data from RAIDA...")
         log_info(logger, "App", "Starting data sync...")
@@ -856,6 +851,11 @@ def main():
     else:
         print("[INIT] Skipping data sync (--skip-sync flag)")
         log_info(logger, "App", "Data sync skipped (--skip-sync flag)")
+
+    # Print configuration summary AFTER sync (so it shows correct server count)
+    print()
+    print_config_summary(config, app_context.db_handle)
+    print()
 
     # Start the server
     server.start()

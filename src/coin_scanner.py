@@ -411,12 +411,24 @@ def load_coin_from_file(file_path: str) -> Optional[Any]:
             return None
 
         # Parse internal POWN from Byte 16
+
         pown_bytes = data[16:29]
         pown_str = ""
         for i in range(25):
             byte_val = pown_bytes[i // 2]
             nibble = (byte_val >> 4) if (i % 2 == 0) else (byte_val & 0x0F)
-            pown_str += 'p' if nibble == 1 else ('f' if nibble == 0 else 'u')
+            
+            # Correct nibble decoding (matches cloudcoin.py _char_to_pown_nibble)
+            if nibble == 0xA:      # 10 = POWN_PASS
+                pown_str += 'p'
+            elif nibble == 0xF:    # 15 = POWN_FAIL
+                pown_str += 'f'
+            elif nibble == 0xC:    # 12 = POWN_NO_RESPONSE
+                pown_str += 'n'
+            elif nibble == 0x0:    # 0 = POWN_UNTRIED
+                pown_str += 'u'
+            else:
+                pown_str += 'u'    # Unknown status
 
         # Parse SN/DN from Byte 32 preamble
         denomination = struct.unpack('b', data[34:35])[0]
@@ -446,11 +458,14 @@ def load_coin_from_file(file_path: str) -> Optional[Any]:
 def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int = None) -> List:
     """
     Get coins from wallet that total the target value.
-    STRATEGY: Accumulate coins (Largest First) until target is met.
+    
+    STRATEGY: 
+    1. Only select coins with 25/25 pass status (no 'f', 'u', or 'n' in POWN)
+    2. Greedy fit - largest coins that FIT first
+    3. Minimizes overpayment and avoids breaking coins
     """
     import os
-    # Ensure parse_denomination_code is available
-    from coin_scanner import parse_denomination_code
+    from coin_scanner import parse_denomination_code, load_coin_from_file
     
     bank_path = os.path.join(wallet_path, "Bank")
     
@@ -459,45 +474,68 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
     
     all_coins = []
     
-    # 1. Scan and load all available coins
     for filename in os.listdir(bank_path):
         if not filename.endswith('.bin'):
             continue
             
         file_path = os.path.join(bank_path, filename)
-        
-        # Use the loader you provided (assumed to be in module scope)
         coin = load_coin_from_file(file_path)
         
         if coin is None:
             continue
         
-        # CRITICAL: Skip identity coin
+        # Skip identity coin
         if identity_sn and coin.serial_number == int(identity_sn):
             continue
         
-        # Get float value
+        # Check coin health - this has the same grading implementation as the go code 
+        pown = getattr(coin, 'pown_string', '') or ''
+        pass_count = pown.count('p')
+        fail_count = pown.count('f')
+        error_count = pown.count('e')
+        
+        # Need at least 14 passes (MIN_PASSED_NUM_TO_BE_AUTHENTIC) this variable is same as used in the go code
+        if pass_count < 14:
+            continue
+        
+        # If has fails or errors, it's fracked (not authentic)
+        if fail_count > 0 or error_count > 0:
+            continue
+        
+        # 'n' (no response) and 'u' (untried) are IGNORED - coin is still authentic
+        # This matches Go behavior where only 'f' and 'e' disqualify a coin
+        
         coin_value = parse_denomination_code(coin.denomination)
         all_coins.append((coin, coin_value))
 
-    # 2. Sort Descending (Largest First)
-    # This ensures we try to cover the amount with the fewest/largest coins possible
+    # Sort DESCENDING (Largest First)
     all_coins.sort(key=lambda x: x[1], reverse=True)
     
     selected_coins = []
-    current_sum = 0.0
+    remaining = target_value
     
-    # 3. Accumulate until we hit target
+    # GREEDY SELECTION: Only take coins that FIT within remaining
     for coin, val in all_coins:
-        selected_coins.append(coin)
-        current_sum += val
-        
-        # If we have enough (>= target), return the selection
-        # (The payment logic will handle breaking if we have too much)
-        if current_sum >= target_value - 0.00000001:
-            return selected_coins
+        if val <= remaining + 0.00000001:  # Coin fits
+            selected_coins.append(coin)
+            remaining -= val
+            
+            if remaining <= 0.00000001:  # Target reached exactly
+                return selected_coins
+    
+    # If we still have remaining > 0, we need ONE larger coin
+    if remaining > 0.00000001:
+        for coin, val in reversed(all_coins):  # Smallest to largest
+            if coin not in selected_coins and val >= remaining:
+                selected_coins.append(coin)
+                return selected_coins
+    
+    # Check if we have enough total
+    total = sum(parse_denomination_code(c.denomination) for c in selected_coins)
+    if total >= target_value - 0.00000001:
+        return selected_coins
 
-    # 4. Insufficient funds even after summing everything
+    # Insufficient funds (no healthy coins available)
     return []
 
 def find_identity_coin(wallet_path: str, target_sn: Optional[int] = None) -> Optional[dict]:
