@@ -658,7 +658,7 @@ def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool:
     return save_config(config, path)
 
 
-def print_config_summary(config: QMailConfig) -> None:
+def print_config_summary(config: QMailConfig, db_handle: Any = None) -> None:
     """Print a human-readable summary of the configuration."""
     print("=" * 60)
     print("QMail Client Configuration Summary")
@@ -672,15 +672,36 @@ def print_config_summary(config: QMailConfig) -> None:
     print(f"Encryption:   {'Enabled' if config.encryption.enabled else 'Disabled'} "
           f"(Mode {'A' if config.encryption.mode == 6 else 'B'})")
     print(f"Beacon:       {config.beacon.url}")
-    print(
-        f"RAID:         {config.raid.data_stripe_count}+{config.raid.parity_stripe_count} stripes")
+    
+    # RAID stripes are now DYNAMIC based on database server count
+    # Try to get actual server count from database
+    db_server_count = None
+    if db_handle:
+        try:
+            from database import get_all_servers, DatabaseErrorCode
+            err, servers = get_all_servers(db_handle, available_only=True)
+            if err == DatabaseErrorCode.SUCCESS and servers:
+                db_server_count = len(servers)
+        except:
+            pass
+    
+    if db_server_count:
+        print(f"RAID:         {db_server_count - 1}+1 stripes (dynamic, {db_server_count} servers)")
+    else:
+        print(f"RAID:         {config.raid.data_stripe_count}+{config.raid.parity_stripe_count} stripes (default)")
+    
     print(f"Thread pool:  {config.threading.pool_size} workers")
     print(f"API:          {'Enabled' if config.api.enabled else 'Disabled'} "
           f"on {config.api.host}")
     print(f"Log level:    {config.logging.level}")
     print(f"Sync URLs:    users={config.sync.users_url[:40]}...")
     print(f"              servers={config.sync.servers_url[:40]}...")
-    print(f"QMail servers: {len(config.qmail_servers)}")
+    
+    # Show both config file servers and database servers
+    if db_server_count:
+        print(f"QMail servers: {db_server_count} (from database)")
+    else:
+        print(f"QMail servers: {len(config.qmail_servers)} (from config)")
     print(f"RAIDA servers: {len(config.raida_servers)}")
     print("=" * 60)
 
