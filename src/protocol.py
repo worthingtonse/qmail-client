@@ -1146,6 +1146,7 @@ def build_tell_header(
     header[4] = CMD_GROUP_QMAIL
     header[5] = CMD_TELL
     struct.pack_into('>H', header, 6, 0x0006) 
+    header[8] = 0x00 | (os.urandom(1)[0] & 0x01)
 
     header[16] = encryption_type & 0xFF 
     header[17] = denomination & 0xFF

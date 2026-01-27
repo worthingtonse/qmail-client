@@ -414,7 +414,7 @@ def build_request_header(
     header = bytearray(REQUEST_HEADER_SIZE)
 
     # Routing bytes (0-7)
-    header[0] = 0x00                    # VR: Version (must be 0x00!)
+    header[0] = 0x01                    # VR: Version (doesnt matter actually because the validation at the server was commented out )
     header[1] = 0x00                    # SP: Split ID
     header[2] = raida_id & 0xFF         # RI: RAIDA ID
     header[3] = 0x00                    # SH: Shard ID
