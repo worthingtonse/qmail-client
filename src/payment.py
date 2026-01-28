@@ -423,6 +423,9 @@ async def _create_locker_async(
                     return ErrorCode.ERR_INTERNAL, b'', []
                 
                 await asyncio.sleep(0.5)
+                # Force filesystem sync on Windows
+                import gc
+                gc.collect()
                 continue
                 
         log_error(logger_handle, PAYMENT_CONTEXT, "Unable to make exact change after max attempts")

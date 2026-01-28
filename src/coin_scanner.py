@@ -474,11 +474,23 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
     
     all_coins = []
     
-    for filename in os.listdir(bank_path):
-        if not filename.endswith('.bin'):
+    # for filename in os.listdir(bank_path):
+    #     if not filename.endswith('.bin'):
+    #         continue
+            
+    #     file_path = os.path.join(bank_path, filename)
+
+    # Use scandir for fresh directory reading (avoids Windows caching)
+    try:
+        entries = list(os.scandir(bank_path))
+    except OSError:
+        return []
+    
+    for entry in entries:
+        if not entry.name.endswith('.bin'):
             continue
             
-        file_path = os.path.join(bank_path, filename)
+        file_path = entry.path
         coin = load_coin_from_file(file_path)
         
         if coin is None:
@@ -507,6 +519,8 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
         
         coin_value = parse_denomination_code(coin.denomination)
         all_coins.append((coin, coin_value))
+
+        print(f"[DEBUG] Found coin: SN={coin.serial_number}, DN={coin.denomination}, value={coin_value}, pown={pown[:10]}...") # just printing the coins and their pown status for debugging
 
     # Sort DESCENDING (Largest First)
     all_coins.sort(key=lambda x: x[1], reverse=True)
