@@ -325,9 +325,7 @@ def compute_coin_an(denomination: int, serial_number: int, seed: bytes) -> bytes
     
     # 3. Hash the 21-byte buffer
     digest = bytearray(hashlib.md5(binary_input).digest())
-    
-    # 4. CRUCIAL: Set the last 4 bytes to 0xFF for locker compatibility
-    digest[12:16] = b'\xff\xff\xff\xff'
+   
     
     return bytes(digest)
 

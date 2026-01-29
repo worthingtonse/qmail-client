@@ -596,7 +596,7 @@ def get_raida_server_config(raida_index: int, servers: List[ServerConfig]) -> Op
     return None
 
 
-def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool:
+def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool: # this function is not used anymore to get the qmail server list as they are directly synced from the host file and extracted from the database when required (keeping it here just in case)
     """
     Create a default qmail.toml configuration file with all required values.
 
@@ -633,10 +633,10 @@ def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool:
         (8, "13.234.55.11", 50008),
         (9, "124.187.106.233", 50009),
         (10, "94.130.179.247", 50010),
-        (11, "67.181.90.11", 50011),
+        (11, "67.181.90.11", 50011),# Beacon server
         (12, "3.16.169.178", 50012),
         (13, "113.30.247.109", 50013),
-        (14, "168.220.219.199", 50014),  # Beacon server
+        (14, "168.220.219.199", 50014),  
         (15, "185.37.61.73", 50015),
         (16, "193.7.195.250", 50016),
         (17, "5.161.63.179", 50017),

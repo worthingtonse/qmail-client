@@ -1878,17 +1878,19 @@ def _send_single_tell(
         finally:
             disconnect(conn)
 
-    # 4. FALLBACK: UDP Port 19000
-    log_info(logger_handle, "EmailSender", f"TCP failed, trying UDP for {beacon_id}")
-    
-    # Assuming _send_udp_request is available in the module scope
-    response = _send_udp_request(host, 19000, request_bytes, logger_handle)
-    if response:
-        _, status, _ = validate_tell_response(response, challenge, logger_handle)
-        if status == 250:
-            return ErrorCode.SUCCESS
-
     return ErrorCode.ERR_NETWORK
+
+    # # 4. FALLBACK: UDP Port 19000
+    # log_info(logger_handle, "EmailSender", f"TCP failed, trying UDP for {beacon_id}")
+    
+    # # Assuming _send_udp_request is available in the module scope
+    # response = _send_udp_request(host, 19000, request_bytes, logger_handle)
+    # if response:
+    #     _, status, _ = validate_tell_response(response, challenge, logger_handle)
+    #     if status == 250:
+    #         return ErrorCode.SUCCESS
+
+   
 
 def _send_udp_request(
     ip: str,
