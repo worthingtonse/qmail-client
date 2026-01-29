@@ -928,7 +928,8 @@ def upload_stripe_to_server(
     locker_code: bytes,
     storage_duration: int,
     logger_handle: Optional[object] = None,
-    verify_only: bool = False  # <--- NEW PARAMETER
+    verify_only: bool = False,
+    file_type: int = 0  # <--- UPDATED: Added file_type argument
 ) -> UploadResult:
     """
     Upload a single stripe with Adaptive Idempotency.
@@ -976,6 +977,7 @@ def upload_stripe_to_server(
                 locker_code=current_locker_code,
                 storage_duration=storage_duration,
                 stripe_data=stripe_data,
+                file_type=file_type,  # <--- PASS file_type
                 encryption_type=0,
                 logger_handle=logger_handle
             )
@@ -1037,7 +1039,8 @@ def upload_file_to_servers(
     storage_duration: int,
     thread_pool: Optional[ThreadPoolExecutor] = None,
     logger_handle: Optional[object] = None,
-    skip_payment_indices: List[int] = None  # <--- NEW PARAMETER
+    skip_payment_indices: List[int] = None,
+    file_type: int = 0  # <--- UPDATED: Added file_type argument
 ) -> Tuple[ErrorCode, List[UploadResult]]:
     """
     Upload a file's stripes to all servers in parallel.
@@ -1090,7 +1093,8 @@ def upload_file_to_servers(
             locker_code=s_locker,  # Use per-server locker code
             storage_duration=storage_duration,
             logger_handle=logger_handle,
-            verify_only=should_verify
+            verify_only=should_verify,
+            file_type=file_type  # <--- PASS file_type
         )
 
     # Prepare tasks
@@ -1395,7 +1399,8 @@ def send_email_async(
                 err, upload_results = upload_file_to_servers(
                     body_info, servers, identity, state.file_group_guid,
                     None, storage_duration, thread_pool, logger_handle,
-                    skip_payment_indices=skip_indices  # Pass the state down
+                    skip_payment_indices=skip_indices,
+                    file_type=1  # <--- Explicitly send Type 1 for body
                 )
                 
                 # Update success set
@@ -1433,10 +1438,12 @@ def send_email_async(
             # Upload Attachments (Only if body succeeded)
             # Standard single pass for attachments (can be improved with similar retry logic if needed)
             state.files_uploaded = 1
-            for att_info in prepared_attachments:
+            for i, att_info in enumerate(prepared_attachments): # <--- Changed iterator to get index
+                # TYPE 10 + i = .0.bin, .1.bin, etc.
                 err, att_results = upload_file_to_servers(
                     att_info, servers, identity, state.file_group_guid,
-                    state.locker_code, storage_duration, thread_pool, logger_handle
+                    state.locker_code, storage_duration, thread_pool, logger_handle,
+                    file_type=10 + i  # <--- Explicitly send Type 10+ for attachments
                 )
                 result.upload_results.extend(att_results)
                 state.files_uploaded += 1

@@ -826,6 +826,7 @@ def build_upload_payload(
     locker_code: bytes,
     storage_duration: int,
     stripe_data: bytes,
+    file_type: int = 0,  # <--- UPDATED: Added file_type argument
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes, bytes]:
     """
@@ -878,8 +879,11 @@ def build_upload_payload(
     # Locker Code (64-71)
     payload[64:72] = locker_code[:8] if locker_code else bytes(8)
 
-    # Reserved (72-74)
-    payload[72:75] = bytes(3)
+    # Reserved -> File Type (72-74)
+    # Byte 72 is reserved_file_type in server struct
+    payload[72] = file_type & 0xFF
+    payload[73] = 0x00
+    payload[74] = 0x00
 
     # Storage Duration (75)
     # KEPT AS IS: per your request not to hardcode 255
@@ -895,7 +899,7 @@ def build_upload_payload(
     # Terminator
     payload[-2:] = TERMINATOR
 
-    log_debug(logger_handle, PROTOCOL_CONTEXT, f"Built upload payload: {payload_size} bytes")
+    log_debug(logger_handle, PROTOCOL_CONTEXT, f"Built upload payload: {payload_size} bytes, type={file_type}")
     return ProtocolErrorCode.SUCCESS, bytes(payload), challenge
 
 def encrypt_payload(
@@ -1039,6 +1043,7 @@ def build_complete_upload_request(
     locker_code: bytes,
     storage_duration: int,
     stripe_data: bytes,
+    file_type: int = 0,  # <--- UPDATED: Added file_type argument
     encryption_type: int = 0,  # Default to plaintext Type 0
     logger_handle: Optional[object] = None
 ) -> Tuple[ProtocolErrorCode, bytes, bytes, bytes]:  # Added 4th return value for consistency
@@ -1055,6 +1060,7 @@ def build_complete_upload_request(
         locker_code: 8-byte locker code
         storage_duration: Duration code (0-5 or 255)
         stripe_data: Binary data to upload
+        file_type: File type code (0=meta, 1=qmail, 10+=attachments)
         encryption_type: Encryption type (0 for plaintext)
         logger_handle: Optional logger handle
 
@@ -1065,7 +1071,9 @@ def build_complete_upload_request(
     err, payload, challenge = build_upload_payload(
         denomination, serial_number, device_id, an,
         file_group_guid, locker_code, storage_duration,
-        stripe_data, logger_handle
+        stripe_data, 
+        file_type,  # <--- PASS file_type
+        logger_handle
     )
     if err != ProtocolErrorCode.SUCCESS:
         return err, b'', b'', b''
@@ -1089,6 +1097,7 @@ def build_complete_upload_request(
         # Plaintext Type 0: Send payload exactly as built
         final_body = payload
 
+    # 4. Assemble complete request
     complete_request = header + final_body
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
