@@ -1121,7 +1121,8 @@ def upload_file_to_servers(
     log_info(logger_handle, SENDER_CONTEXT,
              f"File upload complete: {success_count}/{len(results)} stripes succeeded")
 
-    if success_count < NUM_DATA_STRIPES:
+    num_data_stripes = len(servers) - 1
+    if success_count < num_data_stripes:
         return ErrorCode.ERR_NETWORK, results
 
     return ErrorCode.SUCCESS, results
