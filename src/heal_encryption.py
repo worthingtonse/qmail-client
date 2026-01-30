@@ -5,8 +5,8 @@ This module handles encryption status checking and shared secret
 establishment with RAIDA servers.
 
 Author: Claude Opus 4.5
-Version: 1.0.0
-Date: 2025-12-26
+Version: 1.1.0
+Date: 2025-01-30
 
 Encryption Overview:
     - RAIDA communication can be encrypted using shared secrets
@@ -17,6 +17,8 @@ Encryption Overview:
 Commands Used:
     - Get Encryption Ticket (44): Get encrypted ticket from working RAIDA
     - Fix Encryption (45): Establish shared secret with broken RAIDA
+
+
 """
 
 import os
@@ -26,7 +28,6 @@ import logging
 from typing import List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 
-# Import from heal modules
 # Import from heal modules
 try:
     from heal_protocol import (
@@ -55,13 +56,6 @@ try:
 except ImportError as e:
     print(f"Failed to import heal_network: {e}")
     raise
-# For encryption
-try:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
-    CRYPTO_AVAILABLE = True
-except ImportError:
-    CRYPTO_AVAILABLE = False
 
 # For concurrency
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -211,86 +205,83 @@ def check_encryption(wallet_path: str) -> Tuple[HealErrorCode, EncryptionHealth]
     health = EncryptionHealth()
 
     # Step 1: Check Bank folder first
-    # Rule: Coins in Bank folder MUST have all 25 RAIDA passing (0xA)
-    # Therefore, if Bank has ANY coins, all 25 RAIDA have shared secrets
-    bank_folder = os.path.join(wallet_path, FOLDER_BANK)
-    err, bank_coins = load_coins_from_folder(bank_folder)
+    bank_path = os.path.join(wallet_path, FOLDER_BANK)
+    bank_coins = load_coins_from_folder(bank_path) if os.path.isdir(bank_path) else []
 
-    if err == HealErrorCode.SUCCESS and bank_coins:
-        logger.info(f"  -> Found {len(bank_coins)} coins in Bank folder")
-        logger.info("  -> Bank coins exist - all 25 RAIDA have shared secrets")
+    if bank_coins:
+        # If we have ANY Bank coins, encryption is NOT lost for any RAIDA
+        # Bank coins are only there if they pass all 25 RAIDA
+        logger.info(f"  Found {len(bank_coins)} Bank coins")
         logger.info("  -> No lost encryption detected")
-        # All RAIDA have shared secrets (health.is_broken is already all False)
         return HealErrorCode.SUCCESS, health
 
-    # Step 2: Bank is empty - check Fracked folder for shared secrets
-    logger.info("  -> Bank folder empty, checking Fracked folder...")
-    fracked_folder = os.path.join(wallet_path, FOLDER_FRACKED)
-    err, fracked_coins = load_coins_from_folder(fracked_folder)
+    # Step 2: Bank is empty, check Fracked folder
+    logger.info("  Bank is empty, checking Fracked folder...")
+    fracked_path = os.path.join(wallet_path, FOLDER_FRACKED)
+    fracked_coins = load_coins_from_folder(fracked_path) if os.path.isdir(fracked_path) else []
 
-    if err != HealErrorCode.SUCCESS or not fracked_coins:
-        logger.warning("  -> No coins in Bank or Fracked folders - all RAIDA marked as broken")
-        health.is_broken = [True] * RAIDA_COUNT
+    if not fracked_coins:
+        # No coins at all - mark all RAIDA as broken
+        logger.warning("  No coins found in wallet!")
+        for i in range(RAIDA_COUNT):
+            health.is_broken[i] = True
         return HealErrorCode.SUCCESS, health
-
-    logger.info(f"  -> Found {len(fracked_coins)} coins in Fracked folder")
 
     # Step 3: Find shared secrets from Fracked coins
-    # For each RAIDA, we need at least ONE coin with 'p' (0xA) status
+    logger.info(f"  Found {len(fracked_coins)} Fracked coins")
     shared_secrets = find_shared_secrets(fracked_coins)
 
     # Step 4: Identify which RAIDA have NO passing coins (truly broken encryption)
     broken_count = 0
-    broken_raida = []
     for raida_id in range(RAIDA_COUNT):
         if shared_secrets[raida_id] is None:
             health.is_broken[raida_id] = True
             broken_count += 1
-            broken_raida.append(raida_id)
 
     if broken_count > 0:
-        logger.warning(f"  -> {broken_count} RAIDA have no shared secrets: {broken_raida}")
+        broken_list = health.get_broken_raida()
+        logger.info(f"  Encryption broken on {broken_count} RAIDA: {broken_list}")
         logger.info("     These RAIDA are fracked on ALL coins - encryption fix required")
     else:
-        logger.info("  -> All RAIDA have shared secrets (at least one passing coin each)")
+        logger.info("  All RAIDA have at least one passing coin - encryption OK")
 
     return HealErrorCode.SUCCESS, health
 
 
 # ============================================================================
-# HELPER FUNCTIONS FOR FIX ENCRYPTION
+# KEY PART SPLITTING
 # ============================================================================
 
 def split_an_into_key_parts(an: bytes) -> Tuple[bytes, bytes]:
     """
     Split a 16-byte AN into two 8-byte key parts.
 
-    The key parts are the actual halves of the AN we want to sync
-    with the broken RAIDA. Helper RAIDA will encrypt these using
-    their shared secret with the broken RAIDA.
+    The Fix Encryption protocol requires sending the AN in two halves,
+    each encrypted separately by different helper RAIDA.
 
     Args:
         an: 16-byte Authenticity Number
 
     Returns:
-        Tuple of (part_0: bytes[8], part_1: bytes[8])
+        Tuple of (part_0: bytes[0:8], part_1: bytes[8:16])
     """
-    if len(an) < AN_SIZE:
-        an = an.ljust(AN_SIZE, b'\x00')
-    return an[0:8], an[8:16]
+    if len(an) < 16:
+        an = an.ljust(16, b'\x00')
+    return an[:8], an[8:16]
 
+
+# ============================================================================
+# ID KEY SELECTION
+# ============================================================================
 
 # ID Key denomination - ID keys used for RAIDA-to-RAIDA encryption
-# These are special internal tokens with denomination 1 (smallest unit)
-# Each RAIDA has 1000 ID keys for inter-RAIDA communication
-ID_KEY_DENOMINATION = 1
+ID_KEY_DN = 1  # ID keys have denomination 1
 
-
-def select_id_key_sn(broken_raida_id: int) -> int:
+def select_id_key_sn(raida_id: int) -> int:
     """
-    Select a random ID key serial number for the broken RAIDA.
+    Select an ID key serial number for a specific RAIDA.
 
-    Each RAIDA has 1000 ID keys numbered:
+    ID Key ranges per RAIDA (from RAIDA design):
         RAIDA 0:  0-999
         RAIDA 1:  1000-1999
         ...
@@ -301,71 +292,14 @@ def select_id_key_sn(broken_raida_id: int) -> int:
     the key part for the broken RAIDA.
 
     Args:
-        broken_raida_id: RAIDA ID (0-24)
+        raida_id: Target RAIDA ID (0-24)
 
     Returns:
-        Random SN in the range [raida_id*1000, raida_id*1000+999]
+        Serial number in the RAIDA's ID key range
     """
-    base = broken_raida_id * 1000
-    return base + random.randint(0, 999)
-
-
-class CryptoUnavailableError(Exception):
-    """Raised when cryptography library is required but not available."""
-    pass
-
-
-def aes_ctr_encrypt(plaintext: bytes, key: bytes, nonce: bytes) -> bytes:
-    """
-    Encrypt data using AES-128-CTR mode.
-
-    Args:
-        plaintext: Data to encrypt
-        key: 16-byte AES key (coin AN)
-        nonce: 8-byte nonce (from request header)
-
-    Returns:
-        Encrypted data
-
-    Raises:
-        CryptoUnavailableError: If cryptography library is not installed
-    """
-    if not CRYPTO_AVAILABLE:
-        raise CryptoUnavailableError(
-            "Cryptography library required for Fix Encryption. "
-            "Install with: pip install cryptography"
-        )
-
-    # Pad nonce to 16 bytes for CTR mode (nonce || counter)
-    iv = nonce.ljust(16, b'\x00')
-    cipher = Cipher(algorithms.AES(key[:16]), modes.CTR(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    return encryptor.update(plaintext) + encryptor.finalize()
-
-
-def aes_ctr_decrypt(ciphertext: bytes, key: bytes, nonce: bytes) -> bytes:
-    """
-    Decrypt data using AES-128-CTR mode.
-
-    Args:
-        ciphertext: Data to decrypt
-        key: 16-byte AES key (coin AN)
-        nonce: 8-byte nonce (from response header)
-
-    Returns:
-        Decrypted data
-
-    Raises:
-        CryptoUnavailableError: If cryptography library is not installed
-    """
-    if not CRYPTO_AVAILABLE:
-        raise CryptoUnavailableError(
-            "Cryptography library required for Fix Encryption. "
-            "Install with: pip install cryptography"
-        )
-
-    # CTR mode decryption is same as encryption
-    return aes_ctr_encrypt(ciphertext, key, nonce)
+    base_sn = raida_id * 1000
+    # Pick a random key in the range for load distribution
+    return base_sn + random.randint(0, 999)
 
 
 # ============================================================================
@@ -432,14 +366,15 @@ def build_fix_encryption_body(
         - Coin DN: 1 byte
         - Coin SN: 4 bytes (big-endian)
         - Num Tickets: 1 byte
-        For each ticket (22 bytes each):
+        For each ticket (19 bytes each):
             - Helper RAIDA ID: 1 byte
             - Split ID: 1 byte (0 for AN[0:7], 1 for AN[8:15])
-            - Key Selector: 4 bytes
+            - Key Selector: 1 byte (ignored by server, uses hardcoded key)
             - Encrypted Key Part: 16 bytes
         - Terminator: 2 bytes (0x3E3E)
 
     NOTE: This request is UNENCRYPTED (Type 0).
+    NOTE: Server uses HARDCODED_TEST_KEY for decryption, key_selector is ignored.
 
     Args:
         fracked_coin: The coin we're fixing
@@ -463,7 +398,7 @@ def build_fix_encryption_body(
     # Num Tickets (1 byte)
     body.append(len(key_parts) & 0xFF)
 
-    # Each ticket (22 bytes)
+    # Each ticket (19 bytes): 1 helper_id + 1 split_id + 1 key_selector + 16 encrypted
     for kp in key_parts:
         # Helper RAIDA ID (1 byte)
         body.append(kp.helper_raida_id & 0xFF)
@@ -471,8 +406,8 @@ def build_fix_encryption_body(
         # Split ID (1 byte)
         body.append(kp.split_id & 0x01)
 
-        # Key Selector (4 bytes, big-endian) - using 1 for now
-        body.append(1)
+        # Key Selector (1 byte) - server ignores this, uses hardcoded key
+        body.append(0x00)
 
         # Encrypted Key Part (16 bytes)
         body.extend(kp.encrypted_key_part[:16])
@@ -493,10 +428,16 @@ def parse_get_encryption_ticket_response(
     """
     Parse response from Get Encryption Ticket command (CMD 44).
 
-    Response format:
+    Response format (from server cmd_key_exchange.c):
         - Header: 32 bytes
-        - Encrypted key part: 16 bytes
-        - Terminator: 2 bytes (0x3E3E)
+        - Encrypted key part: 16 bytes (NO terminator!)
+
+    The server encrypts the following 16-byte block:
+        [0-7]   = key_part (8 bytes)
+        [8]     = coin_den (1 byte)
+        [9-12]  = coin_sn (4 bytes)
+        [13]    = random (1 byte)
+        [14-15] = 0xEE 0xEE marker
 
     Args:
         response: Raw response bytes
@@ -504,7 +445,9 @@ def parse_get_encryption_ticket_response(
     Returns:
         Tuple of (error_code, 16-byte encrypted key part)
     """
-    if len(response) < 50:  # 32 header + 16 key + 2 terminator
+    # Server returns 32-byte header + 16-byte encrypted body (no terminator)
+    if len(response) < 48:
+        logger.debug(f"Response too short: {len(response)} bytes (need 48)")
         return HealErrorCode.ERR_NETWORK_ERROR, bytes(16)
 
     raida_id, status, cmd_group, body_size = parse_response_header(response)
@@ -514,20 +457,18 @@ def parse_get_encryption_ticket_response(
         logger.debug(f"Get Encryption Ticket failed with status: {status}")
         return HealErrorCode.ERR_ENCRYPTION_FAILED, bytes(16)
 
-    # Extract body
+    # Extract body (should be exactly 16 bytes)
     body = response[32:]
 
-    if len(body) < 18:  # 16 key + 2 terminator
-        return HealErrorCode.ERR_NETWORK_ERROR, bytes(16)
-
-    # Verify terminator
-    if body[-2:] != TERMINATOR:
-        logger.debug("Invalid terminator in Get Encryption Ticket response")
+    if len(body) < 16:
+        logger.debug(f"Body too short: {len(body)} bytes (need 16)")
         return HealErrorCode.ERR_NETWORK_ERROR, bytes(16)
 
     # Extract encrypted key part (first 16 bytes of body)
+    # NOTE: Server does NOT send terminator in CMD 44 response!
     encrypted_key_part = body[:16]
 
+    logger.debug(f"Got encrypted ticket: {encrypted_key_part.hex()}")
     return HealErrorCode.SUCCESS, encrypted_key_part
 
 
@@ -540,63 +481,58 @@ def parse_fix_encryption_response(
 
     Response format (from server cmd_key_exchange.c):
         - Header: 32 bytes
-        - Acceptance statuses: N bytes (0x00=fail, 0x01=success per key part)
+        - Acceptance statuses: N bytes (0x00=rejected, 0x01=accepted per ticket)
         NO hash, NO terminator in body
 
-    Server validates each key part by:
-        1. Decrypting with RAIDA-to-RAIDA shared key
-        2. Checking last byte is 0xFF marker
-        3. Comparing embedded DN/SN with cleartext DN/SN
+    Server validates each ticket by:
+        1. Decrypting with HARDCODED_TEST_KEY and HARDCODED_TEST_NONCE
+        2. Checking bytes [14-15] are 0xEE 0xEE marker
+        3. Comparing embedded DN/SN with request DN/SN
 
     Args:
         response: Raw response bytes
-        expected_key_parts: Number of key parts sent
+        expected_key_parts: Number of key parts sent in request
 
     Returns:
-        Tuple of (error_code, list of accepted statuses)
+        Tuple of (error_code, list of acceptance statuses)
     """
-    min_size = 32 + expected_key_parts  # header + N status bytes
-    if len(response) < min_size:
-        logger.debug(f"Response too short: {len(response)} < {min_size}")
+    if len(response) < 32:
         return HealErrorCode.ERR_NETWORK_ERROR, []
 
     raida_id, status, cmd_group, body_size = parse_response_header(response)
 
-    # Check for success status (STATUS_SUCCESS = 250 or 1)
-    if status not in (250, 1, 0):  # 0 = NO_ERROR in server
-        logger.debug(f"Fix Encryption failed with status: {status}")
-        return HealErrorCode.ERR_FIX_REJECTED, []
+    # Check for success status
+    if status not in (0, 1, 250):
+        logger.debug(f"Fix Encryption command failed with status: {status}")
+        return HealErrorCode.ERR_ENCRYPTION_FAILED, []
 
-    # Body is just the status bytes (no hash, no terminator)
+    # Extract body
     body = response[32:]
 
-    # Extract acceptance statuses (0x00=fail, 0x01=success)
+    if len(body) < expected_key_parts:
+        logger.debug(f"Body too short for {expected_key_parts} status bytes")
+        return HealErrorCode.ERR_NETWORK_ERROR, []
+
+    # Parse acceptance statuses
     accepted = []
     for i in range(expected_key_parts):
-        if i < len(body):
-            accepted.append(body[i] == 0x01)
-        else:
-            accepted.append(False)
+        is_accepted = (body[i] == 0x01)
+        accepted.append(is_accepted)
+        logger.debug(f"  Ticket {i}: {'ACCEPTED' if is_accepted else 'REJECTED'} (0x{body[i]:02X})")
 
-    logger.debug(f"Fix Encryption statuses: {accepted}")
     return HealErrorCode.SUCCESS, accepted
 
 
 def verify_fix_success(accepted_statuses: List[bool]) -> bool:
     """
-    Verify Fix Encryption succeeded based on acceptance statuses.
+    Verify that the fix encryption operation was successful.
 
-    The server validates each key part internally by:
-        1. Decrypting with RAIDA-to-RAIDA shared key
-        2. Checking last byte is 0xFF marker
-        3. Comparing embedded DN/SN with cleartext DN/SN
-        4. Writing the 8-byte key part to the coin record
-
-    The server returns 0x01 for success, 0x00 for failure per key part.
-    No hash is returned - validation is done server-side.
+    For a fix to be considered successful, ALL key parts must be accepted.
+    This is because the AN is split into two halves, and both must be
+    stored correctly for the coin to be usable.
 
     Args:
-        accepted_statuses: List of accepted status for each key part
+        accepted_statuses: List of acceptance statuses from server
 
     Returns:
         True if all key parts were accepted
@@ -613,6 +549,10 @@ def verify_fix_success(accepted_statuses: List[bool]) -> bool:
     return True
 
 
+# ============================================================================
+# ENCRYPTION FIX PROTOCOL - MAIN FUNCTIONS
+# ============================================================================
+
 def get_encryption_ticket(
     helper_raida_id: int,
     broken_raida_id: int,
@@ -628,7 +568,11 @@ def get_encryption_ticket(
     1. Build Get Encryption Ticket request body
     2. Build header with NO encryption (Type 0)
     3. Send UNENCRYPTED request to helper RAIDA
-    4. Parse response to extract encrypted key part
+    4. Server encrypts key_part using HARDCODED_TEST_KEY
+    5. Parse response to extract encrypted key part
+
+    NOTE: Client does NOT perform any encryption. Server uses hardcoded
+    test key for inter-RAIDA encryption during debugging.
 
     Args:
         helper_raida_id: RAIDA that will encrypt for us
@@ -693,6 +637,7 @@ def get_encryption_ticket(
 
     return HealErrorCode.SUCCESS, result
 
+
 def fix_encryption_on_raida(
     broken_raida_id: int,
     fracked_coin: CloudCoinBin,
@@ -704,16 +649,16 @@ def fix_encryption_on_raida(
     Process:
     1. Build Fix Encryption request body (UNENCRYPTED)
     2. Build header with encryption type = 0
-    3. Use nonce from first helper's CMD 44 request
-    4. Send UNENCRYPTED request to broken RAIDA
-    5. Check response body for acceptance status (0x01 = accepted per key part)
+    3. Send UNENCRYPTED request to broken RAIDA
+    4. Server decrypts tickets using HARDCODED_TEST_KEY
+    5. Check response body for acceptance status (0x01 = accepted per ticket)
 
     Server-side validation (per cmd_key_exchange.c):
-        - Decrypts each key part using RAIDA-to-RAIDA shared key
-        - Checks last byte is 0xFF marker
+        - Decrypts each ticket using HARDCODED_TEST_KEY + HARDCODED_TEST_NONCE
+        - Checks bytes [14-15] are 0xEE 0xEE marker
         - Compares embedded DN/SN with cleartext DN/SN
-        - Writes 8-byte key part to coin record if valid
-        - Returns 0x01 (accepted) or 0x00 (rejected) per key part
+        - Writes 8-byte key_part to coin record if valid
+        - Returns 0x01 (accepted) or 0x00 (rejected) per ticket
 
     Args:
         broken_raida_id: RAIDA ID that needs encryption fix
@@ -730,6 +675,8 @@ def fix_encryption_on_raida(
     # Build request body (unencrypted)
     body, challenge = build_fix_encryption_body(fracked_coin, encrypted_key_parts)
 
+    logger.debug(f"CMD 45 body ({len(body)} bytes): {body.hex()}")
+
     # Build header with NO encryption
     header = build_request_header(
         raida_id=broken_raida_id,
@@ -739,329 +686,299 @@ def fix_encryption_on_raida(
         encryption_type=ENC_NONE
     )
 
-    # Use nonce from first helper's request
-    # Server uses this nonce for CTR mode decryption of key parts
-    if encrypted_key_parts[0].nonce:
-        header = bytearray(header)
-        header[24:32] = encrypted_key_parts[0].nonce
-        header = bytes(header)
-        logger.debug(f"Using nonce from helper RAIDA{encrypted_key_parts[0].helper_raida_id}")
+    logger.debug(f"CMD 45 header ({len(header)} bytes): {header.hex()}")
 
     request = header + body
-
-    logger.debug(f"CMD 45 request to RAIDA{broken_raida_id}:")
-    logger.debug(f"  Header ({len(header)} bytes): {header.hex()}")
-    logger.debug(f"  Body ({len(body)} bytes): {body.hex()}")
-
     err, response = send_request(broken_raida_id, request)
 
     if err != HealErrorCode.SUCCESS:
-        logger.debug(f"Network error fixing RAIDA{broken_raida_id}: {err}")
+        logger.debug(f"Network error sending fix to RAIDA{broken_raida_id}: {err}")
         return err, False
 
-    # Check response
-    if len(response) < 34:  # 32 header + at least 2 status bytes
-        logger.debug(f"Response too short from RAIDA{broken_raida_id}: {len(response)} bytes")
-        return HealErrorCode.ERR_NETWORK_ERROR, False
+    logger.debug(f"CMD 45 response ({len(response)} bytes): {response[:64].hex() if response else 'empty'}")
 
-    raida_id, status, cmd_group, body_size = parse_response_header(response)
-    response_body = response[32:]
+    # Parse response
+    err, accepted = parse_fix_encryption_response(response, len(encrypted_key_parts))
 
-    logger.debug(f"RAIDA{broken_raida_id} response: status={status}, body_size={body_size}")
-    logger.debug(f"Response body ({len(response_body)} bytes): {response_body.hex()}")
+    if err != HealErrorCode.SUCCESS:
+        logger.debug(f"Failed to parse fix response from RAIDA{broken_raida_id}: {err}")
+        return err, False
 
-    # Check header status first
-    if status not in (0, 1, 250):
-        logger.warning(f"Fix Encryption FAILED for RAIDA{broken_raida_id}: status={status}")
-        return HealErrorCode.ERR_FIX_REJECTED, False
+    # Check if all key parts were accepted
+    success = verify_fix_success(accepted)
 
-    # Check body bytes: each key part has a status byte (0x00=rejected, 0x01=accepted)
-    # Per Go client: result.Data.Data[0] != 1 || result.Data.Data[1] != 1
-    num_parts = len(encrypted_key_parts)
-    if len(response_body) < num_parts:
-        logger.warning(f"Response body too short: {len(response_body)} < {num_parts}")
-        return HealErrorCode.ERR_NETWORK_ERROR, False
-
-    all_accepted = True
-    for i in range(num_parts):
-        accepted = response_body[i] == 0x01
-        logger.debug(f"  Key part {i}: {'ACCEPTED' if accepted else 'REJECTED'} (0x{response_body[i]:02x})")
-        if not accepted:
-            all_accepted = False
-
-    if all_accepted:
-        logger.info(f"Fix Encryption SUCCESS for RAIDA{broken_raida_id}: all {num_parts} key parts accepted")
-        return HealErrorCode.SUCCESS, True
+    if success:
+        logger.info(f"Fix Encryption SUCCESS on RAIDA{broken_raida_id}")
     else:
-        logger.warning(f"Fix Encryption FAILED for RAIDA{broken_raida_id}: not all key parts accepted")
-        return HealErrorCode.ERR_FIX_REJECTED, False
+        logger.warning(f"Fix Encryption FAILED on RAIDA{broken_raida_id}: {accepted}")
+
+    return HealErrorCode.SUCCESS if success else HealErrorCode.ERR_ENCRYPTION_FAILED, success
 
 
 # ============================================================================
-# MAIN FIX ENCRYPTION FUNCTION
+# PARALLEL TICKET RETRIEVAL
 # ============================================================================
 
-def select_helpers(
+def select_helper_raida(
+    broken_raida_id: int,
     working_raida: List[int],
-    fracked_coin: CloudCoinBin,
-    count: int = 6
+    count: int = 2
 ) -> List[int]:
     """
-    Select helper RAIDA for fix encryption.
+    Select helper RAIDA to get encryption tickets from.
 
-    Selects more helpers than needed (default 6) to handle timeouts.
-    The actual ticket retrieval will use the first successful responses.
+    Strategy:
+    - Need at least 2 helpers (one for each AN half)
+    - Exclude the broken RAIDA
+    - Prefer RAIDA that are "close" in ID (faster network)
 
     Args:
-        working_raida: List of working RAIDA IDs
-        fracked_coin: Coin to use for encryption
-        count: Number of helpers to select (default 6 for redundancy)
+        broken_raida_id: RAIDA we're trying to fix
+        working_raida: List of RAIDA IDs with working encryption
+        count: Number of helpers to select
 
     Returns:
         List of helper RAIDA IDs
     """
-    # Filter to RAIDA where coin has 'p' status
-    valid_helpers = [r for r in working_raida if fracked_coin.pown[r] == 'p']
+    available = [r for r in working_raida if r != broken_raida_id]
 
-    if len(valid_helpers) <= count:
-        return valid_helpers
+    if len(available) < count:
+        logger.warning(f"Not enough helpers: need {count}, have {len(available)}")
+        return available
 
-    # Randomly select helpers (more than 2 for redundancy)
-    return random.sample(valid_helpers, count)
+    # Simple selection: random sample
+    return random.sample(available, count)
 
 
 def get_encryption_tickets_parallel(
     broken_raida_id: int,
+    fracked_coin: CloudCoinBin,
     helper_raida_ids: List[int],
-    fracked_coin: CloudCoinBin
-) -> List[EncryptedKeyPart]:
+    max_workers: int = 4
+) -> Tuple[HealErrorCode, List[EncryptedKeyPart]]:
     """
     Get encryption tickets from multiple helpers in parallel.
 
-    Uses ThreadPoolExecutor for better error handling and
-    result collection compared to raw threading.
-
-    Sends requests to all helpers and returns as soon as 2 succeed.
-    This handles timeouts gracefully by using redundant helpers.
-
-    CRITICAL: The nonce must be ALL ZEROS because:
-    - CMD 45 uses encryption type 0 (unencrypted)
-    - For type 0, the server sets ci->nonce to zeros (protocol.c line 519)
-    - The broken RAIDA decrypts key parts using this zero nonce
-    - So helpers must encrypt with zero nonce for decryption to work
+    Process:
+    1. Split the fracked coin's AN into two 8-byte key parts
+    2. Send key_part_0 to half of helpers, key_part_1 to other half
+    3. Collect encrypted tickets from all helpers
+    4. Return the encrypted key parts
 
     Args:
-        broken_raida_id: RAIDA we're fixing
-        helper_raida_ids: List of helper RAIDA IDs (should be > 2 for redundancy)
-        fracked_coin: Coin we're using
+        broken_raida_id: RAIDA we're trying to fix
+        fracked_coin: Coin we're fixing
+        helper_raida_ids: List of helper RAIDA IDs
+        max_workers: Max parallel threads
 
     Returns:
-        List of EncryptedKeyPart (2 parts if successful, less if not enough respond)
+        Tuple of (error_code, list of EncryptedKeyPart)
     """
-    # Split AN into key parts (one for each helper)
-    original_an = fracked_coin.ans[broken_raida_id]
-    key_part_0, key_part_1 = split_an_into_key_parts(original_an)
+    if len(helper_raida_ids) < 2:
+        return HealErrorCode.ERR_INSUFFICIENT_HELPERS, []
 
-    # CRITICAL: Use ZERO nonce because CMD 45 is unencrypted (type 0)
-    # For type 0, the server hardcodes ci->nonce to all zeros
-    # The broken RAIDA will decrypt using zero nonce, so helpers must encrypt with zero nonce
-    shared_nonce = bytes(8)  # 8 bytes of zeros
-    logger.debug(f"Using zero nonce for helpers (required for CMD 45 type 0): {shared_nonce.hex()}")
+    # Get AN for the broken RAIDA
+    an = fracked_coin.get_an_for_raida(broken_raida_id)
+    if not an or len(an) < 16:
+        logger.error(f"No AN available for RAIDA{broken_raida_id}")
+        return HealErrorCode.ERR_INVALID_COIN, []
 
-    # We need exactly 2 key parts - alternate between them for redundancy
-    results_part0 = []  # Responses for key_part_0
-    results_part1 = []  # Responses for key_part_1
+    # Split AN into two halves
+    key_part_0, key_part_1 = split_an_into_key_parts(an)
 
-    with ThreadPoolExecutor(max_workers=len(helper_raida_ids)) as executor:
-        future_to_helper = {}
-        # Send to all helpers, alternating key parts (all use same nonce)
-        # split_id=0 for key_part_0 (AN bytes 0-7), split_id=1 for key_part_1 (AN bytes 8-15)
+    logger.debug(f"AN for RAIDA{broken_raida_id}: {an.hex()}")
+    logger.debug(f"  key_part_0: {key_part_0.hex()}")
+    logger.debug(f"  key_part_1: {key_part_1.hex()}")
+
+    # We need at least one ticket for each key part
+    encrypted_parts: List[EncryptedKeyPart] = []
+    got_part_0 = False
+    got_part_1 = False
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+
+        # Submit tasks: alternate between key_part_0 and key_part_1
         for i, helper_id in enumerate(helper_raida_ids):
-            split_id = i % 2
-            key_part = key_part_0 if split_id == 0 else key_part_1
-            future = executor.submit(
-                get_encryption_ticket,
-                helper_id,
-                broken_raida_id,
-                key_part,
-                fracked_coin,
-                shared_nonce,  # All helpers use same nonce
-                split_id       # Track which half of AN this is for
-            )
-            future_to_helper[future] = (helper_id, split_id)
+            if i % 2 == 0:
+                # Get ticket for key_part_0
+                future = executor.submit(
+                    get_encryption_ticket,
+                    helper_id,
+                    broken_raida_id,
+                    key_part_0,
+                    fracked_coin,
+                    None,
+                    0  # split_id = 0
+                )
+            else:
+                # Get ticket for key_part_1
+                future = executor.submit(
+                    get_encryption_ticket,
+                    helper_id,
+                    broken_raida_id,
+                    key_part_1,
+                    fracked_coin,
+                    None,
+                    1  # split_id = 1
+                )
+            futures.append((future, helper_id, i % 2))
 
-        # Collect results as they complete
-        for future in as_completed(future_to_helper):
-            helper_id, part_idx = future_to_helper[future]
+        # Collect results
+        for future, helper_id, split_id in futures:
             try:
-                err, encrypted_part = future.result()
+                err, key_part = future.result(timeout=10)
                 if err == HealErrorCode.SUCCESS:
-                    if part_idx == 0 and len(results_part0) == 0:
-                        results_part0.append(encrypted_part)
+                    encrypted_parts.append(key_part)
+                    if split_id == 0:
+                        got_part_0 = True
                         logger.debug(f"Got key_part_0 ticket from RAIDA{helper_id}")
-                    elif part_idx == 1 and len(results_part1) == 0:
-                        results_part1.append(encrypted_part)
+                    else:
+                        got_part_1 = True
                         logger.debug(f"Got key_part_1 ticket from RAIDA{helper_id}")
-
-                    # Check if we have both parts
-                    if len(results_part0) >= 1 and len(results_part1) >= 1:
-                        logger.debug("Got both key parts, done collecting")
-                        break
-                else:
-                    logger.warning(f"Helper RAIDA{helper_id} failed: {err}")
             except Exception as e:
-                logger.error(f"Helper RAIDA{helper_id} exception: {e}")
+                logger.debug(f"Failed to get ticket from RAIDA{helper_id}: {e}")
 
-    # Return combined results
-    return results_part0 + results_part1
+    # Check if we have both halves
+    if not got_part_0 or not got_part_1:
+        logger.warning(f"Missing key parts: part_0={got_part_0}, part_1={got_part_1}")
+        return HealErrorCode.ERR_INSUFFICIENT_HELPERS, encrypted_parts
+
+    return HealErrorCode.SUCCESS, encrypted_parts
+
+
+# ============================================================================
+# HIGH-LEVEL FIX ENCRYPTION ORCHESTRATION
+# ============================================================================
+
+def fix_single_raida_encryption(
+    broken_raida_id: int,
+    fracked_coin: CloudCoinBin,
+    health: EncryptionHealth
+) -> Tuple[HealErrorCode, bool]:
+    """
+    Fix encryption for a single broken RAIDA.
+
+    Complete process:
+    1. Find working RAIDA (helpers)
+    2. Select 2+ helpers for ticket retrieval
+    3. Get encrypted tickets from helpers (parallel)
+    4. Send encrypted tickets to broken RAIDA (CMD 45)
+    5. Verify acceptance
+
+    Args:
+        broken_raida_id: RAIDA ID to fix
+        fracked_coin: Coin to use for shared secret
+        health: Current encryption health status
+
+    Returns:
+        Tuple of (error_code, success: bool)
+    """
+    logger.info(f"Fixing encryption for RAIDA{broken_raida_id}")
+
+    # Get working RAIDA
+    working = health.get_working_raida()
+    if len(working) < 2:
+        logger.error(f"Not enough working RAIDA: {len(working)} (need 2+)")
+        return HealErrorCode.ERR_INSUFFICIENT_HELPERS, False
+
+    # Select helpers
+    helpers = select_helper_raida(broken_raida_id, working, count=4)
+    if len(helpers) < 2:
+        logger.error(f"Could not select enough helpers: {helpers}")
+        return HealErrorCode.ERR_INSUFFICIENT_HELPERS, False
+
+    logger.info(f"  Using helpers: {helpers}")
+
+    # Get encrypted tickets
+    err, encrypted_parts = get_encryption_tickets_parallel(
+        broken_raida_id,
+        fracked_coin,
+        helpers
+    )
+
+    if err != HealErrorCode.SUCCESS or len(encrypted_parts) < 2:
+        logger.warning(f"Failed to get enough tickets: {err}, got {len(encrypted_parts)}")
+        return HealErrorCode.ERR_INSUFFICIENT_HELPERS, False
+
+    # Send fix request to broken RAIDA
+    err, success = fix_encryption_on_raida(
+        broken_raida_id,
+        fracked_coin,
+        encrypted_parts
+    )
+
+    return err, success
 
 
 def fix_encryption(
     wallet_path: str,
-    health: EncryptionHealth
+    health: EncryptionHealth,
+    fix_coin: CloudCoinBin = None
 ) -> FixEncryptionResult:
     """
-    Fix broken encryption by establishing shared secrets.
+    Fix encryption for all broken RAIDA.
 
-    Algorithm (from K. Healing Services for Keys.md):
-    1. Identify broken RAIDA from health object
-    2. Load coins from FRACKED folder (Bank is empty when fix needed)
-    3. Find a coin with enough working RAIDA (2+ for helpers)
-    4. For each broken RAIDA:
-       a. Split the AN into two 8-byte key parts
-       b. Get encrypted key parts from 2 helper RAIDA (parallel)
-       c. Call fix_encryption_on_raida with collected tickets
-       d. Verify hash matches and update health status
-    5. Return detailed results
+    Process:
+    1. Get list of broken RAIDA from health status
+    2. Find a coin that can be used as shared secret
+    3. For each broken RAIDA:
+       a. Select helper RAIDA (working RAIDA)
+       b. Get encrypted tickets from helpers (CMD 44)
+       c. Send fix request to broken RAIDA (CMD 45)
+       d. Update health status based on result
 
     Args:
         wallet_path: Path to wallet folder
-        health: Encryption health status from check_encryption
+        health: Current encryption health status
+        fix_coin: Optional coin to use for fixing (uses first fracked if not provided)
 
     Returns:
-        FixEncryptionResult with detailed success/failure info
+        FixEncryptionResult with detailed results
     """
-    logger.info("=" * 60)
-    logger.info("FIX ENCRYPTION - Establishing Shared Secrets")
-    logger.info("=" * 60)
-
     result = FixEncryptionResult()
+    broken_list = health.get_broken_raida()
 
-    # Check crypto availability early - required for CMD 44 encryption
-    if not CRYPTO_AVAILABLE:
-        logger.error("Cryptography library not available - required for Fix Encryption")
-        logger.error("Install with: pip install cryptography")
-        # Return error without attempting any RAIDA communication
-        for r in health.get_broken_raida():
-            result.failed_raida.append(r)
-            result.errors[r] = FixEncryptionError.NO_COINS_AVAILABLE  # Closest error type
-        return result
+    result.total_broken = len(broken_list)
 
-    broken_raida = health.get_broken_raida()
-    working_raida = health.get_working_raida()
-
-    result.total_broken = len(broken_raida)
-
-    if not broken_raida:
-        logger.info("No broken encryption to fix")
+    if not broken_list:
+        logger.info("No broken RAIDA to fix")
         result.success = True
         return result
 
-    if len(working_raida) < 2:
-        logger.error(f"Not enough working RAIDA for helpers ({len(working_raida)} < 2)")
-        for r in broken_raida:
-            result.failed_raida.append(r)
-            result.errors[r] = FixEncryptionError.INSUFFICIENT_HELPERS
-        return result
+    logger.info("\n" + "=" * 60)
+    logger.info(f"FIX ENCRYPTION: {len(broken_list)} RAIDA need fixing")
+    logger.info(f"Broken RAIDA: {broken_list}")
+    logger.info("=" * 60)
 
-    logger.info(f"Broken RAIDA: {broken_raida}")
-    logger.info(f"Working RAIDA: {working_raida}")
-
-    # Load coins - try Bank first (preferred as they have all 25 RAIDA passing),
-    # then Fracked folder. Bank may be empty when fix encryption is needed,
-    # but if Bank has coins, they're better candidates for helpers.
-    coins = []
-
-    bank_folder = os.path.join(wallet_path, FOLDER_BANK)
-    err, bank_coins = load_coins_from_folder(bank_folder)
-    if err == HealErrorCode.SUCCESS and bank_coins:
-        coins.extend(bank_coins)
-        logger.info(f"Found {len(bank_coins)} coins in Bank folder")
-
-    fracked_folder = os.path.join(wallet_path, FOLDER_FRACKED)
-    err, fracked_coins = load_coins_from_folder(fracked_folder)
-    if err == HealErrorCode.SUCCESS and fracked_coins:
-        coins.extend(fracked_coins)
-        logger.info(f"Found {len(fracked_coins)} coins in Fracked folder")
-
-    if not coins:
-        logger.error("No coins available for encryption fix")
-        for r in broken_raida:
-            result.failed_raida.append(r)
-            result.errors[r] = FixEncryptionError.NO_COINS_AVAILABLE
-        return result
-
-    logger.info(f"Total {len(coins)} coins available for fix encryption")
-
-    # Find a coin that has 'p' status on at least 2 working RAIDA (for helpers)
-    fix_coin = None
-    for coin in coins:
-        helper_count = sum(1 for r in working_raida if coin.pown[r] == 'p')
-        if helper_count >= 2:
-            fix_coin = coin
-            break
-
+    # Find a coin to use for fixing
     if fix_coin is None:
-        logger.error("No coin has enough helper RAIDA (need 2+ with 'p' status)")
-        for r in broken_raida:
-            result.failed_raida.append(r)
-            result.errors[r] = FixEncryptionError.INSUFFICIENT_HELPERS
-        return result
+        fracked_path = os.path.join(wallet_path, FOLDER_FRACKED)
+        fracked_coins = load_coins_from_folder(fracked_path) if os.path.isdir(fracked_path) else []
 
-    logger.info(f"Using coin SN={fix_coin.serial_number} for encryption fix")
+        if not fracked_coins:
+            logger.error("No fracked coins available for fix encryption")
+            result.success = False
+            return result
+
+        # Use first fracked coin
+        fix_coin = fracked_coins[0]
+
+    logger.info(f"Using coin SN={fix_coin.serial_number} for fix encryption")
+    logger.info(f"Coin POWN: {fix_coin.pown}")
 
     # Fix each broken RAIDA
-    for broken_id in broken_raida:
-        if not health.can_retry(broken_id):
-            logger.debug(f"Skipping RAIDA{broken_id} (cooldown)")
-            result.failed_raida.append(broken_id)
-            result.errors[broken_id] = FixEncryptionError.RAIDA_OFFLINE
-            continue
+    for broken_id in broken_list:
+        logger.info(f"\n--- Fixing RAIDA{broken_id} ---")
 
-        health.mark_attempt(broken_id)
-        logger.info(f"\nFixing RAIDA{broken_id}...")
-
-        # Select 6 helpers for redundancy (only need 2 to respond)
-        helpers = select_helpers(working_raida, fix_coin)
-        if len(helpers) < 2:
-            logger.warning(f"Not enough helpers for RAIDA{broken_id}")
-            health.mark_failed(broken_id)
-            result.failed_raida.append(broken_id)
-            result.errors[broken_id] = FixEncryptionError.INSUFFICIENT_HELPERS
-            continue
-
-        logger.info(f"  Helpers selected: {helpers} (using first 2 to respond)")
-
-        # Get encrypted key parts from helpers (parallel)
-        encrypted_parts = get_encryption_tickets_parallel(
-            broken_id, helpers, fix_coin
+        err, success = fix_single_raida_encryption(
+            broken_id,
+            fix_coin,
+            health
         )
 
-        if len(encrypted_parts) < 2:
-            logger.warning(f"Failed to get enough tickets for RAIDA{broken_id}")
-            health.mark_failed(broken_id)
-            result.failed_raida.append(broken_id)
-            result.errors[broken_id] = FixEncryptionError.TICKET_FAILED
-            continue
-
-        logger.info(f"  Got {len(encrypted_parts)} encrypted key parts")
-
-        # Send Fix Encryption to broken RAIDA
-        err, verified = fix_encryption_on_raida(broken_id, fix_coin, encrypted_parts)
-
-        if err == HealErrorCode.SUCCESS and verified:
+        if success:
             health.mark_fixed(broken_id)
-            health.reset_failure(broken_id)
             result.fixed_raida.append(broken_id)
             result.total_fixed += 1
             # Update coin's POWN to reflect successful fix
@@ -1143,7 +1060,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     print("=" * 60)
-    print("heal_encryption.py - Self Tests (Updated for Fix Encryption)")
+    print("heal_encryption.py - Self Tests (Updated for Hardcoded Keys)")
     print("=" * 60)
 
     # Test 1: EncryptionHealth dataclass
@@ -1224,21 +1141,22 @@ if __name__ == "__main__":
         key_part=bytes(range(8)),
         fracked_coin=test_coin
     )
-    # Server expects 31 bytes: Challenge(16) + DN(1) + SN(4) + KeyPart(8) + Terminator(2)
-    assert len(body) == 31, f"Body length {len(body)} != 31"
+    # Server expects 32 bytes: Challenge(16) + BrokenID(1) + DN(1) + SN(4) + KeyPart(8) + Terminator(2)
+    assert len(body) == 32, f"Body length {len(body)} != 32"
     assert body[-2:] == TERMINATOR
-    print(f"   PASS: Body length = {len(body)} bytes (expected 31)")
+    print(f"   PASS: Body length = {len(body)} bytes (expected 32)")
 
     # Test 9: Build Fix Encryption body
     print("\n9. Testing build_fix_encryption_body...")
     key_parts = [
         EncryptedKeyPart(helper_raida_id=1, denomination=1, serial_number=12345,
-                         encrypted_key_part=bytes(16)),
+                         encrypted_key_part=bytes(16), split_id=0),
         EncryptedKeyPart(helper_raida_id=2, denomination=1, serial_number=12345,
-                         encrypted_key_part=bytes(16))
+                         encrypted_key_part=bytes(16), split_id=1)
     ]
     body, challenge = build_fix_encryption_body(test_coin, key_parts)
-    expected_len = 16 + 1 + 4 + (26 * 2) + 2  # challenge + dn + sn + 2 records + terminator
+    # Expected: 16 challenge + 1 dn + 4 sn + 1 num_tickets + (19 * 2) + 2 terminator = 62 bytes
+    expected_len = 16 + 1 + 4 + 1 + (19 * 2) + 2
     assert len(body) == expected_len, f"Body length {len(body)} != {expected_len}"
     assert body[-2:] == TERMINATOR
     print(f"   PASS: Body length = {len(body)} bytes (expected {expected_len})")
@@ -1273,4 +1191,4 @@ if __name__ == "__main__":
     print("All tests passed!")
     print("=" * 60)
     print("\nNote: Network tests require live RAIDA servers.")
-    print("Crypto available:", CRYPTO_AVAILABLE)
+    print("Server uses HARDCODED_TEST_KEY and HARDCODED_TEST_NONCE for debugging.")
