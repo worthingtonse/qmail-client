@@ -308,6 +308,8 @@ CREATE TABLE IF NOT EXISTS PendingTells (
     RecipientType INTEGER NOT NULL DEFAULT 0,
     BeaconServerID TEXT NOT NULL,
     LockerCode BLOB NOT NULL,
+    BeaconLockerHex TEXT,
+    InboxLockerHex TEXT,
     ServerListJSON TEXT NOT NULL,
     CreatedTimestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     RetryCount INTEGER DEFAULT 0,
@@ -521,6 +523,71 @@ CREATE INDEX IF NOT EXISTS idx_received_stripes_tell_id ON received_stripes(tell
 #         if logger: log_error(logger, "Database", "Initialization failed", str(e))
 #         return DatabaseErrorCode.ERR_OPEN_FAILED, None
 
+# def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
+#     """
+#     Initialize database connection and create all tables.
+#     FIXED: Auto-migrates missing columns (UseForParity, PingMS) to prevent crashes.
+#     """
+#     import sqlite3
+#     import os
+#     from src.database import DatabaseErrorCode, DatabaseHandle, SCHEMA_SQL
+#     from src.logger import log_info, log_error
+
+#     if not db_path: 
+#         return DatabaseErrorCode.ERR_INVALID_PARAM, None
+
+#     # 1. Directory Safety
+#     db_dir = os.path.dirname(db_path)
+#     if db_dir and not os.path.exists(db_dir):
+#         try:
+#             os.makedirs(db_dir, exist_ok=True)
+#             log_info(logger, "Database", f"Created directory: {db_dir}")
+#         except OSError as e:
+#             if logger: log_error(logger, "Database", "Directory creation failed", str(e))
+#             return DatabaseErrorCode.ERR_IO, None
+
+#     try:
+#         # 2. Connection
+#         connection = sqlite3.connect(db_path, check_same_thread=False)
+#         connection.row_factory = sqlite3.Row
+#         connection.execute("PRAGMA foreign_keys = ON")
+#         cursor = connection.cursor()
+
+#         # 3. Create Tables (If they don't exist)
+#         cursor.executescript(SCHEMA_SQL)
+
+#         # 4. MIGRATION: Fix Servers Table (This fixes your crash)
+#         cursor.execute("PRAGMA table_info(Servers)")
+#         server_cols = [col[1] for col in cursor.fetchall()]
+        
+#         if 'UseForParity' not in server_cols:
+#             log_info(logger, "Database", "Migrating: Adding UseForParity to Servers")
+#             cursor.execute("ALTER TABLE Servers ADD COLUMN UseForParity INTEGER DEFAULT 0")
+            
+#         if 'PingMS' not in server_cols:
+#             log_info(logger, "Database", "Migrating: Adding PingMS to Servers")
+#             cursor.execute("ALTER TABLE Servers ADD COLUMN PingMS INTEGER DEFAULT 0")
+
+#         # 5. MIGRATION: Fix Users Table (Preserving your existing checks)
+#         cursor.execute("PRAGMA table_info(Users)")
+#         user_cols = [col[1] for col in cursor.fetchall()]
+        
+#         if 'contact_count' not in user_cols:
+#             cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
+        
+#         if 'last_contacted_timestamp' not in user_cols:
+#             cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp INTEGER")
+
+#         connection.commit()
+#         log_info(logger, "Database", f"Database initialized and migrated: {db_path}")
+        
+#         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
+#         return DatabaseErrorCode.SUCCESS, handle
+
+#     except sqlite3.Error as e:
+#         if logger: log_error(logger, "Database", "Initialization failed", str(e))
+#         return DatabaseErrorCode.ERR_OPEN_FAILED, None
+
 def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
     """
     Initialize database connection and create all tables.
@@ -576,6 +643,18 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
         if 'last_contacted_timestamp' not in user_cols:
             cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp INTEGER")
 
+        # 6. MIGRATION: PendingTells locker columns
+        cursor.execute("PRAGMA table_info(PendingTells)")
+        pt_cols = [col[1] for col in cursor.fetchall()]
+
+        if 'BeaconLockerHex' not in pt_cols:
+            log_info(logger, "Database", "Migrating: Adding BeaconLockerHex to PendingTells")
+            cursor.execute("ALTER TABLE PendingTells ADD COLUMN BeaconLockerHex TEXT")
+
+        if 'InboxLockerHex' not in pt_cols:
+            log_info(logger, "Database", "Migrating: Adding InboxLockerHex to PendingTells")
+            cursor.execute("ALTER TABLE PendingTells ADD COLUMN InboxLockerHex TEXT")
+
         connection.commit()
         log_info(logger, "Database", f"Database initialized and migrated: {db_path}")
         
@@ -585,6 +664,7 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
     except sqlite3.Error as e:
         if logger: log_error(logger, "Database", "Initialization failed", str(e))
         return DatabaseErrorCode.ERR_OPEN_FAILED, None
+
 # ============================================================================
 # CLOSE DATABASE
 # ============================================================================
@@ -662,7 +742,7 @@ def store_email(handle: Any, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, 
         is_read = email.get('is_read', 0)
         
         cursor.execute("""
-            INSERT INTO Emails (
+            INSERT OR IGNORE INTO Emails (
                 EmailID, Subject, Body, ReceivedTimestamp, 
                 SentTimestamp, Meta, Style, folder, is_read
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -3183,7 +3263,9 @@ def insert_pending_tell(
     recipient_type: int,
     beacon_server_id: str,
     locker_code: bytes,
-    server_list_json: str
+    server_list_json: str,
+    beacon_locker_hex: str = None,
+    inbox_locker_hex: str = None
 ) -> Tuple[DatabaseErrorCode, int]:
     """
     Insert a pending Tell notification for retry.
@@ -3217,10 +3299,10 @@ def insert_pending_tell(
         cursor.execute("""
             INSERT INTO PendingTells
             (FileGroupGUID, RecipientAddress, RecipientType, BeaconServerID,
-             LockerCode, ServerListJSON, Status)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+             LockerCode, BeaconLockerHex, InboxLockerHex, ServerListJSON, Status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
         """, (file_group_guid, recipient_address, recipient_type, beacon_server_id,
-              locker_code, server_list_json))
+              locker_code, beacon_locker_hex, inbox_locker_hex, server_list_json))
 
         tell_id = cursor.lastrowid
         handle.connection.commit()
@@ -3261,10 +3343,10 @@ def get_pending_tells(
         cursor = handle.connection.cursor()
 
         cursor.execute("""
-            SELECT TellID, FileGroupGUID, RecipientAddress, RecipientType,
-                   BeaconServerID, LockerCode, ServerListJSON,
-                   CreatedTimestamp, RetryCount, LastAttemptTimestamp,
-                   ErrorMessage, Status
+              SELECT TellID, FileGroupGUID, RecipientAddress, RecipientType,
+                   BeaconServerID, LockerCode, BeaconLockerHex, InboxLockerHex,
+                   ServerListJSON, CreatedTimestamp, RetryCount,
+                   LastAttemptTimestamp, ErrorMessage, Status
             FROM PendingTells
             WHERE Status = ?
             ORDER BY CreatedTimestamp ASC
@@ -3280,6 +3362,8 @@ def get_pending_tells(
                 'recipient_type': row['RecipientType'],
                 'beacon_server_id': row['BeaconServerID'],
                 'locker_code': row['LockerCode'],
+                'beacon_locker_hex': row['BeaconLockerHex'],     
+                'inbox_locker_hex': row['InboxLockerHex'],       
                 'server_list_json': row['ServerListJSON'],
                 'created_timestamp': row['CreatedTimestamp'],
                 'retry_count': row['RetryCount'],
@@ -3287,7 +3371,7 @@ def get_pending_tells(
                 'error_message': row['ErrorMessage'],
                 'status': row['Status']
             })
-
+          
         log_debug(handle.logger, DB_CONTEXT,
                   f"Retrieved {len(tells)} pending tells with status '{status}'")
         return DatabaseErrorCode.SUCCESS, tells

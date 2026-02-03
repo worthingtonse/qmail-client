@@ -128,14 +128,14 @@ def handle_account_identity(request_handler, context):
     
     err, rows = execute_query(
         app_ctx.db_handle,
-        "SELECT auto_address, first_name, last_name FROM Users WHERE SerialNumber = ?",
+        "SELECT auto_address, FirstName, LastName FROM Users WHERE SerialNumber = ?",
         (identity.serial_number,)
     )
     
     if err == 0 and rows:
         pretty_address = rows[0].get('auto_address')
-        first_name = rows[0].get('first_name', '')
-        last_name = rows[0].get('last_name', '')
+        first_name = rows[0].get('FirstName', '')
+        last_name = rows[0].get('LastName', '')
         if first_name or last_name:
             display_name = f"{first_name} {last_name}".strip()
     
@@ -404,8 +404,12 @@ def handle_mail_send(request_handler, context):
 def handle_mail_download(request_handler, context):
     """
     GET /api/mail/download/{id} - Download email by ID
-    STRICT VERSION: Now handles Status 200 to trigger Reactive Healing.
+    Caches downloaded email in Emails table. Serves from cache on re-open.
+    Handles Status 200 to trigger Reactive Healing.
     """
+    import sqlite3
+    from database import store_email, DatabaseErrorCode
+
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
     logger = app_ctx.logger
@@ -416,7 +420,28 @@ def handle_mail_download(request_handler, context):
             400, {"error": "Invalid file_guid format"})
         return
 
-    # Get credentials
+    # --- SHORT-CIRCUIT: Already downloaded? Serve from Emails table ---
+    try:
+        db_handle.connection.row_factory = sqlite3.Row
+        cursor = db_handle.connection.cursor()
+        cursor.execute("SELECT Body FROM Emails WHERE EmailID = ?",
+                       (bytes.fromhex(file_guid),))
+        cached_row = cursor.fetchone()
+        if cached_row and cached_row['Body']:
+            body_text = cached_row['Body']
+            file_bytes = body_text.encode('utf-8') if isinstance(body_text, str) else body_text
+            request_handler.send_response(200)
+            request_handler.send_header('Content-Type', 'application/octet-stream')
+            request_handler.send_header('Content-Length', str(len(file_bytes)))
+            request_handler.send_header(
+                'Content-Disposition', f'attachment; filename="{file_guid}.bin"')
+            request_handler.end_headers()
+            request_handler.wfile.write(file_bytes)
+            return
+    except Exception:
+        pass  # Cache miss or DB error — fall through to network download
+
+    # --- FIRST DOWNLOAD: Fetch from QMail servers ---
     try:
         identity = app_ctx.config.identity
         an = _get_an_for_download(app_ctx)
@@ -425,7 +450,6 @@ def handle_mail_download(request_handler, context):
             500, {"error": "Configuration error", "details": str(e)})
         return
 
-    # Download file
     try:
         file_bytes, status = download_file_sync(
             db_handle=db_handle,
@@ -446,7 +470,47 @@ def handle_mail_download(request_handler, context):
                 401, {"error": "Authentication failed - Coin fracked"})
             return
 
-        # Success: Return raw bytes
+        if not file_bytes:
+            request_handler.send_json_response(
+                404, {"error": "Download returned empty"})
+            return
+
+        # --- PERSIST: Save to Emails table + mark tell as downloaded ---
+        try:
+            body_text = file_bytes.decode('utf-8', errors='replace')
+            # First line of body as subject (no subject in wire format yet)
+            subject_preview = body_text[:80].split('\n')[0].strip() or f"Mail {file_guid[:8]}"
+
+            # Get timestamp from the tell
+            sender_sn = 0
+            received_ts = None
+            cursor = db_handle.connection.cursor()
+            cursor.execute(
+                "SELECT created_at FROM received_tells WHERE file_guid = ?",
+                (file_guid,))
+            tell_row = cursor.fetchone()
+            if tell_row:
+                received_ts = tell_row['created_at'] if tell_row['created_at'] else None
+                # Mark as downloaded
+                cursor.execute(
+                    "UPDATE received_tells SET download_status = 1 WHERE file_guid = ?",
+                    (file_guid,))
+                db_handle.connection.commit()
+
+            store_email(db_handle, {
+                'email_id': file_guid,
+                'subject': subject_preview,
+                'body': body_text,
+                'sender_sn': sender_sn,
+                'recipient_sns': [],
+                'folder': 'inbox',
+                'is_read': 0,
+                'received_timestamp': received_ts
+            })
+        except Exception as persist_err:
+            log_error(logger, "API", f"Cache persist failed (non-fatal): {persist_err}")
+
+        # Return raw bytes to frontend
         request_handler.send_response(200)
         request_handler.send_header('Content-Type', 'application/octet-stream')
         request_handler.send_header('Content-Length', str(len(file_bytes)))
@@ -459,7 +523,6 @@ def handle_mail_download(request_handler, context):
         log_error(logger, "API", f"Download failed: {e}")
         request_handler.send_json_response(
             500, {"error": "Download failed", "details": str(e)})
-
 # DONT DELETE
 
 # def _get_an_for_download(app_ctx):
@@ -648,7 +711,9 @@ def _get_an_for_download(app_ctx):
 def handle_mail_list(request_handler, context):
     """
     GET /api/mail/list - List emails with Pretty Addresses
+    Shows real subject for downloaded emails, placeholder for pending.
     """
+    import sqlite3
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
 
@@ -661,7 +726,6 @@ def handle_mail_list(request_handler, context):
     except:
         limit, offset = 50, 0
 
-    # list_emails ab join karke 'contact_pretty' la raha hai
     from database import list_emails, get_email_count, DatabaseErrorCode
     err, emails = list_emails(db_handle, folder=folder, limit=limit, offset=offset)
 
@@ -673,11 +737,31 @@ def handle_mail_list(request_handler, context):
         if isinstance(email.get('EmailID'), bytes):
             email['EmailID'] = email['EmailID'].hex()
 
+    # For inbox: enrich with real subject + downloaded flag from Emails table
+    if folder == 'inbox':
+        try:
+            db_handle.connection.row_factory = sqlite3.Row
+            cursor = db_handle.connection.cursor()
+            for email in emails:
+                eid = email.get('EmailID', '')
+                if isinstance(eid, str) and len(eid) == 32:
+                    cursor.execute(
+                        "SELECT Subject FROM Emails WHERE EmailID = ?",
+                        (bytes.fromhex(eid),))
+                    row = cursor.fetchone()
+                    if row and row['Subject']:
+                        email['Subject'] = row['Subject']
+                        email['downloaded'] = True
+                    else:
+                        email['downloaded'] = False
+        except Exception:
+            pass  # Non-fatal: list still works with placeholder subjects
+
     _, total_count = get_email_count(db_handle, folder=folder)
 
     return request_handler.send_json_response(200, {
         "folder": folder,
-        "emails": emails, # Includes contact_pretty (e.g. Sean.Worthington...)
+        "emails": emails,
         "total_count": total_count
     })
 
@@ -1344,11 +1428,11 @@ def handle_mail_get(request_handler, context):
     if not is_valid:
         return request_handler.send_json_response(400, {"error": "Invalid id", "details": error_msg})
 
-    # 1. Try downloaded emails
+    # 1. Try downloaded emails (cached in Emails table after first download)
     err, metadata = get_email_metadata(db_handle, clean_id)
 
     if err == DatabaseErrorCode.SUCCESS:
-        # metadata ab 'sender_pretty' aur 'recipients_pretty' fields return karega
+        metadata['downloaded'] = True
         return request_handler.send_json_response(200, metadata)
 
     # 2. Check pending tells
@@ -1375,7 +1459,6 @@ def handle_mail_get(request_handler, context):
             return request_handler.send_json_response(500, {"error": "Database error"})
 
     return request_handler.send_json_response(404, {"error": "Email not found"})
-
 def handle_mail_delete(request_handler, context):
     """
     DELETE /api/mail/{id} - Soft delete an email (move to trash)

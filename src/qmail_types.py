@@ -1041,6 +1041,7 @@ class ServerLocation:
     Derived from the 32-byte Server List entry in a PING response.
     """
     stripe_index: int = 0
+    stripe_type: int = 0  
     total_stripes: int = 0
     server_id: int = 0  # RAIDA index of the server
     raw_entry: bytes = b'' # The raw 32-byte entry for debugging

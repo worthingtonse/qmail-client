@@ -562,6 +562,10 @@ def connect_to_server(
 
         except sock_module.timeout:
             last_error = NetworkErrorCode.ERR_TIMEOUT
+            try:
+                sock.close()
+            except Exception:
+                pass
             if attempt < max_retries - 1:
                 backoff = retry_backoff_ms * (2 ** attempt) / 1000.0
                 log_warning(
@@ -573,6 +577,10 @@ def connect_to_server(
 
         except sock_module.error as e:
             last_error = NetworkErrorCode.ERR_CONNECTION_FAILED
+            try:
+                sock.close()
+            except Exception:
+                pass
             if attempt < max_retries - 1:
                 backoff = retry_backoff_ms * (2 ** attempt) / 1000.0
                 log_warning(
@@ -1077,16 +1085,20 @@ def send_raw_request(
         return NetworkErrorCode.ERR_NOT_CONNECTED, None, b''
 
     # Use getattr for object attribute safety
-    timeout_ms_val = getattr(config, 'read_timeout_ms', timeout_ms or 5000)
+    # Fallback to 30000ms (30s) to match qmail.toml default, not 5000ms
+    timeout_ms_val = getattr(config, 'read_timeout_ms', timeout_ms or 30000)
     connection.socket.settimeout(timeout_ms_val / 1000.0)
 
     try:
         connection.socket.sendall(req)
 
-        # 2. Read 32-byte Header
-        header_data = connection.socket.recv(32)
-        if len(header_data) < 32:
-            return NetworkErrorCode.ERR_INVALID_RESPONSE, None, b''
+        # 2. Read 32-byte Header (loop until complete - TCP may fragment)
+        header_data = b''
+        while len(header_data) < 32:
+            chunk = connection.socket.recv(32 - len(header_data))
+            if not chunk:
+                return NetworkErrorCode.ERR_INVALID_RESPONSE, None, b''
+            header_data += chunk
 
         from collections import namedtuple
         Header = namedtuple('Header', ['raida_id', 'status', 'body_size'])

@@ -339,6 +339,7 @@ def parse_tell_response(
                 server_data = response_body[offset : offset + 32]
                 location = ServerLocation(
                     stripe_index=server_data[0],
+                    stripe_type=server_data[1], 
                     total_stripes=tell.server_count,
                     server_id=server_data[0], # Simple mapping for now
                     raw_entry=server_data
@@ -880,11 +881,11 @@ def build_upload_payload(
     payload[64:72] = locker_code[:8] if locker_code else bytes(8)
 
     # Reserved -> File Type (72-74)
-    # Byte 72 is reserved_file_type in server struct
-    payload[72] = file_type & 0xFF
+    # Reserved bytes (72-73) — must be zero
+    payload[72] = 0x00
     payload[73] = 0x00
-    payload[74] = 0x00
-
+    # File Type at offset 74 (reserved_file_type in server struct)
+    payload[74] = file_type & 0xFF
     # Storage Duration (75)
     # KEPT AS IS: per your request not to hardcode 255
     payload[75] = storage_duration & 0xFF
@@ -1345,7 +1346,7 @@ def build_tell_payload(
     # Protocol specification requires strictly ending with '>>'
     payload[-2:] = b'\x3e\x3e' 
     
-    return 0, bytes(payload), full_challenge
+    return 0, bytes(payload), challenge
 
 def build_complete_tell_request(
     raida_id: int, an: bytes, denomination: int, serial_number: int,
@@ -1556,8 +1557,8 @@ def build_download_payload(
                   "build_download_payload failed", "file_group_guid must be at least 16 bytes")
         return ProtocolErrorCode.ERR_INVALID_BODY, b'', b''
 
-    # Total payload: Preamble (48) + Request (21) + Terminator (2) = 71 bytes
-    payload_size = 71 
+    # Total payload: Preamble (48) + Request (21) + Terminator (2) = 71 bytes -- correction only 70 
+    payload_size = 70
     payload = bytearray(payload_size)
 
     # 1. Preamble (48 bytes) - Challenge & Identity
@@ -1588,18 +1589,18 @@ def build_download_payload(
     #   uint8_t file_type          - Offset 64
     #   uint8_t version            - Offset 65
     #   uint8_t bytes_per_page     - Offset 66
-    #   uint8_t page_number[2]     - Offset 67-68
+    #   uint8_t page_number        - Offset 67.
     
     payload[48:64] = file_group_guid[:16]  # File GUID
     payload[64] = file_type & 0xFF         # File Type
     payload[65] = 0x01                     # Version (must be 1 per server)
-    payload[66] = 0x00                     # Bytes Per Page (0 = max size)
+    payload[66] = 0x03                     # Bytes Per Page same as server
     
     # Page Number (2 bytes, Big Endian)
-    struct.pack_into('>H', payload, 67, page_number)
+    payload[67] = page_number & 0xFF 
 
     # 3. Terminator (2 bytes)
-    payload[69:71] = b'\x3e\x3e'
+    payload[68:70] = b'\x3e\x3e'
 
     log_debug(logger_handle, PROTOCOL_CONTEXT,
               f"Built download payload: {len(payload)} bytes, file_type={file_type}, page={page_number}")
@@ -1711,8 +1712,8 @@ def validate_download_response(
     # body[0]:type, [1]:ver, [2]:bpp, [3-4]:page, [5-8]:data_len
     meta_body = response[32:]
     try:
-        # FIXED: data_length is at offset 5 because page_number took 2 bytes
-        data_length = struct.unpack('>I', meta_body[5:9])[0]
+       
+        data_length = struct.unpack('>I', meta_body[4:8])[0]
         
         # FIXED: Actual file data starts at offset 9 (1+1+1+2+4)
         file_data = meta_body[9 : 9 + data_length]

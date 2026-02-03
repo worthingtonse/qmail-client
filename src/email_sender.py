@@ -1385,6 +1385,7 @@ def send_email_async(
             # Track which stripe indices have successfully uploaded
             successful_body_stripes = set()
             MAX_BATCH_RETRIES = 3
+            min_required = num_servers - 1  # With XOR parity, can tolerate 1 missing stripe
             
             for attempt in range(MAX_BATCH_RETRIES):
                 # If retrying, we skip payment for stripes that already succeeded.
@@ -1409,8 +1410,8 @@ def send_email_async(
                     if getattr(r, 'success', False):
                         successful_body_stripes.add(r.stripe_index)
                 
-                # Check consensus (Need 4 or 5 out of 5)
-                if len(successful_body_stripes) >= 4:
+               # Check consensus - need at least (num_servers - 1) for XOR parity reconstruction
+                if len(successful_body_stripes) >= min_required:
                     result.upload_results.extend(upload_results)
                     break
                 
@@ -1420,19 +1421,19 @@ def send_email_async(
 
             # --- CHECK FINAL BODY SUCCESS ---
             body_success_count = len(successful_body_stripes)
-            
-            # SCENARIO 1: TOTAL FAILURE (Refund Trigger)
+
+          # SCENARIO 1: TOTAL FAILURE (Refund Trigger)
             # If 0 servers accepted the file after retries, the payment is stranded on RAIDA.
             if body_success_count == 0:
-                raise UploadException("Connection failed: 0/5 servers accepted the email.")
+                raise UploadException(f"Connection failed: 0/{num_servers} servers accepted the email.")
 
             # SCENARIO 2: PARTIAL FAILURE (No Refund)
-            # If 1-3 servers accepted, the payment was likely consumed. 
-            # We fail without refunding, relying on write-over logic for future retries.
-            if body_success_count < 4:
+            # Not enough stripes for XOR parity reconstruction.
+            if body_success_count < min_required:
                 result.success = False
                 result.error_code = SendEmailErrorCode.ERR_PARTIAL_FAILURE
-                result.error_message = f"Consensus failed after retries: {body_success_count}/5 servers (No refund)"
+                result.error_message = (f"Consensus failed after retries: {body_success_count}/{num_servers} servers "
+                                        f"(need {min_required}, no refund)")
                 update_state("FAILED", 0, result.error_message)
                 return result.error_code, result
 
@@ -1743,7 +1744,9 @@ def send_tell_notifications(
 
                     insert_pending_tell(
                         db_handle, file_group_guid, address, r_type,
-                        beacon_id, locker_code, server_list_json
+                        beacon_id, locker_code, server_list_json,
+                        beacon_locker_hex=beacon_locker_bytes.hex(),
+                        inbox_locker_hex=recipient_locker_bytes.hex()
                     )
 
         except Exception as e:
@@ -1994,7 +1997,7 @@ def _build_tell_servers(
 
         tell_servers.append(TellServer(
             stripe_index=stripe_index,
-            stripe_type=0 if stripe_index < 4 else 1,  # 0=Data, 1=Parity
+            stripe_type=0 if stripe_index < (len(servers) - 1) else 1,  # Last stripe = Parity
             server_id=0,
             ip_address=ip,
             port=port
@@ -2108,32 +2111,36 @@ def _process_pending_tells(
             )
             continue
 
-        # Get fresh locker key
-        err, keys = get_locker_keys(cc_handle, 0.1, 1)
-        if err != CloudCoinErrorCode.SUCCESS or not keys:
+        # Reuse original locker codes (coins already locked on RAIDA)
+        beacon_locker_hex = tell.get('beacon_locker_hex')
+        inbox_locker_hex = tell.get('inbox_locker_hex')
+
+        if beacon_locker_hex:
+            beacon_locker_bytes = bytes.fromhex(beacon_locker_hex)[:8]
+        else:
+            # Fallback: no stored beacon locker — original coins are lost
+            # Generate fresh payment for retry
             log_warning(logger_handle, SENDER_CONTEXT,
-                        f"Could not get locker key for pending tell {tell_id}")
-            continue
+                        f"No stored beacon locker for tell {tell_id}, creating fresh payment")
+            err_code, new_hex = asyncio.run(create_recipient_locker(
+                "Data/Wallets/Default", 0.1, identity.serial_number, logger_handle
+            ))
+            if err_code != 0 or not new_hex:
+                log_warning(logger_handle, SENDER_CONTEXT,
+                            f"Could not create beacon locker for pending tell {tell_id}")
+                continue
+            beacon_locker_bytes = bytes.fromhex(new_hex)[:8]
 
-        locker_key = bytes.fromhex(keys[0]) if isinstance(keys[0], str) else keys[0]
+        if inbox_locker_hex:
+            inbox_locker_bytes = bytes.fromhex(inbox_locker_hex)[:16]
+        else:
+            inbox_locker_bytes = bytes(16)  # No inbox fee
 
-        # Get beacon info and locker code first (needed for TellServer)
+        # Get beacon info
         beacon_id = tell['beacon_server_id']
         raida_id = _beacon_id_to_raida_index(beacon_id)
-        locker_code = tell['locker_code']
 
-        # Ensure locker_code is bytes
-        if isinstance(locker_code, str):
-            try:
-                locker_code = bytes.fromhex(locker_code)
-            except ValueError:
-                locker_code = locker_code.encode()[:8]
-        if locker_code and len(locker_code) < 8:
-            locker_code = locker_code + bytes(8 - len(locker_code))
-        elif not locker_code:
-            locker_code = bytes(8)
-
-        # Parse stored data - include locker_code for recipient decryption
+        # Parse stored data
         try:
             server_list = json.loads(tell['server_list_json'])
             tell_servers = [TellServer(
@@ -2141,25 +2148,25 @@ def _process_pending_tells(
                 stripe_type=s.get('stripe_type', 0),
                 ip_address=s.get('ip_address', ''),
                 port=s.get('port', DEFAULT_BEACON_PORT),
-                locker_code=locker_code[:8]  # Include locker code for decryption
+                locker_code=beacon_locker_bytes[:8]
             ) for s in server_list]
         except (json.JSONDecodeError, TypeError):
             tell_servers = []
 
-        # Build recipient
+        # Build recipient with stored inbox locker code
         coin_id, denom, serial = _parse_qmail_address(tell['recipient_address'])
         recipient = TellRecipient(
             address_type=tell.get('recipient_type', 0),
             coin_id=coin_id,
             denomination=denom,
             serial_number=serial,
-            locker_payment_key=locker_key
+            locker_payment_key=inbox_locker_bytes
         )
 
-        # Send Tell
+        # Send Tell with stored beacon locker code
         err = _send_single_tell(
             raida_id, beacon_id, recipient, tell['file_group_guid'],
-            tell_servers, locker_code, identity, timestamp, logger_handle
+            tell_servers, beacon_locker_bytes, identity, timestamp, logger_handle
         )
 
         if err == ErrorCode.SUCCESS:
@@ -2179,7 +2186,6 @@ def _process_pending_tells(
                  f"Processed {sent_count} pending tells successfully")
 
     return sent_count
-
 
 def verify_an_loading(mailbox_file: str, logger_handle: Optional[object] = None):
     """

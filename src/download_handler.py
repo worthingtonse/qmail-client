@@ -116,17 +116,30 @@ async def download_file(
 
     err, stripes_info = database.get_stripes_for_tell(db_handle, tell_info['id'])
 
-    # 2. Build server list using ports from the Tell
+    # 2. Build RAIDA index lookup from Servers table (IP → RAIDA index)
+    raida_lookup = {}
+    try:
+        s_err, all_servers = database.get_all_servers(db_handle)
+        if s_err == database.DatabaseErrorCode.SUCCESS:
+            for srv in all_servers:
+                raida_lookup[srv.get('ip_address', '')] = srv.get('server_index', 0)
+    except Exception:
+        pass  # Fallback: stripe_id will be used as raida_id
+
+    # 3. Build server list using ports from the Tell
     servers = []
     for stripe in stripes_info:
+        # Look up actual RAIDA index from IP, fall back to stripe_id
+        actual_raida_id = raida_lookup.get(stripe['server_ip'], stripe['stripe_id'])
         server_info = ServerInfo(
             host=stripe['server_ip'],
-            port=stripe['port'],  # Use port from Tell metadata
-            raida_id=stripe['stripe_id']
+            port=stripe['port'],
+            raida_id=actual_raida_id
         )
         servers.append({
             'info': server_info,
             'stripe_id': stripe['stripe_id'],
+            'raida_id': actual_raida_id,
             'is_parity': stripe.get('is_parity', False)
         })
 
@@ -172,46 +185,56 @@ async def download_all_stripes(
     all_stripe_data = {}
     failed_stripes = []
     
-    # 1. Parallel Execution of Data Stripe Downloads
-    download_tasks = []
-    for server in data_servers:
-        task = download_stripe_with_pagination(
-            server_info=server['info'],
-            file_guid=file_guid,
-            locker_code=locker_code,
-            file_type=file_type,
-            denomination=denomination,
-            serial_number=serial_number,
-            device_id=device_id,
-            an=an,
-            stripe_id=server['stripe_id'],
-            logger_handle=logger_handle
-        )
-        download_tasks.append((server['stripe_id'], task))
+# 1. Parallel Execution of Data Stripe Downloads
+    async def _download_one(server):
+        stripe_id = server['stripe_id']
+        rid = server.get('raida_id', stripe_id)
+        try:
+            res = await download_stripe_with_pagination(
+                server_info=server['info'],
+                file_guid=file_guid,
+                locker_code=locker_code,
+                file_type=file_type,
+                denomination=denomination,
+                serial_number=serial_number,
+                device_id=device_id,
+                an=an,
+                stripe_id=stripe_id,
+                raida_id=rid,
+                logger_handle=logger_handle
+            )
+            return stripe_id, res
+        except Exception as e:
+            log_error(logger_handle, DOWNLOAD_CONTEXT, f"Stripe {stripe_id} exception: {e}")
+            return stripe_id, None
+
+    # Launch all downloads concurrently
+    gather_results = await asyncio.gather(
+        *[_download_one(s) for s in data_servers],
+        return_exceptions=True
+    )
 
     # Collect Results
-    for stripe_id, task in download_tasks:
-        try:
-            stripe_res = await task
-            if stripe_res.success:
-                all_stripe_data[stripe_id] = stripe_res.data
-                result.stripes_downloaded += 1
-            else:
-                # CRITICAL: If any server returns 200 (Invalid AN), track it
-                if stripe_res.status == 200:
-                    result.status = 200
-                failed_stripes.append(stripe_id)
-                log_warning(logger_handle, DOWNLOAD_CONTEXT, 
-                            f"Stripe {stripe_id} failed with status {stripe_res.status}")
-        except Exception as e:
+    for item in gather_results:
+        if isinstance(item, Exception):
+            continue
+        stripe_id, stripe_res = item
+        if stripe_res and stripe_res.success:
+            all_stripe_data[stripe_id] = stripe_res.data
+            result.stripes_downloaded += 1
+        else:
+            if stripe_res and stripe_res.status == 200:
+                result.status = 200
             failed_stripes.append(stripe_id)
-            log_error(logger_handle, DOWNLOAD_CONTEXT, f"Stripe {stripe_id} exception: {e}")
+            log_warning(logger_handle, DOWNLOAD_CONTEXT,
+                        f"Stripe {stripe_id} failed with status {getattr(stripe_res, 'status', 0)}")
 
     # 2. Parity Recovery: If exactly one data stripe is missing
     if len(failed_stripes) == 1 and parity_servers:
         log_info(logger_handle, DOWNLOAD_CONTEXT, f"Attempting recovery for missing stripe {failed_stripes[0]}")
         
         # Download the parity stripe
+    # Download the parity stripe
         parity_server = parity_servers[0]
         p_res = await download_stripe_with_pagination(
             server_info=parity_server['info'],
@@ -223,6 +246,7 @@ async def download_all_stripes(
             device_id=device_id,
             an=an,
             stripe_id=parity_server['stripe_id'],
+            raida_id=parity_server.get('raida_id', parity_server['stripe_id']),
             logger_handle=logger_handle
         )
         
@@ -279,11 +303,16 @@ async def download_stripe_with_pagination(
     device_id: int,
     an: bytes,
     stripe_id: int,
+    raida_id: int = -1,
     logger_handle: Optional[object] = None
 ) -> Any:
     """Handles Encryption Type 0 (Plaintext) download and AN Slicing."""
     from dataclasses import make_dataclass
     Res = make_dataclass("Res", [("success", bool), ("data", bytes), ("status", int)])
+    
+    # Use actual RAIDA index for AN slicing, fall back to stripe_id
+    if raida_id < 0:
+        raida_id = stripe_id
     
     all_pages = []
     page_number = 0
@@ -291,12 +320,12 @@ async def download_stripe_with_pagination(
     final_status = 250
 
     # 1. AN SLICING (Prove ownership to this specific RAIDA)
-    server_an = an[stripe_id * 16 : (stripe_id + 1) * 16] if len(an) >= 400 else an[:16]
+    server_an = an[raida_id * 16 : (raida_id + 1) * 16] if len(an) >= 400 else an[:16]
 
     while more_pages:
         # 2. Build Request (Encryption Type 0 / Plaintext)
         err, request, challenge, _ = build_complete_download_request(
-            raida_id=stripe_id,
+            raida_id=raida_id,
             denomination=denomination,
             serial_number=serial_number,
             device_id=device_id,
@@ -369,15 +398,29 @@ async def send_download_request(
             timeout=timeout_s
         )
 
-        # Parse body length from header (bytes 22-23 for 128-bit encryption)
-        body_length = struct.unpack('>H', header[22:24])[0]
-        if body_length == 0xFFFF:
-            # Extended length - read 4 more bytes
-            ext_len = await asyncio.wait_for(
-                reader.readexactly(4),
-                timeout=timeout_s
-            )
-            body_length = struct.unpack('>I', ext_len)[0]
+        # # Parse body length from header (bytes 22-23 for 128-bit encryption)
+        # body_length = struct.unpack('>H', header[22:24])[0]
+        # if body_length == 0xFFFF:
+        #     # Extended length - read 4 more bytes
+        #     ext_len = await asyncio.wait_for(
+        #         reader.readexactly(4),
+        #         timeout=timeout_s
+        #     )
+        #     body_length = struct.unpack('>I', ext_len)[0]
+
+        # # Read body
+        # body = b''
+        # if body_length > 0:
+        #     body = await asyncio.wait_for(
+        #         reader.readexactly(body_length),
+        #         timeout=timeout_s
+        #     )
+
+        # download_handler.py — replace lines 401-409 with:
+
+        # Parse body length from header bytes 9-11 (3 bytes, big-endian)
+        # Matches server protocol.c legacy 32-byte header format
+        body_length = (header[9] << 16) | (header[10] << 8) | header[11]
 
         # Read body
         body = b''
@@ -394,16 +437,28 @@ async def send_download_request(
         return header + body
 
     except asyncio.TimeoutError:
-        log_error(logger_handle, DOWNLOAD_CONTEXT,
-                  f"Timeout connecting to {server_info.host}:{server_info.port}")
+        log_error(
+            logger_handle,
+            DOWNLOAD_CONTEXT,
+            f"Timeout connecting to {server_info.host}:{server_info.port}"
+        )
         return None
+
     except asyncio.IncompleteReadError:
-        log_error(logger_handle, DOWNLOAD_CONTEXT,
-                  f"Incomplete response from {server_info.host}:{server_info.port}")
+        log_error(
+            logger_handle,
+            DOWNLOAD_CONTEXT,
+            f"Incomplete response from {server_info.host}:{server_info.port}"
+        )
         return None
+
     except Exception as e:
-        log_error(logger_handle, DOWNLOAD_CONTEXT,
-                  f"Connection error to {server_info.host}:{server_info.port}", str(e))
+        log_error(
+            logger_handle,
+            DOWNLOAD_CONTEXT,
+            f"Connection error to {server_info.host}:{server_info.port}",
+            str(e)
+        )
         return None
 
 

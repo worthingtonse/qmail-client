@@ -744,7 +744,7 @@ def start_periodic_healer(wallet_paths: List[str], logger: Any, interval_hours: 
 
     def healer_loop():
         # Wait 30 seconds after app start to let RAIDA servers stabilize
-        time.sleep(300)
+        time.sleep(3600)
 
         while True:
             log_info(logger, "PeriodicHeal", "Starting scheduled wallet health check.")
@@ -1064,32 +1064,33 @@ def main():
                             port=server_port
                         )
 
+
                         if s_err != DatabaseErrorCode.SUCCESS:
                             log_error(logger, "Beacon",
                                       f"Failed to store stripe {stripe_index}")
                             continue
-
-                    stripes_stored += 1
+                        stripes_stored += 1
 
                     log_info(
                         logger, "Beacon", f"Successfully cached metadata for {file_guid[:8]} with {stripes_stored} server locations.")
                     successful_count += 1
 
+                    # Claim locker payment if present
                     if locker_code and len(locker_code) >= 8:
-                    # Check if it's not all zeros (no payment)
-                     if locker_code != b'\x00' * len(locker_code):
-                        try:
-                            from download_handler import download_locker_payment
-                            log_info(logger, "Beacon", f"Claiming inbox fee for {file_guid[:8]}...")
-                            err, _ = asyncio.run(download_locker_payment(
-                                app_context, file_guid, logger
-                            ))
-                            if err == 0:
-                                log_info(logger, "Beacon", f"✓ Inbox fee claimed for {file_guid[:8]}")
-                            else:
-                                log_warning(logger, "Beacon", f"Failed to claim inbox fee: error {err}")
-                        except Exception as e:
-                            log_warning(logger, "Beacon", f"Inbox fee claim exception: {e}")
+                        # Check if it's not all zeros (no payment)
+                        if locker_code != b'\x00' * len(locker_code):
+                            try:
+                                from download_handler import download_locker_payment
+                                log_info(logger, "Beacon", f"Claiming inbox fee for {file_guid[:8]}...")
+                                err, _ = asyncio.run(download_locker_payment(
+                                    app_context, file_guid, logger
+                                ))
+                                if err == 0:
+                                    log_info(logger, "Beacon", f"✓ Inbox fee claimed for {file_guid[:8]}")
+                                else:
+                                    log_warning(logger, "Beacon", f"Failed to claim inbox fee: error {err}")
+                            except Exception as e:
+                                log_warning(logger, "Beacon", f"Inbox fee claim exception: {e}")
 
 
                 except Exception as e:

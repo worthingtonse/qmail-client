@@ -27,6 +27,10 @@ import struct
 import zlib
 import socket
 import asyncio
+import json
+import urllib.request
+import urllib.error
+import threading
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 from enum import IntEnum
@@ -60,34 +64,82 @@ class CoinForPut:
     ans: List[bytes]  # 25 x 16-byte ANs, one per RAIDA
 
 
-# Default RAIDA servers
-RAIDA_SERVERS = [
-    ("78.46.170.45", 50000),      # RAIDA 0
-    ("47.229.9.94", 50001),       # RAIDA 1
-    ("209.46.126.167", 50002),    # RAIDA 2
-    ("116.203.157.233", 50003),   # RAIDA 3
-    ("95.183.51.104", 50004),     # RAIDA 4
-    ("31.163.201.90", 50005),     # RAIDA 5
-    ("52.14.83.91", 50006),       # RAIDA 6
-    ("161.97.169.229", 50007),    # RAIDA 7
-    ("13.234.55.11", 50008),      # RAIDA 8
-    ("124.187.106.233", 50009),   # RAIDA 9
-    ("94.130.179.247", 50010),    # RAIDA 10
-    ("67.181.90.11", 50011),      # RAIDA 11
-    ("3.16.169.178", 50012),      # RAIDA 12
-    ("113.30.247.109", 50013),    # RAIDA 13
-    ("168.220.219.199", 50014),   # RAIDA 14
-    ("185.37.61.73", 50015),      # RAIDA 15
-    ("193.7.195.250", 50016),     # RAIDA 16
-    ("5.161.63.179", 50017),      # RAIDA 17
-    ("31.186.58.178", 50018),     # RAIDA 18
-    ("190.105.235.113", 50019),   # RAIDA 19
-    ("184.18.166.118", 50020),    # RAIDA 20
-    ("125.236.210.184", 50021),   # RAIDA 21
-    ("219.97.17.29", 50022),      # RAIDA 22
-    ("130.255.77.156", 50023),    # RAIDA 23
-    ("27.100.58.116", 50024),     # RAIDA 24
-]
+# RAIDA server discovery URL
+RAIDA_SERVERS_URL = "https://raida11.cloudcoin.global/service/raida_servers"
+
+# Cached server list (populated on first use)
+_raida_servers_cache: Optional[List[Tuple[str, int]]] = None
+_cache_lock = threading.Lock()
+
+
+
+def _fetch_raida_servers_from_url() -> Optional[List[Tuple[str, int]]]:
+    """
+    Fetch RAIDA server list from the discovery URL.
+    The URL returns plain text, one server per line: IP:PORT
+    Returns list of 25 (host, port) tuples, or None on failure.
+    """
+    try:
+        req = urllib.request.Request(
+            RAIDA_SERVERS_URL,
+            headers={'User-Agent': 'QMail-LockerPut/1.0'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            text = response.read().decode('utf-8')
+
+        # Parse plain text format: IP:PORT per line
+        servers = []
+        for line in text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if ':' in line:
+                parts = line.split(':')
+                host = parts[0].strip()
+                try:
+                    port = int(parts[1].strip())
+                except (ValueError, IndexError):
+                    port = 50000 + len(servers)
+            else:
+                host = line
+                port = 50000 + len(servers)
+            if host:
+                servers.append((host, port))
+
+        if len(servers) >= RAIDA_COUNT:
+            print(f"[LockerPut] Fetched {len(servers)} RAIDA servers from URL")
+            return servers[:RAIDA_COUNT]
+        else:
+            print(f"[LockerPut] Only {len(servers)} servers from URL, need {RAIDA_COUNT}")
+            return None
+
+    except Exception as e:
+        print(f"[LockerPut] Failed to fetch RAIDA servers from URL: {e}")
+        return None
+
+
+def get_raida_servers() -> List[Tuple[str, int]]:
+    """
+    Get RAIDA server list with caching.
+    Fetches from URL on first call, caches for subsequent calls.
+    """
+    global _raida_servers_cache
+
+    with _cache_lock:
+        if _raida_servers_cache is not None:
+            return _raida_servers_cache
+
+        servers = _fetch_raida_servers_from_url()
+        if servers:
+            _raida_servers_cache = servers
+            return _raida_servers_cache
+
+        # This should not happen if the URL is reachable
+        raise RuntimeError(
+            f"FATAL: Cannot fetch RAIDA servers from {RAIDA_SERVERS_URL}. "
+            "Check network connectivity."
+        )
+
 
 
 def generate_challenge() -> bytes:
@@ -303,7 +355,8 @@ async def put_to_locker(
     results: Dict[int, Tuple[int, List[bool]]] = {}
 
     async def put_single_raida(raida_id: int):
-        host, port = RAIDA_SERVERS[raida_id]
+        servers = get_raida_servers()
+        host, port = servers[raida_id]
         locker_key = locker_keys[raida_id]
 
         try:
@@ -372,7 +425,8 @@ if __name__ == "__main__":
 
         # Test single RAIDA first
         raida_id = 11
-        host, port = RAIDA_SERVERS[raida_id]
+        servers = get_raida_servers()
+        host, port = servers[raida_id]
         locker_key = locker_keys[raida_id]
 
         print(f"Testing RAIDA {raida_id} ({host}:{port})")
