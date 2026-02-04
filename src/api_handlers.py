@@ -165,6 +165,62 @@ def handle_account_identity(request_handler, context):
         "configured": True
     })
 
+def handle_heal_identity(request_handler, context):
+    """
+    POST /api/account/heal-identity
+    Verify and heal the identity coin in the Mailbox wallet.
+    """
+    app_ctx = request_handler.server_instance.app_context
+    logger = getattr(app_ctx, 'logger', None)
+    identity = getattr(app_ctx.config, 'identity', None)
+
+    if not identity:
+        return request_handler.send_json_response(401, {"error": "no_identity_found"})
+
+    try:
+        from heal import heal_wallet
+        from coin_scanner import find_identity_coin
+
+        mailbox_wallet = "Data/Wallets/Mailbox"
+        mailbox_bank = os.path.join(mailbox_wallet, "Bank")
+
+        coin = find_identity_coin(mailbox_bank, identity.serial_number)
+        if not coin:
+            return request_handler.send_json_response(404, {
+                "error": "identity_coin_not_found",
+                "message": f"No identity coin for SN {identity.serial_number} in Mailbox/Bank"
+            })
+
+        file_path = coin.get('file_path') if isinstance(coin, dict) else getattr(coin, 'file_path', None)
+
+        import shutil
+        fracked_dir = os.path.join(mailbox_wallet, "Fracked")
+        os.makedirs(fracked_dir, exist_ok=True)
+        dest = os.path.join(fracked_dir, os.path.basename(file_path))
+        shutil.move(file_path, dest)
+
+        log_info(logger, "API", "Identity coin moved to Fracked for healing")
+
+        heal_res = heal_wallet(mailbox_wallet, max_iterations=3)
+
+        healed_path = os.path.join(mailbox_bank, os.path.basename(file_path))
+        healed = os.path.exists(healed_path)
+
+        return request_handler.send_json_response(200, {
+            "status": "healed" if healed else "failed",
+            "total_fracked": heal_res.total_fracked,
+            "total_fixed": heal_res.total_fixed,
+            "total_failed": heal_res.total_failed,
+            "identity_in_bank": healed
+        })
+
+    except Exception as e:
+        log_error(logger, "API", f"Identity heal error: {e}")
+        return request_handler.send_json_response(500, {
+            "error": "heal_failed",
+            "details": str(e)
+        })
+
 
 def handle_version_check(request_handler, request_context):
     """
@@ -243,8 +299,10 @@ def handle_ping(request_handler, context):
         raida_servers = getattr(app_ctx.config, 'raida_servers', [])
         server_entry = next((s for s in raida_servers if getattr(s, 'index', -1) == target_raida_index), None)
         
-        host = getattr(server_entry, 'address', f"raida{target_raida_index}.cloudcoin.global")
-        port = getattr(server_entry, 'port', 50011)
+        if server_entry is None:
+            return {"status": "error", "message": f"RAIDA {target_raida_index} not in config.raida_servers"}
+        host = server_entry.address
+        port = server_entry.port
         server_info = ServerInfo(host=host, port=port, raida_id=target_raida_index)
 
         err_conn, conn = await connect_async(server_info, config=app_ctx.config)
@@ -389,10 +447,19 @@ def handle_mail_send(request_handler, context):
                 complete_task(app_ctx.task_manager, task_id, {"success": True}, "Email sent successfully")
             else:
                 # Reactive Healing check
-                is_fracked = any(getattr(r, 'status', 0) == 200 for r in (result.upload_results or []))
+                is_fracked = any(getattr(r, 'status_code', 0) == 200 for r in (result.upload_results or []))
                 if is_fracked:
                     from app import move_identity_to_fracked
                     move_identity_to_fracked(identity, app_ctx.beacon_handle, app_ctx.logger)
+                    # Actually heal the identity coin (move alone doesn't fix it)
+                    try:
+                        from heal import heal_wallet
+                        log_info(app_ctx.logger, "API", "Healing fracked identity coin in Mailbox wallet...")
+                        heal_result = heal_wallet("Data/Wallets/Mailbox", max_iterations=3)
+                        log_info(app_ctx.logger, "API",
+                                 f"Identity heal: {heal_result.total_fixed}/{heal_result.total_fracked} fixed")
+                    except Exception as heal_err:
+                        log_error(app_ctx.logger, "API", f"Identity heal failed: {heal_err}")
 
                 fail_task(app_ctx.task_manager, task_id, result.error_message, "Email sending failed")
         except Exception as e:
@@ -3437,6 +3504,8 @@ def register_all_routes(server):
 
     # Account / Identity
     server.register_route('GET', '/api/account/identity', handle_account_identity)
+    server.register_route('POST', '/api/account/heal-identity', handle_heal_identity)
+
 
     # Mail operations
     server.register_route('POST', '/api/mail/send', handle_mail_send)

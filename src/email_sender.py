@@ -964,6 +964,8 @@ def upload_stripe_to_server(
     # so that if it fails (166), the logic below knows to switch to real code.
     using_zero_code = verify_only
 
+    last_status_code = 0
+
     for attempt in range(MAX_RETRIES):
         try:
             # 2. Build Request
@@ -995,6 +997,7 @@ def upload_stripe_to_server(
 
             net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
             status_code = resp.status if resp else 0
+            last_status_code = status_code
             disconnect(conn)
 
             # --- SUCCESS CASE ---
@@ -1021,12 +1024,16 @@ def upload_stripe_to_server(
                 current_locker_code = bytes(8)
                 using_zero_code = True
                 continue
+            # --- UNHANDLED STATUS CODE ---
+            log_warning(logger_handle, SENDER_CONTEXT,
+                        f"RAIDA {server_id}: Unexpected response - net_err={net_err}, status={status_code}")
 
         except Exception as e:
             log_error(logger_handle, SENDER_CONTEXT, f"RAIDA {server_id} crash", str(e))
 
     result.success = False
-    result.error_message = "Max retries reached."
+    result.status_code = last_status_code
+    result.error_message = f"Max retries reached (last status: {last_status_code})."
     return result
 
 
@@ -1409,6 +1416,68 @@ def send_email_async(
                 for r in upload_results:
                     if getattr(r, 'success', False):
                         successful_body_stripes.add(r.stripe_index)
+
+
+                # --- MID-UPLOAD REACTIVE HEALING ---
+                # If any server returned status 200 (ERROR_INVALID_AN), the identity
+                # coin is fracked on those RAIDAs. Heal now so the retry loop can succeed.
+                # Safe because: status 200 means the server rejected the AN BEFORE consuming
+                # the locker code, so the original locker codes are still valid for retry.
+                fracked_200 = [
+                    r for r in upload_results
+                    if not getattr(r, 'success', False) and getattr(r, 'status_code', 0) == 200
+                ]
+
+                if fracked_200 and not hasattr(state, '_identity_healed'):
+                    fracked_raida = [getattr(r, 'server_id', '?') for r in fracked_200]
+                    log_warning(logger_handle, SENDER_CONTEXT,
+                                f"Identity coin fracked on RAIDA {fracked_raida} (status 200). "
+                                f"Healing mid-upload...")
+
+                    try:
+                        from heal import heal_wallet
+                        from coin_scanner import find_identity_coin, load_coin_from_file
+
+                        mailbox_wallet = "Data/Wallets/Mailbox"
+                        mailbox_bank = os.path.join(mailbox_wallet, "Bank")
+
+                        # Find the current identity coin
+                        id_coin = find_identity_coin(mailbox_bank, identity.serial_number)
+                        if id_coin:
+                            id_path = id_coin.get('file_path') if isinstance(id_coin, dict) else getattr(id_coin, 'file_path', None)
+
+                            if id_path and os.path.exists(id_path):
+                                # Move to Fracked
+                                import shutil
+                                fracked_dir = os.path.join(mailbox_wallet, "Fracked")
+                                os.makedirs(fracked_dir, exist_ok=True)
+                                shutil.move(id_path, os.path.join(fracked_dir, os.path.basename(id_path)))
+
+                                # Heal
+                                heal_res = heal_wallet(mailbox_wallet, max_iterations=3)
+                                log_info(logger_handle, SENDER_CONTEXT,
+                                         f"Mid-upload heal: {heal_res.total_fixed}/{heal_res.total_fracked} fixed")
+
+                                # Reload fresh ANs into the identity object
+                                healed_path = os.path.join(mailbox_bank, os.path.basename(id_path))
+                                if os.path.exists(healed_path):
+                                    healed_coin = load_coin_from_file(healed_path)
+                                    if healed_coin and healed_coin.ans:
+                                        hex_an_list = [an.hex() if isinstance(an, bytes) else str(an)
+                                                       for an in healed_coin.ans]
+                                        identity.authenticity_number = "".join(hex_an_list)
+                                        log_info(logger_handle, SENDER_CONTEXT,
+                                                 "Identity healed mid-upload ✓ — retrying with fresh ANs")
+
+                        # Mark so we only attempt healing once per send
+                        state._identity_healed = True
+
+                    except Exception as heal_ex:
+                        log_warning(logger_handle, SENDER_CONTEXT,
+                                    f"Mid-upload healing failed: {heal_ex}")
+                        state._identity_healed = True  # Don't retry healing
+
+
                 
                # Check consensus - need at least (num_servers - 1) for XOR parity reconstruction
                 if len(successful_body_stripes) >= min_required:
@@ -1876,8 +1945,23 @@ def _send_single_tell(
         return ErrorCode.ERR_PROTOCOL
 
     # 3. Try TCP Port 50000+
-    host = f"{beacon_id}.cloudcoin.global"
-    s_info = ServerInfo(host=host, port=50000 + raida_id, raida_id=raida_id)
+    # host = f"{beacon_id}.cloudcoin.global"
+    # s_info = ServerInfo(host=host, port=50000 + raida_id, raida_id=raida_id)
+    # 3. Try TCP Port 50000+ (resolve beacon IP from host file, not DNS)
+    import urllib.request as _urlreq
+    _beacon_ip = None
+    try:
+        _req = _urlreq.Request("https://raida11.cloudcoin.global/service/raida_servers",
+                               headers={'User-Agent': 'QMail-Tell/1.0'})
+        with _urlreq.urlopen(_req, timeout=10) as _resp:
+            _lines = _resp.read().decode('utf-8').strip().split('\n')
+            if raida_id < len(_lines):
+                _beacon_ip = _lines[raida_id].strip().split(':')[0]
+    except Exception:
+        pass
+    if not _beacon_ip:
+        return ErrorCode.ERR_NETWORK
+    s_info = ServerInfo(host=_beacon_ip, port=50000 + raida_id, raida_id=raida_id)
     err_conn, conn = connect_to_server(s_info, logger_handle=logger_handle)
     
     if err_conn == NetworkErrorCode.SUCCESS and conn:
@@ -2063,7 +2147,23 @@ def _get_beacon_address(beacon_id: str) -> Tuple[str, int]:
 
     # Standard RAIDA beacon addresses
     # Format: raida{N}.cloudcoin.global:DEFAULT_BEACON_PORT
-    ip = f"raida{index}.cloudcoin.global"
+    # ip = f"raida{index}.cloudcoin.global"
+    # port = DEFAULT_BEACON_PORT
+
+    # Resolve beacon IP from host file URL, not DNS
+    import urllib.request as _urlreq
+    ip = None
+    try:
+        _req = _urlreq.Request("https://raida11.cloudcoin.global/service/raida_servers",
+                               headers={'User-Agent': 'QMail-Beacon/1.0'})
+        with _urlreq.urlopen(_req, timeout=10) as _resp:
+            _lines = _resp.read().decode('utf-8').strip().split('\n')
+            if index < len(_lines):
+                ip = _lines[index].strip().split(':')[0]
+    except Exception:
+        pass
+    if not ip:
+        ip = f"raida{index}.cloudcoin.global"  # last resort DNS
     port = DEFAULT_BEACON_PORT
 
     return ip, port

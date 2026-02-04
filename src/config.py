@@ -596,7 +596,7 @@ def get_raida_server_config(raida_index: int, servers: List[ServerConfig]) -> Op
     return None
 
 
-def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool: # this function is not used anymore to get the qmail server list as they are directly synced from the host file and extracted from the database when required (keeping it here just in case)
+def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool: 
     """
     Create a default qmail.toml configuration file with all required values.
 
@@ -620,34 +620,63 @@ def create_default_config_file(path: str = DEFAULT_CONFIG_FILENAME) -> bool: # t
         ServerConfig(address="125.236.210.184", port=50021),
     ]
 
-    # Add all 25 RAIDA servers
-    raida_list = [
-        (0, "78.46.170.45", 50000),
-        (1, "47.229.9.94", 50001),
-        (2, "209.46.126.167", 50002),
-        (3, "116.203.157.233", 50003),
-        (4, "95.183.51.104", 50004),
-        (5, "31.163.201.90", 50005),
-        (6, "52.14.83.91", 50006),
-        (7, "161.97.169.229", 50007),
-        (8, "13.234.55.11", 50008),
-        (9, "124.187.106.233", 50009),
-        (10, "94.130.179.247", 50010),
-        (11, "67.181.90.11", 50011),# Beacon server
-        (12, "3.16.169.178", 50012),
-        (13, "113.30.247.109", 50013),
-        (14, "168.220.219.199", 50014),  
-        (15, "185.37.61.73", 50015),
-        (16, "193.7.195.250", 50016),
-        (17, "5.161.63.179", 50017),
-        (18, "76.114.47.144", 50018),
-        (19, "190.105.235.113", 50019),
-        (20, "184.18.166.118", 50020),
-        (21, "125.236.210.184", 50021),
-        (22, "5.161.123.254", 50022),
-        (23, "130.255.77.156", 50023),
-        (24, "209.205.66.24", 50024),
-    ]
+    # Fetch current RAIDA IPs from host file (single source of truth)
+    import urllib.request
+    _RAIDA_SERVERS_URL = "https://raida11.cloudcoin.global/service/raida_servers"
+    raida_list = []
+    try:
+        _req = urllib.request.Request(_RAIDA_SERVERS_URL,
+                                      headers={'User-Agent': 'QMail-Config/1.0'})
+        with urllib.request.urlopen(_req, timeout=10) as _resp:
+            _text = _resp.read().decode('utf-8')
+        for _line in _text.strip().split('\n'):
+            _line = _line.strip()
+            if not _line:
+                continue
+            if ':' in _line:
+                _parts = _line.split(':')
+                _host = _parts[0].strip()
+                try:
+                    _port = int(_parts[1].strip())
+                except (ValueError, IndexError):
+                    _port = 50000 + len(raida_list)
+            else:
+                _host = _line
+                _port = 50000 + len(raida_list)
+            if _host:
+                raida_list.append((len(raida_list), _host, _port))
+        if len(raida_list) < 25:
+            raise ValueError(f"Only {len(raida_list)} servers, need 25")
+    except Exception as _e:
+        print(f"WARNING: Could not fetch RAIDA servers from URL: {_e}")
+        print("Using last-known IPs (may be stale)")
+        raida_list = [
+            (0, "78.46.170.45", 50000),
+            (1, "47.229.9.94", 50001),
+            (2, "209.46.126.167", 50002),
+            (3, "116.203.157.233", 50003),
+            (4, "95.183.51.104", 50004),
+            (5, "31.163.201.90", 50005),
+            (6, "52.14.83.91", 50006),
+            (7, "161.97.169.229", 50007),
+            (8, "195.133.198.6", 50008),
+            (9, "124.187.106.233", 50009),
+            (10, "94.130.179.247", 50010),
+            (11, "67.181.90.11", 50011),
+            (12, "3.16.169.178", 50012),
+            (13, "113.30.247.109", 50013),
+            (14, "168.220.219.199", 50014),
+            (15, "185.37.61.73", 50015),
+            (16, "193.7.195.250", 50016),
+            (17, "5.161.63.179", 50017),
+            (18, "24.23.27.180", 50018),
+            (19, "190.105.235.113", 50019),
+            (20, "184.18.166.118", 50020),
+            (21, "125.236.210.184", 50021),
+            (22, "174.182.225.64", 50022),
+            (23, "130.255.77.156", 50023),
+            (24, "209.205.66.24", 50024),
+        ]
 
     config.raida_servers = [
         ServerConfig(address=addr, port=port, index=idx)

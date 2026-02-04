@@ -206,29 +206,55 @@ async def get_raida_servers(
                   f"Got {len(servers)} RAIDA servers from database")
         return servers
 
-    # Fetch from URL
+   
+# Fetch from URL (plain text format: IP:PORT per line)
     log_info(logger_handle, LOCKER_CONTEXT,
              f"Fetching RAIDA servers from {RAIDA_SERVERS_URL}")
 
     try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(RAIDA_SERVERS_URL, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    servers = _parse_raida_servers_response(data, logger_handle)
-                    if servers and len(servers) == RAIDA_COUNT:
-                        log_info(logger_handle, LOCKER_CONTEXT,
-                                 f"Fetched {len(servers)} RAIDA servers from URL")
-                        return servers
-    except ImportError:
-        log_warning(logger_handle, LOCKER_CONTEXT,
-                    "aiohttp not installed, using hardcoded servers")
+        import urllib.request
+        req = urllib.request.Request(
+            RAIDA_SERVERS_URL,
+            headers={'User-Agent': 'QMail-LockerDownload/1.0'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode('utf-8')
+
+        servers = []
+        for line in text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if ':' in line:
+                parts = line.split(':')
+                host = parts[0].strip()
+                try:
+                    port = int(parts[1].strip())
+                except (ValueError, IndexError):
+                    port = 50000 + len(servers)
+            else:
+                host = line
+                port = 50000 + len(servers)
+            if host:
+                servers.append(ServerInfo(
+                    host=host,
+                    port=port,
+                    raida_id=len(servers),
+                    shard_id=0
+                ))
+
+        if len(servers) >= RAIDA_COUNT:
+            log_info(logger_handle, LOCKER_CONTEXT,
+                     f"Fetched {len(servers)} RAIDA servers from URL")
+            return servers[:RAIDA_COUNT]
+        else:
+            log_warning(logger_handle, LOCKER_CONTEXT,
+                        f"Only {len(servers)} servers from URL, need {RAIDA_COUNT}")
     except Exception as e:
         log_error(logger_handle, LOCKER_CONTEXT,
-                  "Failed to fetch RAIDA servers", str(e))
+                  "Failed to fetch RAIDA servers from URL", str(e))
 
-    # Fallback: hardcoded default servers
+    # Fallback: hardcoded default servers (with CORRECT IPs)
     servers = _get_default_raida_servers()
     log_warning(logger_handle, LOCKER_CONTEXT,
                 f"Using {len(servers)} hardcoded default RAIDA servers")
@@ -273,7 +299,7 @@ def _get_default_raida_servers() -> List[ServerInfo]:
         "31.163.201.90",     # RAIDA 5
         "52.14.83.91",       # RAIDA 6
         "161.97.169.229",    # RAIDA 7
-        "13.234.55.11",      # RAIDA 8
+        "195.133.198.6",     # RAIDA 8  
         "124.187.106.233",   # RAIDA 9
         "94.130.179.247",    # RAIDA 10
         "67.181.90.11",      # RAIDA 11
@@ -283,11 +309,11 @@ def _get_default_raida_servers() -> List[ServerInfo]:
         "185.37.61.73",      # RAIDA 15
         "193.7.195.250",     # RAIDA 16
         "5.161.63.179",      # RAIDA 17
-        "76.114.47.144",     # RAIDA 18
+        "24.23.27.180",      # RAIDA 18 
         "190.105.235.113",   # RAIDA 19
         "184.18.166.118",    # RAIDA 20
         "125.236.210.184",   # RAIDA 21
-        "5.161.123.254",     # RAIDA 22
+        "174.182.225.64",    # RAIDA 22 
         "130.255.77.156",    # RAIDA 23
         "209.205.66.24",     # RAIDA 24
     ]
@@ -310,7 +336,7 @@ def _get_default_raida_servers() -> List[ServerInfo]:
 def compute_coin_an(denomination: int, serial_number: int, seed: bytes) -> bytes:
     """
     Computes the NEW Authenticity Number for a downloaded coin.
-    Matches server formula: MD5(binary: 1-byte Denom + 4-byte SN + 16-byte Seed) + 0xFFFFFFFF
+    Matches server formula: MD5(binary: 1-byte Denom + 4-byte SN + 16-byte Seed) 
     
     NOTE: Denomination can be negative (e.g., -1 for 0.1 CC).
     We convert to unsigned byte using & 0xFF to match server behavior.

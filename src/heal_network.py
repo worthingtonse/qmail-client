@@ -145,10 +145,10 @@ def fetch_raida_servers_from_url() -> Optional[List[RaidaServer]]:
             text = response.read().decode('utf-8')
 
             # Parse plain text format: IP:PORT per line
-            lines = text.strip().split('\n')
+            # lines = text.strip().split('\n')
             servers = []
 
-            for i, line in enumerate(lines):
+            for line in text.strip().split('\n'):
                 line = line.strip()
                 if not line:
                     continue
@@ -160,16 +160,17 @@ def fetch_raida_servers_from_url() -> Optional[List[RaidaServer]]:
                     try:
                         port = int(parts[1].strip())
                     except (ValueError, IndexError):
-                        port = RAIDA_BASE_PORT + i
+                        port = RAIDA_BASE_PORT + len(servers)
                 else:
                     host = line
-                    port = RAIDA_BASE_PORT + i
+                    port = RAIDA_BASE_PORT + len(servers)
 
-                servers.append(RaidaServer(
-                    raida_id=i,
-                    host=host,
-                    port=port
-                ))
+                if host:
+                    servers.append(RaidaServer(
+                        raida_id=len(servers),
+                        host=host,
+                        port=port
+                    ))
 
             if len(servers) >= RAIDA_COUNT:
                 logger.info(f"Fetched {len(servers)} RAIDA servers from URL")
@@ -234,11 +235,12 @@ def get_raida_servers(db_handle: Any = None) -> List[RaidaServer]:
             _raida_servers_cache = url_servers
             return _raida_servers_cache
 
-        # Use hardcoded defaults as last resort
-        logger.info("Using default hardcoded RAIDA servers")
-        _raida_servers_cache = get_default_raida_servers()
-        return _raida_servers_cache
-
+             # NO DNS FALLBACK - DNS names resolve to stale/wrong IPs
+        # If URL fetch fails, raise error so the problem is visible
+        raise RuntimeError(
+            f"FATAL: Cannot fetch RAIDA servers from {RAIDA_SERVERS_URL}. "
+            "Check network connectivity. Will not fall back to DNS names."
+        )
 
 def clear_server_cache() -> None:
     """Clear the cached server list to force refresh."""
@@ -260,7 +262,7 @@ def get_raida_endpoint(raida_id: int) -> Tuple[str, int]:
     servers = get_raida_servers()
     if 0 <= raida_id < len(servers):
         return servers[raida_id].host, servers[raida_id].port
-    return RAIDA_URL_PATTERN.format(raida_id), RAIDA_BASE_PORT + raida_id
+    raise ValueError(f"RAIDA {raida_id} out of range (0-{len(servers)-1})")
 
 
 # ============================================================================
@@ -326,7 +328,7 @@ def send_request(
         logger.warning(f"RAIDA{raida_id} timeout ({host}:{port})")
         return HealErrorCode.ERR_NETWORK_ERROR, b''
     except socket.error as e:
-        logger.warning(f"RAIDA{raida_id} socket error: {e}")
+        logger.warning(f"RAIDA{raida_id} socket error ({host}:{port}): {e}")
         return HealErrorCode.ERR_NETWORK_ERROR, b''
     except Exception as e:
         logger.error(f"RAIDA{raida_id} unexpected error: {e}")

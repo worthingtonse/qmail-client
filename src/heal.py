@@ -395,6 +395,18 @@ def heal_wallet(wallet_path: str, max_iterations: int = 3) -> HealResult:
 
     logger.info(
         f"Wallet folders verified: Bank, Fracked, Limbo, Fraud, Suspect, Grade")
+    
+    # Log which RAIDA IPs we're using (critical for debugging connection issues)
+    try:
+        from heal_network import get_raida_servers
+        servers = get_raida_servers()
+        logger.info(f"Using {len(servers)} RAIDA servers from host file:")
+        for s in servers:
+            logger.debug(f"  RAIDA {s.raida_id}: {s.host}:{s.port}")
+    except Exception as e:
+        logger.error(f"Failed to load RAIDA servers: {e}")
+        result.errors.append(f"RAIDA server discovery failed: {e}")
+        return result
 
    # STEP 0: MOVE FRACKED BANK COINS TO FRACKED FOLDER
     # Check all Bank coins for 'f', 'n', or 'u' status and move them for healing

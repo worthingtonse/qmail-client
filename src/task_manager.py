@@ -1125,34 +1125,35 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
     log_info(logger, "Staking", f"Staking coins into {target_wallet} wallet via Command 8...")
     log_debug(logger, "Staking", f"Locker code: {locker_code_str}")
 
-    # Hardcoded RAIDA IP addresses as fallback (from config.py)
-    RAIDA_IPS_FALLBACK = [
-        "78.46.170.45",      # RAIDA 0
-        "47.229.9.94",       # RAIDA 1
-        "209.46.126.167",    # RAIDA 2
-        "116.203.157.233",   # RAIDA 3
-        "95.183.51.104",     # RAIDA 4
-        "31.163.201.90",     # RAIDA 5
-        "52.14.83.91",       # RAIDA 6
-        "161.97.169.229",    # RAIDA 7
-        "13.234.55.11",      # RAIDA 8
-        "124.187.106.233",   # RAIDA 9
-        "94.130.179.247",    # RAIDA 10
-        "67.181.90.11",      # RAIDA 11
-        "3.16.169.178",      # RAIDA 12
-        "113.30.247.109",    # RAIDA 13
-        "168.220.219.199",   # RAIDA 14
-        "185.37.61.73",      # RAIDA 15
-        "193.7.195.250",     # RAIDA 16
-        "5.161.63.179",      # RAIDA 17
-        "76.114.47.144",     # RAIDA 18
-        "190.105.235.113",   # RAIDA 19
-        "184.18.166.118",    # RAIDA 20
-        "125.236.210.184",   # RAIDA 21
-        "5.161.123.254",     # RAIDA 22
-        "130.255.77.156",    # RAIDA 23
-        "209.205.66.24",     # RAIDA 24
-    ]
+# Fetch RAIDA IPs from host file URL (single source of truth)
+    import urllib.request as _urllib_req
+    _RAIDA_URL = "https://raida11.cloudcoin.global/service/raida_servers"
+    _raida_ips = []
+    try:
+        _req = _urllib_req.Request(_RAIDA_URL, headers={'User-Agent': 'QMail-Staking/1.0'})
+        with _urllib_req.urlopen(_req, timeout=10) as _resp:
+            _text = _resp.read().decode('utf-8')
+        for _line in _text.strip().split('\n'):
+            _line = _line.strip()
+            if _line:
+                _raida_ips.append(_line.split(':')[0].strip())
+        if len(_raida_ips) < 25:
+            raise ValueError(f"Only {len(_raida_ips)} servers")
+        log_info(logger, "Staking", f"Fetched {len(_raida_ips)} RAIDA IPs from host file")
+    except Exception as _e:
+        log_warning(logger, "Staking", f"URL fetch failed ({_e}), trying config.raida_servers")
+        _raida_ips = []
+        if app_context:
+            raida_cfg = getattr(app_context, 'config', None)
+            if raida_cfg:
+                for s in getattr(raida_cfg, 'raida_servers', []):
+                    idx = getattr(s, 'index', len(_raida_ips))
+                    while len(_raida_ips) <= idx:
+                        _raida_ips.append('')
+                    _raida_ips[idx] = getattr(s, 'address', '')
+        if len(_raida_ips) < 25 or not all(_raida_ips):
+            log_error(logger, "Staking", "Cannot get RAIDA server IPs from URL or config")
+            return {}
 
     seeds = {}
     responses = {}
@@ -1163,17 +1164,8 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
         servers_used = 0
 
         for raida_id in range(25):
-            # Try app_context first, then use fallback hardcoded IPs
-            ip = None
-            if app_context:
-                ip = app_context.get_server_ip(raida_id)
-
-            if not ip:
-                # Fallback to hardcoded IPs
-                ip = RAIDA_IPS_FALLBACK[raida_id]
-                log_debug(logger, "Staking", f"RAIDA {raida_id}: Using fallback IP {ip}")
-            else:
-                log_debug(logger, "Staking", f"RAIDA {raida_id}: Using cached IP {ip}")
+            ip = _raida_ips[raida_id]
+            log_debug(logger, "Staking", f"RAIDA {raida_id}: {ip}")
 
             servers_used += 1
 
@@ -1239,31 +1231,54 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
     # 4. Reconstruct ANs and Write Files
     for dn, sn in all_coin_keys:
         calculated_ans = []
+        pown_chars = []
         for raida_id in range(25):
-            if raida_id in seeds:
-                # AN Formula: MD5( Denom(1) + SN(4) + Seed(16) )
-                binary_input = struct.pack(">B", dn) + struct.pack(">I", sn) + seeds[raida_id]
-                digest = bytearray(hashlib.md5(binary_input).digest())
-                
-                # --- MANDATORY TAIL (cmd_locker.c line 191) ---
-                # RAIDA isko future payments ke liye "Passport" maanta hai
-                digest[12:16] = b'\xff\xff\xff\xff'
-                calculated_ans.append(digest) # Store as raw bytes
+            if raida_id in responses and raida_id in seeds:
+                coin_found = any(d == dn and s == sn for d, s in responses[raida_id])
+                if coin_found:
+                    binary_input = struct.pack(">B", dn & 0xFF) + struct.pack(">I", sn) + seeds[raida_id]
+                    digest = bytearray(hashlib.md5(binary_input).digest())
+                    # NO 0xFFFFFFFF tail — raw MD5 per cmd_locker.c line 1405
+                    calculated_ans.append(bytes(digest))
+                    pown_chars.append('p')
+                else:
+                    calculated_ans.append(bytes(16))
+                    pown_chars.append('f')
             else:
                 calculated_ans.append(bytes(16))
-
-        # Build coin object for write_coin_file
-        # It must have: denomination, serial_number, ans, pown_string
+                pown_chars.append('u')
+        pown_string = ''.join(pown_chars)
+        pass_count = pown_string.count('p')
+        fail_count = pown_string.count('f')
+        unknown_count = pown_string.count('u')
+        log_info(logger, "Staking",
+                 f"Coin DN={dn} SN={sn}: {pass_count}p/{fail_count}f/{unknown_count}u")
+        if pass_count < 13:
+            log_warning(logger, "Staking",
+                        f"Coin DN={dn} SN={sn} only has {pass_count}/25 passes — "
+                        f"may not have quorum. Saving anyway for healing.")
         coin_obj = type('Coin', (), {
             'denomination': dn,
             'serial_number': sn,
             'ans': calculated_ans,
-            'pown_string': 'p' * 25  # All passed since we just downloaded them
+            'pown_string': pown_string
         })()
 
         # STABLE NAMING: DN.SN.bin (e.g., 1.9572.bin)
+        # filename = f"{dn}.{sn}.bin"
+        # save_path = os.path.join(bank_path, filename)
+
+
+        # STABLE NAMING: DN.SN.bin (e.g., 1.9572.bin)
         filename = f"{dn}.{sn}.bin"
-        save_path = os.path.join(bank_path, filename)
+        if pass_count == 25:
+            save_path = os.path.join(bank_path, filename)
+        else:
+            fracked_path = f"Data/Wallets/{target_wallet}/Fracked"
+            os.makedirs(fracked_path, exist_ok=True)
+            save_path = os.path.join(fracked_path, filename)
+            log_info(logger, "Staking",
+                     f"Saving {filename} to Fracked folder (pown: {pown_string})")
         
         # Call your fixed write_coin_file
         from src.cloudcoin import write_coin_file
@@ -1308,11 +1323,17 @@ def execute_single_stake(srv_cfg, packet, logger, raida_id=None):
         else:
             # Log the actual status for debugging (INFO level so user can see)
             status_meaning = {
-                251: "Locker not found/empty",
-                252: "Invalid key",
-                253: "Locker expired",
-                200: "OK but no coins",
-                241: "All Checks Passed" 
+                   241: "All Checks Passed",
+                   242: "All Checks Failed",
+                   243: "Mixed results",
+                   250: "Success",
+                   179: "Locker not found/empty",
+                   154: "Locker already used",
+                   153: "Too few coins in locker",
+                   252: "Internal error",
+                   253: "Network error",
+                   200: "Invalid AN",  
+                    27:  "Invalid encryption code", 
             }.get(resp_h.status, f"Unknown status")
             log_info(logger, "Staking", f"{rid_str}: Status {resp_h.status} ({status_meaning})")
             return 4, None

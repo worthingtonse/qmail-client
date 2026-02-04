@@ -570,7 +570,7 @@ def connect_to_server(
                 backoff = retry_backoff_ms * (2 ** attempt) / 1000.0
                 log_warning(
                     logger_handle, NET_CONTEXT,
-                    f"Connection timeout (attempt {attempt + 1}/{max_retries}), retrying in {backoff:.1f}s"
+                    f"Connection timeout to {server_info.host}:{server_info.port} (attempt {attempt + 1}/{max_retries}), retrying in {backoff:.1f}s"
                 )
                 time.sleep(backoff)
                 continue
