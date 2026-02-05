@@ -907,26 +907,39 @@ def handle_import_credentials(request_handler, request_context):
 
         # 3. PRETTY IDENTITY RESOLUTION (Lookup in Directory)
         from database import execute_query
-        err, rows = execute_query(app_ctx.db_handle, "SELECT auto_address FROM Users WHERE SerialNumber = ?", (sn,))
+        err, rows = execute_query(app_ctx.db_handle,
+            "SELECT auto_address, FirstName, LastName FROM Users WHERE SerialNumber = ?", (sn,))
 
         if err == 0 and rows:
             email_address = rows[0]['auto_address']
+            first_name = rows[0].get('FirstName', '')
+            last_name = rows[0].get('LastName', '')
         else:
-            # Fallback if sync hasn't happened yet
             email_address = f"0006.{dn}.{sn}"
+            first_name = ""
+            last_name = ""
+
+        # Generate pretty address: FirstName.LastName@Domain#Base32SN.Class
+        from data_sync import convert_to_custom_base32
+        class_names = {0: 'Bit', 1: 'Byte', 2: 'Kilo', 3: 'Mega', 4: 'Giga'}
+        class_name = class_names.get(dn, 'Bit')
+        base32_sn = convert_to_custom_base32(sn)
+
+        if first_name and last_name:
+            pretty_address = f"{first_name}.{last_name}@QMail#{base32_sn}.{class_name}"
+        else:
+            pretty_address = f"User.User@Unregistered#{base32_sn}.{class_name}"
 
         # 4. UPDATE RUNTIME CONFIG AND SAVE TO FILE
         try:
-            # Update runtime config
             app_ctx.config.identity.serial_number = sn
             app_ctx.config.identity.denomination = dn
-            app_ctx.config.identity.email_address = email_address
+            app_ctx.config.identity.email_address = pretty_address
 
-            # Save config to file using config module's save_config
             from src.config import save_config
             config_path = "config/qmail.toml"
             if save_config(app_ctx.config, config_path):
-                log_info(logger, "ImportCredentials", f"Config saved with identity: {email_address}")
+                log_info(logger, "ImportCredentials", f"Config saved with identity: {pretty_address}")
             else:
                 log_error(logger, "ImportCredentials", "Failed to save config to file")
         except Exception as e:
@@ -936,6 +949,7 @@ def handle_import_credentials(request_handler, request_context):
             "status": "success",
             "message": "Credentials imported successfully.",
             "email_address": email_address,
+            "pretty_address": pretty_address,
             "serial_number": sn,
             "denomination": dn
         })
