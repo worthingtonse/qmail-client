@@ -334,12 +334,13 @@ CREATE INDEX IF NOT EXISTS idx_sent_timestamp ON sent_emails(timestamp);
 -- Table for incoming email metadata (from .tell files)
 CREATE TABLE IF NOT EXISTS received_tells (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_guid TEXT UNIQUE,            -- The unique identifier for the mail package
-    locker_code BLOB,                 -- Code used to fetch stripes
-    tell_type INTEGER,                -- 0 for QMail, 1 for Payment
-    download_status INTEGER DEFAULT 0, -- 0=Metadata Only, 1=Downloaded
-    read_status INTEGER DEFAULT 0,     -- 0=Unread, 1=Read
-    local_path TEXT,                  -- Path to the file on local disk
+    file_guid TEXT UNIQUE,
+    locker_code BLOB,
+    tell_type INTEGER,
+    sender_sn INTEGER DEFAULT 0,
+    download_status INTEGER DEFAULT 0,
+    read_status INTEGER DEFAULT 0,
+    local_path TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -376,217 +377,9 @@ CREATE INDEX IF NOT EXISTS idx_received_stripes_tell_id ON received_stripes(tell
 # INIT DATABASE
 # ============================================================================
 
-# def init_database(db_path: str, logger: Any = None, base_dir: str = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
-#     """
-#     Initialize database connection and create schema if needed.
 
-#     Args:
-#         db_path: Path to the SQLite database file
-#         logger: Optional logger handle for logging operations
-#         base_dir: Optional base directory for path validation security.
-#                   If provided, db_path must be within this directory.
 
-#     Returns:
-#         Tuple of (error_code, database_handle)
-#         Handle is None if initialization failed.
 
-#     C signature: DatabaseErrorCode init_database(const char* db_path, const char* base_dir, DatabaseHandle** out_handle);
-#     """
-#     if not db_path:
-#         log_error(logger, DB_CONTEXT, "init_database failed", "db_path is empty")
-#         return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-#     # Security: Validate path doesn't escape intended directory (prevents path traversal)
-#     # This check is optional but recommended for production use
-#     if base_dir is not None:
-#         abs_db_path = os.path.abspath(db_path)
-#         abs_base_dir = os.path.abspath(base_dir)
-#         if not abs_db_path.startswith(abs_base_dir):
-#             log_error(logger, DB_CONTEXT, "init_database failed", f"db_path '{db_path}' escapes base_dir (path traversal attempt)")
-#             return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-#     # Ensure directory exists
-#     db_dir = os.path.dirname(db_path)
-#     if db_dir and not os.path.exists(db_dir):
-#         try:
-#             os.makedirs(db_dir)
-#             log_info(logger, DB_CONTEXT, f"Created database directory: {db_dir}")
-#         except OSError as e:
-#             log_error(logger, DB_CONTEXT, "Failed to create database directory", str(e))
-#             return DatabaseErrorCode.ERR_IO, None
-
-#     try:
-#         # Connect to database (creates file if doesn't exist)
-#         # check_same_thread=False allows connection to be used from multiple threads
-#         # (required for multi-threaded API server)
-#         connection = sqlite3.connect(db_path, check_same_thread=False)
-#         connection.row_factory = sqlite3.Row  # Enable dict-like access to rows
-
-#         # Enable foreign keys
-#         connection.execute("PRAGMA foreign_keys = ON")
-
-#         # Create schema
-#         cursor = connection.cursor()
-#         cursor.executescript(SCHEMA_SQL)
-#         connection.commit()
-
-#         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
-#         log_info(logger, DB_CONTEXT, f"Database initialized successfully: {db_path}")
-
-#         return DatabaseErrorCode.SUCCESS, handle
-
-#     except sqlite3.Error as e:
-#         log_error(logger, DB_CONTEXT, "Database initialization failed", str(e))
-#         return DatabaseErrorCode.ERR_OPEN_FAILED, None
-
-# def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
-#     """
-#     Initialize database connection and create/upgrade schema safely.
-#     SAFE VERSION: No DROP TABLE. Uses migration logic for existing databases.
-#     """
-#     import sqlite3
-#     import os
-#     from src.database import DatabaseErrorCode, DatabaseHandle
-#     from src.logger import log_info, log_error
-
-#     if not db_path: return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-#     try:
-#         connection = sqlite3.connect(db_path, check_same_thread=False)
-#         connection.row_factory = sqlite3.Row
-#         connection.execute("PRAGMA foreign_keys = ON")
-#         cursor = connection.cursor()
-
-#         # 1. CREATE CORE TABLES (IF NOT EXISTS)
-#         cursor.execute("""
-#             CREATE TABLE IF NOT EXISTS Users (
-#                 SerialNumber INTEGER PRIMARY KEY,
-#                 Denomination INTEGER DEFAULT 0,
-#                 CustomSerialNumber TEXT UNIQUE,
-#                 FirstName TEXT,
-#                 LastName TEXT,
-#                 auto_address TEXT UNIQUE,
-#                 Description TEXT,
-#                 InboxFee REAL DEFAULT 0.0,
-#                 Class TEXT,
-#                 Beacon TEXT
-#             )
-#         """)
-
-#         # 2. AUTO-MIGRATION: Add missing columns if they don't exist
-#         cursor.execute("PRAGMA table_info(Users)")
-#         existing_cols = [col[1] for col in cursor.fetchall()]
-        
-#         if 'contact_count' not in existing_cols:
-#             log_info(logger, "Database", "Upgrading Users table: adding contact_count")
-#             cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
-        
-#         if 'last_contacted_timestamp' not in existing_cols:
-#             cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp TEXT")
-
-#         # 3. EMAILS & JUNCTION (Safe Creation)
-#         cursor.execute("""
-#             CREATE TABLE IF NOT EXISTS Emails (
-#                 EmailID BLOB PRIMARY KEY,
-#                 Subject TEXT,
-#                 Body TEXT,
-#                 ReceivedTimestamp INTEGER,
-#                 SentTimestamp INTEGER,
-#                 is_read INTEGER DEFAULT 0,
-#                 is_starred INTEGER DEFAULT 0,
-#                 is_trashed INTEGER DEFAULT 0,
-#                 folder TEXT DEFAULT 'inbox',
-#                 Meta BLOB,
-#                 Style BLOB
-#             )
-#         """)
-
-#         cursor.execute("""
-#             CREATE TABLE IF NOT EXISTS Junction_Email_Users (
-#                 EmailID BLOB,
-#                 SerialNumber INTEGER,
-#                 user_type TEXT CHECK(user_type IN ('TO', 'CC', 'BC', 'MASS', 'FROM')),
-#                 PRIMARY KEY (EmailID, SerialNumber, user_type),
-#                 FOREIGN KEY(EmailID) REFERENCES Emails(EmailID) ON DELETE CASCADE
-#             )
-#         """)
-
-#         # 4. TELLS & INDEXES
-#         cursor.execute("CREATE TABLE IF NOT EXISTS received_tells (file_guid TEXT PRIMARY KEY, locker_code BLOB, tell_type INTEGER DEFAULT 0, download_status INTEGER DEFAULT 0, created_at INTEGER DEFAULT (strftime('%s','now')))")
-#         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_pretty ON Users(auto_address)")
-
-#         connection.commit()
-#         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
-#         return DatabaseErrorCode.SUCCESS, handle
-
-#     except sqlite3.Error as e:
-#         if logger: log_error(logger, "Database", "Initialization failed", str(e))
-#         return DatabaseErrorCode.ERR_OPEN_FAILED, None
-
-# def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
-#     """
-#     Initialize database connection and create all tables.
-#     FIXED: Auto-migrates missing columns (UseForParity, PingMS) to prevent crashes.
-#     """
-#     import sqlite3
-#     import os
-#     from src.database import DatabaseErrorCode, DatabaseHandle, SCHEMA_SQL
-#     from src.logger import log_info, log_error
-
-#     if not db_path: 
-#         return DatabaseErrorCode.ERR_INVALID_PARAM, None
-
-#     # 1. Directory Safety
-#     db_dir = os.path.dirname(db_path)
-#     if db_dir and not os.path.exists(db_dir):
-#         try:
-#             os.makedirs(db_dir, exist_ok=True)
-#             log_info(logger, "Database", f"Created directory: {db_dir}")
-#         except OSError as e:
-#             if logger: log_error(logger, "Database", "Directory creation failed", str(e))
-#             return DatabaseErrorCode.ERR_IO, None
-
-#     try:
-#         # 2. Connection
-#         connection = sqlite3.connect(db_path, check_same_thread=False)
-#         connection.row_factory = sqlite3.Row
-#         connection.execute("PRAGMA foreign_keys = ON")
-#         cursor = connection.cursor()
-
-#         # 3. Create Tables (If they don't exist)
-#         cursor.executescript(SCHEMA_SQL)
-
-#         # 4. MIGRATION: Fix Servers Table (This fixes your crash)
-#         cursor.execute("PRAGMA table_info(Servers)")
-#         server_cols = [col[1] for col in cursor.fetchall()]
-        
-#         if 'UseForParity' not in server_cols:
-#             log_info(logger, "Database", "Migrating: Adding UseForParity to Servers")
-#             cursor.execute("ALTER TABLE Servers ADD COLUMN UseForParity INTEGER DEFAULT 0")
-            
-#         if 'PingMS' not in server_cols:
-#             log_info(logger, "Database", "Migrating: Adding PingMS to Servers")
-#             cursor.execute("ALTER TABLE Servers ADD COLUMN PingMS INTEGER DEFAULT 0")
-
-#         # 5. MIGRATION: Fix Users Table (Preserving your existing checks)
-#         cursor.execute("PRAGMA table_info(Users)")
-#         user_cols = [col[1] for col in cursor.fetchall()]
-        
-#         if 'contact_count' not in user_cols:
-#             cursor.execute("ALTER TABLE Users ADD COLUMN contact_count INTEGER DEFAULT 0")
-        
-#         if 'last_contacted_timestamp' not in user_cols:
-#             cursor.execute("ALTER TABLE Users ADD COLUMN last_contacted_timestamp INTEGER")
-
-#         connection.commit()
-#         log_info(logger, "Database", f"Database initialized and migrated: {db_path}")
-        
-#         handle = DatabaseHandle(connection=connection, path=db_path, logger=logger)
-#         return DatabaseErrorCode.SUCCESS, handle
-
-#     except sqlite3.Error as e:
-#         if logger: log_error(logger, "Database", "Initialization failed", str(e))
-#         return DatabaseErrorCode.ERR_OPEN_FAILED, None
 
 def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, Optional[DatabaseHandle]]:
     """
@@ -654,6 +447,13 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
         if 'InboxLockerHex' not in pt_cols:
             log_info(logger, "Database", "Migrating: Adding InboxLockerHex to PendingTells")
             cursor.execute("ALTER TABLE PendingTells ADD COLUMN InboxLockerHex TEXT")
+
+        # 7. MIGRATION: received_tells sender_sn column (for existing databases)
+        try:
+            cursor.execute("ALTER TABLE received_tells ADD COLUMN sender_sn INTEGER DEFAULT 0")
+            log_info(logger, "Database", "Migrating: Adding sender_sn to received_tells")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         connection.commit()
         log_info(logger, "Database", f"Database initialized and migrated: {db_path}")
@@ -2816,113 +2616,8 @@ def get_stripes_for_tell(handle: DatabaseHandle, tell_id: int) -> Tuple[Database
         return DatabaseErrorCode.ERR_QUERY_FAILED, []
 
 
-def store_received_tell(
-    handle: DatabaseHandle,
-    file_guid: str,
-    locker_code: bytes,
-    tell_type: int = 0,
-    version: int = 1,
-    file_size: int = 0,
-    status: str = 'pending'
-) -> Tuple[DatabaseErrorCode, int]:
-    """
-    Store a received tell notification in the database.
-
-    Args:
-        handle: Database handle
-        file_guid: File group GUID (string, hex format)
-        locker_code: 8-byte locker code
-        file_type: Type of file (0=email, 10+=attachments)
-        version: Protocol version
-        file_size: Expected file size (if known)
-        status: Status string ('pending', 'downloading', 'complete', 'failed')
-
-    Returns:
-        Tuple of (error_code, tell_id)
-        tell_id is -1 on failure
-
-    C signature: DatabaseErrorCode store_received_tell(DatabaseHandle* handle,
-                                                         const char* file_guid,
-                                                         const uint8_t* locker_code,
-                                                         int file_type, int* out_tell_id);
-    """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, -1
-
-    if not file_guid or locker_code is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM, -1
-
-    # Convert locker_code to hex string for storage
-    locker_code_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
-
-    try:
-        cursor = handle.connection.cursor()
-        cursor.execute("""
-        INSERT OR REPLACE INTO received_tells
-        (file_guid, locker_code, tell_type)
-         VALUES (?, ?, ?)
-        """, (file_guid, locker_code_hex, tell_type))
-        handle.connection.commit()
-        tell_id = cursor.lastrowid
-
-        log_info(handle.logger, DB_CONTEXT, f"Stored received tell: {file_guid}, id={tell_id}")
-        return DatabaseErrorCode.SUCCESS, tell_id
-
-    except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to store received tell", str(e))
-        handle.connection.rollback()
-        return DatabaseErrorCode.ERR_QUERY_FAILED, -1
 
 
-def store_received_stripe(
-    handle: DatabaseHandle,
-    tell_id: int,
-    server_ip: str,
-    stripe_id: int,
-    is_parity: bool,
-    stripe_hash: str = None
-) -> DatabaseErrorCode:
-    """
-    Store stripe location information for a received tell.
-
-    Args:
-        handle: Database handle
-        tell_id: ID of the parent tell
-        server_ip: Server IP address or hostname
-        stripe_id: Stripe index (0-based)
-        is_parity: True if this is a parity stripe
-        stripe_hash: Optional hash of stripe data for verification
-
-    Returns:
-        DatabaseErrorCode
-
-    C signature: DatabaseErrorCode store_received_stripe(DatabaseHandle* handle,
-                                                           int tell_id, const char* server_ip,
-                                                           int stripe_id, bool is_parity);
-    """
-    if handle is None or handle.connection is None:
-        return DatabaseErrorCode.ERR_INVALID_PARAM
-
-    if tell_id < 0 or not server_ip:
-        return DatabaseErrorCode.ERR_INVALID_PARAM
-
-    try:
-        cursor = handle.connection.cursor()
-        cursor.execute("""
-            INSERT INTO received_stripes
-            (tell_id, server_ip, stripe_id, is_parity, stripe_hash)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tell_id, server_ip, stripe_id, is_parity, stripe_hash))
-
-        handle.connection.commit()
-        log_debug(handle.logger, DB_CONTEXT,
-                  f"Stored stripe: tell_id={tell_id}, server={server_ip}, stripe={stripe_id}")
-        return DatabaseErrorCode.SUCCESS
-
-    except sqlite3.Error as e:
-        log_error(handle.logger, DB_CONTEXT, "Failed to store received stripe", str(e))
-        handle.connection.rollback()
-        return DatabaseErrorCode.ERR_QUERY_FAILED
 
 
 def update_received_tell_status(
@@ -3679,6 +3374,7 @@ def store_received_tell(
     file_guid: Any, 
     locker_code: bytes,
     tell_type: int = 0,
+    sender_sn: int = 0,
     version: int = 1,
     file_size: int = 0,
     status: str = 'pending'
@@ -3703,11 +3399,12 @@ def store_received_tell(
         cursor = handle.connection.cursor()
         
         # 2. INSERT OR REPLACE: Duplicate GUID aane par ye record ko refresh kar dega
+       
         cursor.execute("""
             INSERT OR REPLACE INTO received_tells
-            (file_guid, locker_code, tell_type)
-            VALUES (?, ?, ?)
-        """, (guid_hex, locker_code_hex, tell_type))
+            (file_guid, locker_code, tell_type, sender_sn)
+            VALUES (?, ?, ?, ?)
+        """, (guid_hex, locker_code_hex, tell_type, sender_sn))
 
         handle.connection.commit()
         tell_id = cursor.lastrowid

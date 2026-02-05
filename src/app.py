@@ -11,7 +11,7 @@ Usage:
 
 Author: Claude Opus 4.5
 Date: 2025-12-16
-Phase: I (Stub Implementation)
+Phase: I 
 """
 
 import asyncio
@@ -1004,7 +1004,7 @@ def main():
                                 logger, "Beacon", f"Cleaned/Padded locker: {clean_code} -> {locker_code.hex()}")
                         new_locker_found = True
 
-                        new_locker_found = True
+                        
                     else:
                         log_debug(
                             logger, "Beacon", f"Notification {file_guid[:8]} does not contain a locker code.")
@@ -1052,7 +1052,8 @@ def main():
                         app_context.db_handle,
                         file_guid=file_guid,
                         locker_code=locker_code,
-                        tell_type=getattr(notification, 'tell_type', 0)
+                        tell_type=getattr(notification, 'tell_type', 0),
+                        sender_sn=sender_sn
                     )
 
                     if err != DatabaseErrorCode.SUCCESS:
@@ -1104,7 +1105,9 @@ def main():
                             try:
                                 from download_handler import download_locker_payment
                                 log_info(logger, "Beacon", f"Claiming inbox fee for {file_guid[:8]}...")
-                                err, _ = asyncio.run(download_locker_payment(
+                                if not hasattr(app_context, '_beacon_loop') or app_context._beacon_loop is None or app_context._beacon_loop.is_closed():
+                                    app_context._beacon_loop = asyncio.new_event_loop()
+                                err, _ = app_context._beacon_loop.run_until_complete(download_locker_payment(
                                     app_context, file_guid, logger
                                 ))
                                 if err == 0:

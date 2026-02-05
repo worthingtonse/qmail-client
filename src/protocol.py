@@ -1709,7 +1709,7 @@ def validate_download_response(
         return ProtocolErrorCode.ERR_INVALID_BODY, status_code, 0, b''
 
     # Parse 9-byte Body Metadata (Starts at Byte 32)
-    # body[0]:type, [1]:ver, [2]:bpp, [3-4]:page, [5-8]:data_len
+    
     meta_body = response[32:]
     try:
        

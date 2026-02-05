@@ -481,7 +481,7 @@ def handle_mail_download(request_handler, context):
     db_handle = app_ctx.db_handle
     logger = app_ctx.logger
 
-    file_guid = context.path_params.get('id', '').replace('-', '').strip()
+    file_guid = context.path_params.get('id', '').replace('-', '').strip().upper()
     if len(file_guid) != 32:
         request_handler.send_json_response(
             400, {"error": "Invalid file_guid format"})
@@ -521,6 +521,7 @@ def handle_mail_download(request_handler, context):
         file_bytes, status = download_file_sync(
             db_handle=db_handle,
             file_guid=file_guid,
+            file_type=1,  # FIX: Body stripes stored as .qmail (type 1), NOT .meta (type 0)
             denomination=identity.denomination,
             serial_number=identity.serial_number,
             device_id=getattr(identity, 'device_id', 0),
@@ -553,16 +554,18 @@ def handle_mail_download(request_handler, context):
             received_ts = None
             cursor = db_handle.connection.cursor()
             cursor.execute(
-                "SELECT created_at FROM received_tells WHERE file_guid = ?",
+                "SELECT created_at, sender_sn FROM received_tells WHERE file_guid = ?",
                 (file_guid,))
             tell_row = cursor.fetchone()
             if tell_row:
                 received_ts = tell_row['created_at'] if tell_row['created_at'] else None
-                # Mark as downloaded
+                sender_sn = tell_row['sender_sn'] if tell_row['sender_sn'] else 0
+                # Mark as downloaded so inbox shows real subject next time
                 cursor.execute(
                     "UPDATE received_tells SET download_status = 1 WHERE file_guid = ?",
                     (file_guid,))
                 db_handle.connection.commit()
+           
 
             store_email(db_handle, {
                 'email_id': file_guid,
@@ -645,7 +648,7 @@ def handle_mail_payment_download(request_handler, context):
     db_handle = app_ctx.db_handle
 
     # Get file_guid from path parameter
-    file_guid = context.path_params.get('id', '').replace('-', '').strip()
+    file_guid = context.path_params.get('id', '').replace('-', '').strip().upper()
 
     if len(file_guid) != 32:
         request_handler.send_json_response(400, {
@@ -3844,5 +3847,3 @@ if __name__ == "__main__":
     print("  POST /api/wallet/heal           - Manual coin healing")
     print("  GET  /api/wallet/heal/status    - Wallet health status")
     print("  POST /api/wallet/discover       - Discover Bank coin status")
-    
-

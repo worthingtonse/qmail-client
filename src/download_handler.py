@@ -102,6 +102,7 @@ async def download_file(
     Orchestrates the download.
     FIXED: Returns (data, status) to match api_handlers.py expectations.
     """
+    file_guid = file_guid.upper()
     log_info(db_handle.logger, DOWNLOAD_CONTEXT, f"Starting download: {file_guid}")
 
     # 1. Fetch Metadata (IP and Port parsed from the Tell Notification)
@@ -273,18 +274,25 @@ async def download_all_stripes(
         # Sort stripes by index (0, 1, 2, 3) for the Weaver
         sorted_stripes = [all_stripe_data[sid] for sid in sorted(all_stripe_data.keys())]
         
-        # Estimate size (sum of all data stripes)
+        # FIX: Bit-interleaving padding means sum(stripe_sizes) >= original_size.
+        # The difference is at most (num_stripes - 1) bits worth of padding.
+        # We reassemble with est_size then strip trailing null padding bytes.
+        # For proper binary support, sender should set total_file_size in .tell header.
         est_size = sum(len(s) for s in sorted_stripes)
         
-        # Call the bit-interleaved reassembler from striping.py
         err, reassembled = striping.reassemble_upload_stripes(sorted_stripes, est_size, logger_handle)
         
         if err == striping.ErrorCode.SUCCESS:
+            # Strip bit-interleaving padding (trailing nulls from round-robin overshoot)
+            # Safe for UTF-8 text. For binary attachments, we need exact size from .tell header.
+            reassembled = reassembled.rstrip(b'\x00')
+            
             result.success = True
             result.data = reassembled
-            # If we reached this point, we didn't have a fatal authentication error
             if result.status != 200:
                 result.status = 250 
+            log_info(logger_handle, DOWNLOAD_CONTEXT,
+                     f"Reassembled {len(sorted_stripes)} stripes -> {len(reassembled)} bytes")
         else:
             result.error_message = f"Reassembly failed with error {err}"
     else:

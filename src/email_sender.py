@@ -1747,6 +1747,7 @@ def send_tell_notifications(
     tells_sent = 0
     tells_failed = 0
     timestamp = int(time.time())
+    _beacon_ip_cache = {}  # Cache: raida_id -> IP string
     
     for address, r_type, beacon_id, beacon_fee, inbox_fee in recipient_fee_info:
         try:
@@ -1793,7 +1794,8 @@ def send_tell_notifications(
 
             err = _send_single_tell(
                 beacon_raida_id, beacon_id, tell_recipient, file_group_guid,
-                tell_servers, beacon_locker_bytes, identity, timestamp, logger_handle
+                tell_servers, beacon_locker_bytes, identity, timestamp, logger_handle,
+                beacon_ip_cache=_beacon_ip_cache
             )
 
             if err == ErrorCode.SUCCESS:
@@ -1904,7 +1906,8 @@ def _send_single_tell(
     locker_code: bytes,
     identity: 'IdentityConfig',
     timestamp: int,
-    logger_handle: Optional[object] = None
+    logger_handle: Optional[object] = None,
+    beacon_ip_cache: Optional[Dict] = None
 ) -> ErrorCode:
     """
     Deliver Tell notification with TCP-to-UDP fallback.
@@ -1949,17 +1952,21 @@ def _send_single_tell(
     # host = f"{beacon_id}.cloudcoin.global"
     # s_info = ServerInfo(host=host, port=50000 + raida_id, raida_id=raida_id)
     # 3. Try TCP Port 50000+ (resolve beacon IP from host file, not DNS)
+   # 3. Resolve beacon IP (cached across recipients)
     import urllib.request as _urlreq
-    _beacon_ip = None
-    try:
-        _req = _urlreq.Request("https://raida11.cloudcoin.global/service/raida_servers",
-                               headers={'User-Agent': 'QMail-Tell/1.0'})
-        with _urlreq.urlopen(_req, timeout=10) as _resp:
-            _lines = _resp.read().decode('utf-8').strip().split('\n')
-            if raida_id < len(_lines):
-                _beacon_ip = _lines[raida_id].strip().split(':')[0]
-    except Exception:
-        pass
+    _beacon_ip = (beacon_ip_cache or {}).get(raida_id)
+    if not _beacon_ip:
+        try:
+            _req = _urlreq.Request("https://raida11.cloudcoin.global/service/raida_servers",
+                                   headers={'User-Agent': 'QMail-Tell/1.0'})
+            with _urlreq.urlopen(_req, timeout=10) as _resp:
+                _lines = _resp.read().decode('utf-8').strip().split('\n')
+                if raida_id < len(_lines):
+                    _beacon_ip = _lines[raida_id].strip().split(':')[0]
+                    if beacon_ip_cache is not None:
+                        beacon_ip_cache[raida_id] = _beacon_ip
+        except Exception:
+            pass
     if not _beacon_ip:
         return ErrorCode.ERR_NETWORK
     s_info = ServerInfo(host=_beacon_ip, port=50000 + raida_id, raida_id=raida_id)
