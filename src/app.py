@@ -341,7 +341,29 @@ def initialize_application(args):
                     key_file_to_use = filepath
                     log_warning(logger, "App", f"Identity found in Fracked: SN={identity_coin['serial_number']}")
                     break
- 
+
+        # --- STARTUP HEAL: Fix fracked identity before accepting requests ---
+        if identity_coin:
+            log_info(logger, "App", "Identity coin is fracked. Healing before startup...")
+            try:
+                from heal import heal_wallet
+                heal_res = heal_wallet("Data/Wallets/Mailbox", max_iterations=3)
+                log_info(logger, "App",
+                         f"Startup heal complete: {heal_res.total_fixed}/{heal_res.total_fracked} fixed")
+
+                # Check if coin moved back to Bank
+                healed_path = os.path.join(mailbox_bank, os.path.basename(key_file_to_use))
+                if os.path.exists(healed_path):
+                    key_file_to_use = healed_path
+                    identity_coin = load_coin_metadata(healed_path)
+                    log_info(logger, "App", "Identity healed and restored to Bank ✓")
+                else:
+                    log_warning(logger, "App",
+                                "Identity still in Fracked after heal — "
+                                "some RAIDAs may be unreachable. Will retry on next startup.")
+            except Exception as heal_ex:
+                log_error(logger, "App", f"Startup heal failed: {heal_ex}")
+
     # --- THE CRITICAL FIX: OVERRIDE STALE CONFIG WITH DISK REALITY ---
     if identity_coin:
         detected_sn = identity_coin['serial_number']

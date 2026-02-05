@@ -1712,14 +1712,15 @@ def send_tell_notifications(
         recipient_fee_info.append((address, r_type, beacon_id, beacon_fee, inbox_fee))
     
     log_info(logger_handle, SENDER_CONTEXT,
-             f"Total recipient fees needed: {total_fees_needed:.8f} CC "
-             f"({len(all_recipients)} recipients)")
-
+             f"Total notification fees: {total_fees_needed:.8f} CC "
+             f"({len(all_recipients)} recipients) — "
+             f"Beacon: {sum(bf for _, _, _, bf, _ in recipient_fee_info):.8f} CC, "
+             f"Inbox: {sum(inf for _, _, _, _, inf in recipient_fee_info):.8f} CC")
     # ================================================================
     # 5. PRE-FLIGHT: Verify Bank coins and heal if needed
     # ================================================================
     if total_fees_needed > 0.00000001:
-        log_info(logger_handle, SENDER_CONTEXT, "PRE-FLIGHT: Verifying Bank coins for recipient fees...")
+        log_info(logger_handle, SENDER_CONTEXT, "PRE-FLIGHT: Verifying Bank coins for notification fees...")
         
         preflight_ok = _preflight_verify_for_tells(
             wallet_path=wallet_path,
