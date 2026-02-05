@@ -3500,6 +3500,231 @@ def handle_wallet_discover(request_handler, context):
     request_handler.send_json_response(200, response)
 
 
+def handle_prepare_change(request_handler, context):
+    """
+    POST /api/wallet/prepare-change - Pre-break coins for upcoming sends.
+    
+    Calculates total fees for the given recipients (storage + beacon + inbox),
+    then breaks coins in Default wallet so that send_email doesn't have to.
+
+    Request body:
+        {
+            "recipients": ["Sean.Worthington@CEO#C23.Giga", "user2@..."],
+            "num_sends": 1          // optional, default 1 (how many times to send to these recipients)
+        }
+
+    Response:
+        {
+            "status": "success",
+            "total_fee_per_send": 0.10008392,
+            "total_fee_prepared": 0.10008392,
+            "breakdown": {
+                "storage_per_send": 0.00008392,
+                "beacon_fees": 0.10000000,
+                "inbox_fees": 0.00000000
+            },
+            "coins_broken": 2,
+            "ready_for_sends": 1,
+            "denominations_available": {"0.00000001": 120, "0.001": 5, "0.1": 3}
+        }
+    """
+    import json, os, asyncio, math
+    from logger import log_info, log_error, log_warning
+    from database import get_user_by_address, DatabaseErrorCode, get_all_servers
+    from coin_scanner import scan_coins_in_directory
+    from coin_break import break_coin_by_denomination
+    from payment import get_server_fees
+
+    app_ctx = request_handler.server_instance.app_context
+    logger = app_ctx.logger
+    db = app_ctx.db_handle
+    CONTEXT = "PrepareChange"
+
+    # Fixed beacon notification fee — no column in DB, hardcoded in send flow (email_sender.py:1690)
+    BEACON_FEE = 0.1
+
+    # --- 1. PARSE REQUEST ---
+    try:
+        data = json.loads(context.body.decode('utf-8'))
+        recipients = data.get('recipients', [])
+        num_sends = max(1, int(data.get('num_sends', 1)))
+    except Exception as e:
+        log_error(logger, CONTEXT, f"Bad request: {e}")
+        return request_handler.send_json_response(400, {"error": "Invalid JSON. Need {\"recipients\": [...]}"})
+
+    if not recipients or not isinstance(recipients, list):
+        return request_handler.send_json_response(400, {
+            "error": "recipients must be a non-empty list of email addresses"
+        })
+
+    # --- 2. CALCULATE STORAGE FEES (per send) ---
+    err, servers = get_all_servers(db, available_only=True)
+    num_servers = len(servers) if err == 0 and servers else 8
+
+    storage_per_send = 0.0
+    err_fee, server_fees = get_server_fees(db, logger_handle=logger)
+    if err_fee == 0 and server_fees:
+        for sf in server_fees:
+            storage_per_send += sf.cost_per_mb / 1024.0
+            storage_per_send += sf.cost_per_8_weeks / 8.0
+    else:
+        storage_per_send = num_servers * 0.00001049
+
+    log_info(logger, CONTEXT, f"Storage fee per send: {storage_per_send:.8f} CC across {num_servers} servers")
+
+    # --- 3. CALCULATE RECIPIENT FEES (beacon + inbox per recipient) ---
+    total_beacon_fees = 0.0
+    total_inbox_fees = 0.0
+
+    for address in recipients:
+        inbox_fee = 0.0
+
+        err_db, user = get_user_by_address(db, address)
+        if err_db == DatabaseErrorCode.SUCCESS and user:
+            if user.get('inbox_fee'):
+                try:
+                    inbox_fee = float(user['inbox_fee'])
+                except:
+                    inbox_fee = 0.0
+        else:
+            log_warning(logger, CONTEXT, f"User '{address}' not in directory, using defaults")
+
+        total_beacon_fees += BEACON_FEE
+        total_inbox_fees += inbox_fee
+
+    # --- 4. TOTAL CALCULATION ---
+    fee_per_send = storage_per_send + total_beacon_fees + total_inbox_fees
+    total_needed = fee_per_send * num_sends
+
+    log_info(logger, CONTEXT,
+             f"Fee per send: {fee_per_send:.8f} CC "
+             f"(storage: {storage_per_send:.8f}, "
+             f"beacon: {total_beacon_fees:.8f}, "
+             f"inbox: {total_inbox_fees:.8f}) x {num_sends} sends = {total_needed:.8f} CC")
+
+    # --- 5. CHECK EXISTING SMALL COINS ---
+    wallet_path = "Data/Wallets/Default"
+    bank_path = os.path.join(wallet_path, "Bank")
+
+    total_value, coin_count, denom_counts = scan_coins_in_directory(bank_path, logger)
+
+    # Small = coins worth <= 0.1 CC (suitable for payments without breaking)
+    small_coin_value = 0.0
+    for value, count in denom_counts.items():
+        if value <= 0.1:
+            small_coin_value += value * count
+
+    if small_coin_value >= total_needed:
+        denom_display = {str(v): c for v, c in sorted(denom_counts.items())}
+        log_info(logger, CONTEXT,
+                 f"Already have {small_coin_value:.8f} CC in small coins "
+                 f"(need {total_needed:.8f}). No breaking needed.")
+        return request_handler.send_json_response(200, {
+            "status": "success",
+            "message": "Sufficient change already available.",
+            "total_fee_per_send": round(fee_per_send, 8),
+            "total_fee_prepared": round(total_needed, 8),
+            "breakdown": {
+                "storage_per_send": round(storage_per_send, 8),
+                "beacon_fees": round(total_beacon_fees, 8),
+                "inbox_fees": round(total_inbox_fees, 8),
+                "num_sends": num_sends
+            },
+            "coins_broken": 0,
+            "ready_for_sends": num_sends,
+            "denominations_available": denom_display
+        })
+
+    # --- 6. BREAK COINS ---
+    deficit = total_needed - small_coin_value
+    coins_broken = 0
+    max_breaks = 10  # safety limit
+
+    log_info(logger, CONTEXT,
+             f"Need {deficit:.8f} CC more in small coins. Breaking...")
+
+    for attempt in range(max_breaks):
+        # Re-scan after each break
+        _, _, current_denoms = scan_coins_in_directory(bank_path, logger)
+
+        current_small = 0.0
+        for value, count in current_denoms.items():
+            if value <= 0.1:
+                current_small += value * count
+
+        if current_small >= total_needed:
+            log_info(logger, CONTEXT, f"Sufficient change after {coins_broken} breaks.")
+            break
+
+        # Find smallest coin larger than 0.1 CC
+        available_large = sorted(
+            [(v, c) for v, c in current_denoms.items() if v > 0.1 and c > 0],
+            key=lambda x: x[0]
+        )
+
+        if not available_large:
+            log_warning(logger, CONTEXT, "No more coins available to break.")
+            break
+
+        target_value = available_large[0][0]
+        target_denom = int(round(math.log10(target_value)))
+
+        log_info(logger, CONTEXT,
+                 f"Breaking {target_value} CC coin (denom={target_denom})...")
+
+        try:
+            result = asyncio.run(
+                break_coin_by_denomination(wallet_path, target_denom, logger_handle=logger)
+            )
+
+            if getattr(result, 'success', False):
+                coins_broken += 1
+                log_info(logger, CONTEXT, f"Break #{coins_broken} successful.")
+            else:
+                error_msg = getattr(result, 'error_message', 'Unknown error')
+                log_error(logger, CONTEXT, f"Break failed: {error_msg}")
+                break
+        except Exception as e:
+            log_error(logger, CONTEXT, f"Break exception: {e}")
+            break
+
+    # --- 7. FINAL SCAN & RESPONSE ---
+    final_value, final_count, final_denoms = scan_coins_in_directory(bank_path, logger)
+
+    final_small = 0.0
+    for value, count in final_denoms.items():
+        if value <= 0.1:
+            final_small += value * count
+
+    ready_sends = int(final_small / fee_per_send) if fee_per_send > 0 else 0
+    denom_display = {str(v): c for v, c in sorted(final_denoms.items())}
+
+    status = "success" if final_small >= total_needed else "partial"
+    message = (f"Change prepared: {coins_broken} coins broken. "
+               f"Ready for {ready_sends} send(s).")
+
+    if status == "partial":
+        message += f" (Requested {num_sends}, but only enough change for {ready_sends}.)"
+
+    log_info(logger, CONTEXT, message)
+
+    return request_handler.send_json_response(200, {
+        "status": status,
+        "message": message,
+        "total_fee_per_send": round(fee_per_send, 8),
+        "total_fee_prepared": round(min(final_small, total_needed), 8),
+        "breakdown": {
+            "storage_per_send": round(storage_per_send, 8),
+            "beacon_fees": round(total_beacon_fees, 8),
+            "inbox_fees": round(total_inbox_fees, 8),
+            "num_sends": num_sends
+        },
+        "coins_broken": coins_broken,
+        "ready_for_sends": ready_sends,
+        "denominations_available": denom_display
+    })
+
+
 # ============================================================================
 # ROUTE REGISTRATION HELPER
 # ============================================================================
@@ -3566,6 +3791,7 @@ def register_all_routes(server):
     server.register_route('POST', '/api/wallet/heal', handle_wallet_heal)
     server.register_route('GET', '/api/wallet/heal/status', handle_wallet_heal_status)
     server.register_route('POST', '/api/wallet/discover', handle_wallet_discover)
+    server.register_route('POST', '/api/wallet/prepare-change', handle_prepare_change)
 
     # Locker operations
     server.register_route('POST', '/api/locker/download',
