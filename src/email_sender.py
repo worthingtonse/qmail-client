@@ -1378,7 +1378,7 @@ def send_email_async(
         
         locker_str_safe = payments[0].locker_code_str if payments else "N/A"
         log_info(logger_handle, SENDER_CONTEXT, 
-                 f"All {len(payments)} storage payments successful. Primary locker: {locker_str_safe}")
+                 f"All {len(payments)} storage payments successful.")
         
         storage_duration = weeks_to_duration_code(request.storage_weeks)
 
