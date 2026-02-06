@@ -38,6 +38,7 @@ class ErrorCode(IntEnum):
     ERR_PERMISSION = 8
     ERR_INTERNAL = 9
     ERR_NOT_IMPLEMENTED = 10
+    ERR_INVALID_AN = 11  # Identity coin fracked - AN mismatch (status 200)
 
 
 class DatabaseErrorCode(IntEnum):

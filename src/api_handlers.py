@@ -897,12 +897,39 @@ def handle_import_credentials(request_handler, request_context):
         if not success:
             return request_handler.send_json_response(404, {"error": "Locker is empty or consensus failed"})
 
-        # 2. DISCOVER COIN & NUMERIC DATA
+       
+        # 2. DISCOVER COIN & NUMERIC DATA (Check Bank first, then Fracked)
         mailbox_bank = "Data/Wallets/Mailbox/Bank"
+        mailbox_fracked = "Data/Wallets/Mailbox/Fracked"
+        
         identity_coin = find_identity_coin(mailbox_bank, None)
-
+        
         if not identity_coin:
-            return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
+            # Check Fracked folder - coin may need healing
+            identity_coin = find_identity_coin(mailbox_fracked, None)
+            
+            if identity_coin:
+                # Coin is fracked - heal it
+                log_info(logger, "ImportCredentials", "Identity coin is fracked, initiating healing...")
+                from heal import heal_wallet
+                heal_result = heal_wallet("Data/Wallets/Mailbox", max_iterations=3)
+                log_info(logger, "ImportCredentials", f"Healing complete: {heal_result.total_fixed} fixed, {heal_result.total_failed} failed")
+                
+                # Re-check Bank folder after healing
+                identity_coin = find_identity_coin(mailbox_bank, None)
+                
+                if not identity_coin:
+                    # Still not in Bank - check if still in Fracked (healing failed)
+                    identity_coin = find_identity_coin(mailbox_fracked, None)
+                    if identity_coin:
+                        return request_handler.send_json_response(500, {
+                            "error": "Identity coin could not be healed. Please try again later.",
+                            "details": f"Fixed: {heal_result.total_fixed}, Failed: {heal_result.total_failed}"
+                        })
+                    else:
+                        return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
+            else:
+                return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
 
        # FIX: Use .get() with fallback or correct key names
         sn = int(identity_coin.get('serial_number', identity_coin.get('sn', 0)))

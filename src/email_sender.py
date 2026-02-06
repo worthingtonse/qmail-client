@@ -1801,6 +1801,18 @@ def send_tell_notifications(
             if err == ErrorCode.SUCCESS:
                 tells_sent += 1
                 log_debug(logger_handle, SENDER_CONTEXT, f"Tell sent to {address} via {beacon_id}")
+            elif err == ErrorCode.ERR_INVALID_AN:
+                # Identity fracked - trigger healing and abort tells
+                tells_failed += 1
+                log_error(logger_handle, SENDER_CONTEXT, 
+                          f"Identity coin fracked (status 200). Triggering healing...")
+                try:
+                    from app import move_identity_to_fracked
+                    move_identity_to_fracked(identity, None, logger_handle)
+                except Exception as heal_ex:
+                    log_error(logger_handle, SENDER_CONTEXT, f"Healing trigger failed: {heal_ex}")
+                # Don't continue sending tells - identity needs healing first
+                break
             else:
                 tells_failed += 1
                 log_warning(logger_handle, SENDER_CONTEXT, f"Tell failed for {address} via {beacon_id}")
@@ -1974,10 +1986,14 @@ def _send_single_tell(
     
     if err_conn == NetworkErrorCode.SUCCESS and conn:
         try:
-            # net_err 0 = SUCCESS
             net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
-            if net_err == NetworkErrorCode.SUCCESS and resp and resp.status == 250:
-                return ErrorCode.SUCCESS
+            if net_err == NetworkErrorCode.SUCCESS and resp:
+                if resp.status == 250:
+                    return ErrorCode.SUCCESS
+                elif resp.status == 200:
+                    # Identity coin fracked - return specific error
+                    log_warning(logger_handle, "EmailSender", f"TELL failed: Invalid AN (status 200) on RAIDA {raida_id}")
+                    return ErrorCode.ERR_INVALID_AN
         finally:
             disconnect(conn)
 
