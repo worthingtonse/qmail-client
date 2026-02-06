@@ -752,9 +752,9 @@ async def _prepare_server_payments_async(
         
         return failure_error or ErrorCode.ERR_INTERNAL, []
     
-    # --- 6. All payments successful ---
+    # --- 6. All payments created successfully ---
     log_info(logger_handle, CONTEXT,
-             f"All {len(payments)} server payments prepared successfully")
+             f"All {len(payments)} storage lockers created")
     
     return ErrorCode.SUCCESS, payments
 

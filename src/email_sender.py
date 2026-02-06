@@ -1376,9 +1376,9 @@ def send_email_async(
         # Use first locker code for state tracking (for refund if needed)
         state.locker_code = payments[0].locker_code if payments else b'\x00' * 8
         
-        locker_str_safe = payments[0].locker_code_str if payments else "N/A"
+        # locker_str_safe = payments[0].locker_code_str if payments else "N/A"
         log_info(logger_handle, SENDER_CONTEXT, 
-                 f"All {len(payments)} storage payments successful.")
+                 f"All {len(payments)} storage lockers ready — proceeding to upload")
         
         storage_duration = weeks_to_duration_code(request.storage_weeks)
 
