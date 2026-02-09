@@ -1269,11 +1269,14 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
         # save_path = os.path.join(bank_path, filename)
 
 
+        
         # STABLE NAMING: DN.SN.bin (e.g., 1.9572.bin)
         filename = f"{dn}.{sn}.bin"
-        if pass_count == 25:
+        if fail_count == 0 and pass_count >= 13:
+            # Healthy coin (no failures, enough passes) - goes to Bank
             save_path = os.path.join(bank_path, filename)
         else:
+            # Fracked coin (has failures) - needs healing
             fracked_path = f"Data/Wallets/{target_wallet}/Fracked"
             os.makedirs(fracked_path, exist_ok=True)
             save_path = os.path.join(fracked_path, filename)
