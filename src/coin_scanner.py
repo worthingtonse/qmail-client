@@ -510,9 +510,9 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
         if pass_count < 14:
             continue
         
-        # If has fails or errors, it's fracked (not authentic)
-        if fail_count > 0 or error_count > 0:
-            continue
+        # # If has fails or errors, it's fracked (not authentic)
+        # if fail_count > 0 or error_count > 0:
+        #     continue
         
         # 'n' (no response) and 'u' (untried) are IGNORED - coin is still authentic
         # This matches Go behavior where only 'f' and 'e' disqualify a coin
