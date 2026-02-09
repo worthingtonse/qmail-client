@@ -38,6 +38,10 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Dict, Union
 import struct
 
+# Global healing lock to prevent duplicate healing threads
+_healing_lock = threading.Lock()
+_healing_in_progress = False
+
 # Detect if running as a bundled EXE or as a script
 if getattr(sys, 'frozen', False):
     # Running as EXE: Use the directory of the executable
@@ -501,7 +505,10 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     """
     Move identity coin to Fracked folder WITHOUT changing its filename.
     FIXED: Preserves original filename, strictly uses Mailbox, and limits to 3 retries.
+    FIXED: Added global lock to prevent duplicate healing threads.
     """
+    global _healing_in_progress
+    
     from coin_scanner import find_identity_coin, load_coin_metadata
     import shutil
     import os
@@ -510,6 +517,13 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
     from beacon import stop_beacon_monitor, start_beacon_monitor, init_beacon
     from heal import heal_wallet
     from logger import log_info, log_error, log_warning
+    
+    # 0. CHECK IF HEALING ALREADY IN PROGRESS
+    with _healing_lock:
+        if _healing_in_progress:
+            log_info(logger, "App", "Healing already in progress, skipping duplicate trigger")
+            return
+        _healing_in_progress = True
  
     # 1. STOP THE MONITOR IMMEDIATELY
     if beacon_handle and beacon_handle.is_running:
@@ -617,7 +631,16 @@ def move_identity_to_fracked(identity_config, beacon_handle, logger=None):
         log_error(logger, "App", f"CRITICAL: Identity recovery failed after {max_retries} attempts.")
  
     # Start the recovery thread
-    thread = threading.Thread(target=identity_recovery_loop, name="IdentityRecovery", daemon=True)
+    def recovery_with_cleanup():
+        global _healing_in_progress
+        try:
+            identity_recovery_loop()
+        finally:
+            with _healing_lock:
+                _healing_in_progress = False
+                log_info(logger, "App", "Healing complete, lock released")
+    
+    thread = threading.Thread(target=recovery_with_cleanup, name="IdentityRecovery", daemon=True)
     thread.start()
 
 def validate_tell_payment_sync(
