@@ -2116,12 +2116,30 @@ def _build_tell_servers(
 
 
 def _parse_qmail_address(address: str) -> Tuple[int, int, int]:
+    # First: Handle Pretty Address format (User.User@Unregistered#8SA.Bit)
+    if '#' in address:
+        serial = custom_sn_to_int(address)  # Extracts SN from pretty format
+        # Extract denomination from class suffix if present
+        denom = 0  # Default
+        lower_addr = address.lower()
+        if '.bit' in lower_addr:
+            denom = 0
+        elif '.byte' in lower_addr:
+            denom = 1
+        elif '.kilo' in lower_addr:
+            denom = 2
+        elif '.mega' in lower_addr:
+            denom = 3
+        elif '.giga' in lower_addr:
+            denom = 4
+        return 0x0006, denom, serial
+    
+    # Second: Handle Technical format (0006.1.9002)
     try:
         parts = address.split('.')
         if len(parts) >= 3:
             coin_id = int(parts[0])
             denom = int(parts[1])
-            # FIXED: Use the helper to handle the 'C' prefix
             serial = custom_sn_to_int(parts[2]) 
             return coin_id, denom, serial
     except (ValueError, IndexError):
