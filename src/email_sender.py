@@ -1089,7 +1089,7 @@ def upload_file_to_servers(
             s_id = getattr(server, 'index', getattr(server, 'server_id', stripe_idx))
             s_locker = getattr(server, 'locker_code', locker_code)
 
-        return upload_stripe_to_server(
+        result = upload_stripe_to_server(
             server_address=s_addr,
             server_port=int(s_port),
             server_id=int(s_id),
@@ -1103,7 +1103,10 @@ def upload_file_to_servers(
             verify_only=should_verify,
             file_type=file_type  # <--- PASS file_type
         )
-
+        # FIX: Set IP and port in result for TELL building
+        result.ip_address = s_addr
+        result.port = int(s_port)
+        return result
     # Prepare tasks
     tasks = [
         (i, all_stripes[i], servers[i])
@@ -2095,13 +2098,9 @@ def _build_tell_servers(
         stripe_index = result.stripe_index if hasattr(result, 'stripe_index') else 0
 
         # Look up server info
-        server_info = server_lookup.get(server_id, {})
-        if isinstance(server_info, dict):
-            ip = server_info.get('ip_address', server_info.get('IPAddress', ''))
-            port = server_info.get('port', server_info.get('PortNumb', DEFAULT_BEACON_PORT))
-        else:
-            ip = getattr(server_info, 'ip_address', '')
-            port = getattr(server_info, 'port', DEFAULT_BEACON_PORT)
+        # FIX: Use IP/port directly from upload result
+        ip = result.ip_address if hasattr(result, 'ip_address') and result.ip_address else ''
+        port = result.port if hasattr(result, 'port') and result.port else DEFAULT_BEACON_PORT
 
         tell_servers.append(TellServer(
             stripe_index=stripe_index,
