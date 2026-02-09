@@ -1709,18 +1709,29 @@ def validate_download_response(
         return ProtocolErrorCode.ERR_INVALID_BODY, status_code, 0, b''
 
     # Parse 9-byte Body Metadata (Starts at Byte 32)
+    # Parse 9-byte Body Metadata (Starts at Byte 32)
     
     meta_body = response[32:]
     try:
-       
+        # Parse echoed fields (for verification/sync with server)
+        resp_file_type = meta_body[0]
+        resp_version = meta_body[1]
+        resp_bytes_per_page = meta_body[2]
+        resp_page_number = meta_body[3]
         data_length = struct.unpack('>I', meta_body[4:8])[0]
         
-        # FIXED: Actual file data starts at offset 9 (1+1+1+2+4)
+        # Reserved byte at offset 8, then binary data starts at offset 9
         file_data = meta_body[9 : 9 + data_length]
+
+        log_debug(logger_handle, PROTOCOL_CONTEXT,
+                  f"Download response: type={resp_file_type}, ver={resp_version}, "
+                  f"page_size={resp_bytes_per_page}, page={resp_page_number}, len={data_length}")
 
         return ProtocolErrorCode.SUCCESS, status_code, data_length, file_data
     except Exception as e:
         return ProtocolErrorCode.ERR_INVALID_BODY, status_code, 0, b''
+    
+   
 
 def build_complete_download_request(
     raida_id: int,
