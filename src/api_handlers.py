@@ -3554,6 +3554,7 @@ def handle_prepare_change(request_handler, context):
                 "inbox_fees": 0.00000000
             },
             "coins_broken": 2,
+            "coins_healed": 0,
             "ready_for_sends": 1,
             "denominations_available": {"0.00000001": 120, "0.001": 5, "0.1": 3}
         }
@@ -3572,6 +3573,7 @@ def handle_prepare_change(request_handler, context):
 
     # Fixed beacon notification fee — no column in DB, hardcoded in send flow (email_sender.py:1690)
     BEACON_FEE = 0.1
+    wallet_path = "Data/Wallets/Default"
 
     # --- 1. PARSE REQUEST ---
     try:
@@ -3587,7 +3589,22 @@ def handle_prepare_change(request_handler, context):
             "error": "recipients must be a non-empty list of email addresses"
         })
 
-    # --- 2. CALCULATE STORAGE FEES (per send) ---
+    # --- 2. HEAL WALLET FIRST ---
+    # Ensures fracked coins are fixed before we try to break them
+    coins_healed = 0
+    try:
+        from heal import heal_wallet
+        log_info(logger, CONTEXT, "Healing wallet before preparing change...")
+        heal_result = heal_wallet(wallet_path)
+        coins_healed = getattr(heal_result, 'coins_healed', 0)
+        if coins_healed > 0:
+            log_info(logger, CONTEXT, f"Healed {coins_healed} coins")
+        else:
+            log_info(logger, CONTEXT, "All coins healthy, no healing needed")
+    except Exception as e:
+        log_warning(logger, CONTEXT, f"Healing skipped: {e}")
+
+    # --- 3. CALCULATE STORAGE FEES (per send) ---
     err, servers = get_all_servers(db, available_only=True)
     num_servers = len(servers) if err == 0 and servers else 8
 
@@ -3602,7 +3619,7 @@ def handle_prepare_change(request_handler, context):
 
     log_info(logger, CONTEXT, f"Storage fee per send: {storage_per_send:.8f} CC across {num_servers} servers")
 
-    # --- 3. CALCULATE RECIPIENT FEES (beacon + inbox per recipient) ---
+    # --- 4. CALCULATE RECIPIENT FEES (beacon + inbox per recipient) ---
     total_beacon_fees = 0.0
     total_inbox_fees = 0.0
 
@@ -3622,7 +3639,7 @@ def handle_prepare_change(request_handler, context):
         total_beacon_fees += BEACON_FEE
         total_inbox_fees += inbox_fee
 
-    # --- 4. TOTAL CALCULATION ---
+    # --- 5. TOTAL CALCULATION ---
     fee_per_send = storage_per_send + total_beacon_fees + total_inbox_fees
     total_needed = fee_per_send * num_sends
 
@@ -3632,8 +3649,7 @@ def handle_prepare_change(request_handler, context):
              f"beacon: {total_beacon_fees:.8f}, "
              f"inbox: {total_inbox_fees:.8f}) x {num_sends} sends = {total_needed:.8f} CC")
 
-    # --- 5. CHECK EXISTING SMALL COINS ---
-    wallet_path = "Data/Wallets/Default"
+    # --- 6. CHECK EXISTING SMALL COINS ---
     bank_path = os.path.join(wallet_path, "Bank")
 
     total_value, coin_count, denom_counts = scan_coins_in_directory(bank_path, logger)
@@ -3661,14 +3677,16 @@ def handle_prepare_change(request_handler, context):
                 "num_sends": num_sends
             },
             "coins_broken": 0,
+            "coins_healed": coins_healed,
             "ready_for_sends": num_sends,
             "denominations_available": denom_display
         })
 
-    # --- 6. BREAK COINS ---
+    # --- 7. BREAK COINS ---
     deficit = total_needed - small_coin_value
     coins_broken = 0
     max_breaks = 10  # safety limit
+    break_error = None
 
     log_info(logger, CONTEXT,
              f"Need {deficit:.8f} CC more in small coins. Breaking...")
@@ -3693,7 +3711,8 @@ def handle_prepare_change(request_handler, context):
         )
 
         if not available_large:
-            log_warning(logger, CONTEXT, "No more coins available to break.")
+            break_error = "No coins available to break - check wallet balance"
+            log_warning(logger, CONTEXT, break_error)
             break
 
         target_value = available_large[0][0]
@@ -3711,14 +3730,15 @@ def handle_prepare_change(request_handler, context):
                 coins_broken += 1
                 log_info(logger, CONTEXT, f"Break #{coins_broken} successful.")
             else:
-                error_msg = getattr(result, 'error_message', 'Unknown error')
-                log_error(logger, CONTEXT, f"Break failed: {error_msg}")
+                break_error = getattr(result, 'error_message', 'Unknown error')
+                log_error(logger, CONTEXT, f"Break failed: {break_error}")
                 break
         except Exception as e:
-            log_error(logger, CONTEXT, f"Break exception: {e}")
+            break_error = str(e)
+            log_error(logger, CONTEXT, f"Break exception: {break_error}")
             break
 
-    # --- 7. FINAL SCAN & RESPONSE ---
+    # --- 8. FINAL SCAN & RESPONSE ---
     final_value, final_count, final_denoms = scan_coins_in_directory(bank_path, logger)
 
     final_small = 0.0
@@ -3733,8 +3753,13 @@ def handle_prepare_change(request_handler, context):
     message = (f"Change prepared: {coins_broken} coins broken. "
                f"Ready for {ready_sends} send(s).")
 
+    if coins_healed > 0:
+        message = f"Healed {coins_healed} coins. " + message
+
     if status == "partial":
         message += f" (Requested {num_sends}, but only enough change for {ready_sends}.)"
+        if break_error:
+            message += f" Error: {break_error}"
 
     log_info(logger, CONTEXT, message)
 
@@ -3750,10 +3775,10 @@ def handle_prepare_change(request_handler, context):
             "num_sends": num_sends
         },
         "coins_broken": coins_broken,
+        "coins_healed": coins_healed,
         "ready_for_sends": ready_sends,
         "denominations_available": denom_display
     })
-
 
 # ============================================================================
 # ROUTE REGISTRATION HELPER
