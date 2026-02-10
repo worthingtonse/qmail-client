@@ -1195,7 +1195,10 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
         log_info(logger, "Staking", f"Sending requests to {servers_used} RAIDA servers...")
 
         success_count = 0
-        error_count = 0
+        network_error_count = 0
+        empty_locker_count = 0
+        other_error_count = 0
+        
         for future in as_completed(future_to_raida):
             try:
                 rid = future_to_raida[future]
@@ -1204,21 +1207,29 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
                     responses[rid] = coins_found
                     success_count += 1
                     log_debug(logger, "Staking", f"RAIDA {rid}: Found {len(coins_found)} coins")
+                elif err in [1, 2, 3, 5]:  # Network/connection errors
+                    network_error_count += 1
+                    log_debug(logger, "Staking", f"RAIDA {rid}: Network error {err}")
+                elif err == 4:  # Status error (includes 179 empty locker)
+                    empty_locker_count += 1
+                    log_debug(logger, "Staking", f"RAIDA {rid}: Locker empty or status error")
                 else:
-                    error_count += 1
-                    if err != 0:
-                        log_debug(logger, "Staking", f"RAIDA {rid}: Error {err}")
+                    other_error_count += 1
+                    log_debug(logger, "Staking", f"RAIDA {rid}: Error {err}")
             except Exception as e:
-                error_count += 1
+                network_error_count += 1
                 log_warning(logger, "Staking", f"RAIDA {future_to_raida.get(future, '?')}: Exception {e}")
                 continue
 
-        log_info(logger, "Staking", f"Results: {success_count} success, {error_count} errors")
+        log_info(logger, "Staking", f"Results: {success_count} success, {network_error_count} network, {empty_locker_count} empty, {other_error_count} other")
 
     if not responses:
-        log_error(logger, "Staking", "Consensus failed: Locker is empty or all servers failed.")
-        return False
-
+        if network_error_count == 25:
+            log_error(logger, "Staking", "All servers unreachable - network error")
+            return {"success": False, "reason": "network_error"}
+        else:
+            log_error(logger, "Staking", "Locker is empty or invalid")
+            return {"success": False, "reason": "locker_empty"}
     # 3. Identify Unique Coins (DN, SN pairs)
     all_coin_keys = set()
     for coin_list in responses.values():
@@ -1289,7 +1300,7 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
         
         log_info(logger, "Staking", f"✓ Reconstructed Stable Identity: {filename}")
 
-    return True
+    return {"success": True}
 
 def execute_single_stake(srv_cfg, packet, logger, raida_id=None):
     """Network worker for Command 8"""

@@ -887,15 +887,31 @@ def handle_import_credentials(request_handler, request_context):
     try:
         # 1. EXECUTE STAKING - pass the code WITH hyphen
         log_info(logger, "ImportCredentials", f"Importing credentials from locker code: {locker_code}")
-        success = stake_locker_identity(
+        result = stake_locker_identity(
             locker_code_bytes=locker_code,  # Pass as string with hyphen
             app_context=app_ctx,
             target_wallet="Mailbox",
             logger=logger
         )
 
-        if not success:
-            return request_handler.send_json_response(404, {"error": "Locker is empty or consensus failed"})
+        # Handle result (supports both old bool and new dict format)
+        if isinstance(result, dict):
+            if not result.get("success"):
+                if result.get("reason") == "network_error":
+                    return request_handler.send_json_response(503, {
+                        "error": "Cannot reach servers. Please check your internet connection.",
+                        "can_retry": True
+                    })
+                else:
+                    return request_handler.send_json_response(404, {
+                        "error": "Locker is empty or invalid",
+                        "can_retry": False
+                    })
+        elif not result:  # Backward compatibility
+            return request_handler.send_json_response(404, {
+                "error": "Locker is empty or consensus failed",
+                "can_retry": False
+            })
 
        
         # 2. DISCOVER COIN & NUMERIC DATA (Check Bank first, then Fracked)
@@ -2866,7 +2882,225 @@ def handle_stake_mailbox(request_handler, context):
 # LOCKER DOWNLOAD ENDPOINT
 # ============================================================================
 
-def handle_locker_download(request_handler, context):
+def handle_deposit_coins(request_handler, request_context):
+    """
+    POST /api/wallet/deposit - Deposit CloudCoins to wallet using a locker code.
+    
+    Downloads coins from RAIDA locker and saves to Default wallet.
+    Coins are graded and placed in Bank (healthy), Fracked (needs healing), or Counterfeit.
+    Auto-heals fracked coins after download.
+
+    Request body:
+        {"locker_code": "ABC-1234"}
+
+    The locker code must be exactly 8 characters in format XXX-XXXX (hyphen at index 3).
+    
+    Success Response (200):
+        {
+            "status": "success",
+            "message": "Deposited 5 coins worth 127.0 CC",
+            "coins_deposited": 5,
+            "total_value": 127.0,
+            "bank_count": 3,
+            "fracked_count": 2,
+            "coins_healed": 2,
+            "coins": [
+                {
+                    "serial_number": 12345678,
+                    "denomination": 0,
+                    "value": 1.0,
+                    "pown": "ppppppppppppppppppppppppp",
+                    "pass_count": 25,
+                    "folder": "Bank"
+                }
+            ]
+        }
+    
+    Error Responses:
+        400 - Invalid locker code format
+        404 - Locker is empty or invalid (can_retry: false)
+        503 - Network error (can_retry: true)
+        500 - Download or healing failed
+    """
+    import asyncio
+    import re
+    import os
+    import json
+    from logger import log_info, log_error, log_warning
+
+    app_ctx = request_handler.server_instance.app_context
+    logger = app_ctx.logger
+
+    CONTEXT = "DepositCoins"
+
+    # --- 1. PARSE REQUEST ---
+    try:
+        data = json.loads(request_context.body.decode('utf-8'))
+        raw_code = data.get('locker_code', '').strip()
+    except Exception as e:
+        log_error(logger, CONTEXT, f"Failed to parse JSON body: {e}")
+        return request_handler.send_json_response(400, {"error": "Invalid JSON payload"})
+
+    locker_code = raw_code.upper()  # Normalize to uppercase
+
+    # --- 2. VALIDATE FORMAT (XXX-XXXX) ---
+    if len(locker_code) != 8:
+        return request_handler.send_json_response(400, {
+            "error": "Invalid locker code format. Must be exactly 8 characters (e.g., ABC-1234)"
+        })
+
+    if locker_code[3] != '-':
+        return request_handler.send_json_response(400, {
+            "error": "Invalid locker code format. Hyphen must be at position 4 (e.g., ABC-1234)"
+        })
+
+    parts = locker_code.split('-')
+    if len(parts) != 2 or not re.match(r'^[A-Z0-9]{3}$', parts[0]) or not re.match(r'^[A-Z0-9]{4}$', parts[1]):
+        return request_handler.send_json_response(400, {
+            "error": "Invalid locker code format. Must be alphanumeric XXX-XXXX (e.g., ABC-1234)"
+        })
+
+    # --- 3. DOWNLOAD COINS ---
+    log_info(logger, CONTEXT, f"Depositing coins from locker: {locker_code}")
+
+    try:
+        from src.locker_download import download_from_locker, LockerDownloadResult
+        from src.wallet_structure import get_wallet_path, DEFAULT_WALLET
+
+        wallet_path = get_wallet_path(DEFAULT_WALLET)
+        db_handle = app_ctx.db_handle if hasattr(app_ctx, 'db_handle') else None
+
+        # Convert string to bytes for download_from_locker
+        locker_code_bytes = locker_code.encode('ascii')
+
+        result, coins = asyncio.run(download_from_locker(
+            locker_code=locker_code_bytes,
+            wallet_path=wallet_path,
+            db_handle=db_handle,
+            logger_handle=logger
+        ))
+
+    except Exception as e:
+        log_error(logger, CONTEXT, f"Download exception: {e}")
+        return request_handler.send_json_response(500, {
+            "status": "error",
+            "error": "Download failed",
+            "details": str(e)
+        })
+
+    # --- 4. HANDLE DOWNLOAD RESULT ---
+    if result == LockerDownloadResult.SUCCESS:
+        # Count coins by folder based on pown
+        bank_count = 0
+        fracked_count = 0
+        counterfeit_count = 0
+        total_value = 0.0
+        coin_list = []
+
+        for coin in coins:
+            value = 10.0 ** coin.denomination if coin.denomination != 11 else 0.0
+            total_value += value
+            pown = getattr(coin, 'pown_string', '') or ''
+            pass_count = pown.count('p')
+            fail_count = pown.count('f')
+            
+            # Determine folder based on grading logic (matches download_from_locker)
+            if fail_count == 0 and pass_count >= 13:
+                folder = "Bank"
+                bank_count += 1
+            elif pass_count >= 13:
+                folder = "Fracked"
+                fracked_count += 1
+            else:
+                folder = "Counterfeit"
+                counterfeit_count += 1
+
+            coin_list.append({
+                "serial_number": coin.serial_number,
+                "denomination": coin.denomination,
+                "value": value,
+                "pown": pown,
+                "pass_count": pass_count,
+                "folder": folder
+            })
+
+        # --- 5. AUTO-HEAL FRACKED COINS ---
+        coins_healed = 0
+        if fracked_count > 0:
+            log_info(logger, CONTEXT, f"Auto-healing {fracked_count} fracked coins...")
+            try:
+                from heal import heal_wallet
+                heal_result = heal_wallet(wallet_path, max_iterations=3)
+                coins_healed = getattr(heal_result, 'total_fixed', 0)
+                log_info(logger, CONTEXT, f"Healed {coins_healed} coins")
+            except Exception as e:
+                log_warning(logger, CONTEXT, f"Auto-heal failed: {e}")
+
+        # --- 6. SUCCESS RESPONSE ---
+        message = f"Deposited {len(coins)} coins worth {total_value:.6f} CC"
+        if coins_healed > 0:
+            message += f" (healed {coins_healed})"
+
+        log_info(logger, CONTEXT, message)
+
+        return request_handler.send_json_response(200, {
+            "status": "success",
+            "message": message,
+            "coins_deposited": len(coins),
+            "total_value": round(total_value, 8),
+            "bank_count": bank_count,
+            "fracked_count": fracked_count,
+            "counterfeit_count": counterfeit_count,
+            "coins_healed": coins_healed,
+            "coins": coin_list
+        })
+
+    elif result == LockerDownloadResult.ERR_LOCKER_EMPTY:
+        return request_handler.send_json_response(404, {
+            "status": "error",
+            "error": "Locker is empty or invalid",
+            "can_retry": False
+        })
+
+    elif result == LockerDownloadResult.ERR_NETWORK_ERROR:
+        return request_handler.send_json_response(503, {
+            "status": "error",
+            "error": "Network error - cannot reach servers. Please check your internet connection.",
+            "can_retry": True
+        })
+
+    elif result == LockerDownloadResult.ERR_INSUFFICIENT_RESPONSES:
+        # Some RAIDAs responded but not enough for consensus
+        # Locker may be partially consumed - don't suggest retry
+        return request_handler.send_json_response(500, {
+            "status": "error",
+            "error": "Insufficient server responses. Download may be incomplete.",
+            "can_retry": False
+        })
+
+    else:
+        # Map other error codes
+        error_messages = {
+            LockerDownloadResult.ERR_INVALID_LOCKER_CODE: "Invalid locker code format",
+            LockerDownloadResult.ERR_LOCKER_NOT_FOUND: "Locker not found",
+            LockerDownloadResult.ERR_FILE_WRITE_ERROR: "Failed to save coins to disk",
+            LockerDownloadResult.ERR_NO_RAIDA_SERVERS: "Could not get server list",
+            LockerDownloadResult.ERR_KEY_DERIVATION_FAILED: "Key derivation failed",
+            LockerDownloadResult.ERR_PROTOCOL_ERROR: "Protocol error",
+        }
+        error_msg = error_messages.get(result, f"Unknown error ({result})")
+
+        return request_handler.send_json_response(500, {
+            "status": "error",
+            "error": error_msg,
+            "error_code": int(result),
+            "can_retry": False
+        })
+
+
+
+
+def handle_locker_download(request_handler, context): ## incorrect function to download locker not used anymore -- the above function is used to get coins in the bank folder using a  locker code 
     """
     POST /api/locker/download - Download CloudCoins from a RAIDA locker
 
@@ -3849,6 +4083,7 @@ def register_all_routes(server):
     server.register_route('POST', '/api/wallet/prepare-change', handle_prepare_change)
 
     # Locker operations
+    server.register_route('POST', '/api/wallet/deposit', handle_deposit_coins)
     server.register_route('POST', '/api/locker/download',
                           handle_locker_download)
 

@@ -571,17 +571,21 @@ async def download_locker_payment(
         # 4. EXECUTE STAKING (Targeting Default Wallet)
         # We use stake_locker_identity because it handles the 439-byte Format 9 saving
         # and Go-style naming automatically.
-        success = stake_locker_identity(
+        result = stake_locker_identity(
             locker_code_bytes=locker_code_8char,
             app_context=app_ctx,
             target_wallet="Default",  # CRITICAL: Payments go to Default wallet
             logger=logger_handle
         )
         
-        if not success:
+        # Handle both dict and bool return formats
+        if isinstance(result, dict):
+            if not result.get("success"):
+                log_error(logger_handle, "DownloadHandler", f"Consensus failed during payment download: {result.get('reason', 'unknown')}")
+                return 2, None
+        elif not result:
             log_error(logger_handle, "DownloadHandler", "Consensus failed during payment download.")
             return 2, None
-        
         log_info(logger_handle, "DownloadHandler", "✓ Payment coins downloaded and saved to Default/Bank")
         return 0, [] # Return empty list as coins are handled internally by task_manager
         
