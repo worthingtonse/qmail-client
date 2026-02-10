@@ -472,6 +472,8 @@ def _monitor_loop(handle: BeaconHandle):
                         # Silently ignore - TELLs expire server-side eventually
                         log_debug(handle.logger_handle, "BeaconLoop", 
                                     f"Ignoring {len(tells)} already-processed notification(s)")
+                        # Cooldown to avoid tight-looping
+                        handle.shutdown_event.wait(timeout=10.0)
                 else:
                     log_debug(handle.logger_handle, "BeaconLoop", "Long-poll timeout - no mail.")
                 
