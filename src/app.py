@@ -1016,7 +1016,7 @@ def main():
 
                     # 3. LOCKER CODE CLEANING (Format: AS8D-HJL -> AS8DHJL)
                     locker_code = getattr(notification, 'locker_code', None)
-                    if locker_code:
+                    if locker_code and locker_code != bytes(len(locker_code)):
                         if isinstance(locker_code, str):
                             clean_code = locker_code.replace(
                                 '-', '').strip().upper()

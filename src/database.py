@@ -558,27 +558,35 @@ def store_email(handle: Any, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, 
             is_read
         ))
 
-        # 2. Link sender (FROM) using SerialNumber
+        
+        # 2. Link sender (FROM) using SerialNumber (only if user exists)
         sender_sn = email.get('sender_sn')
         if sender_sn is not None:
-            cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
-                VALUES (?, ?, 'FROM')
-            """, (email_id, sender_sn))
+            # Check if user exists before inserting junction
+            cursor.execute("SELECT 1 FROM Users WHERE SerialNumber = ?", (sender_sn,))
+            if cursor.fetchone():
+                cursor.execute("""
+                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
+                    VALUES (?, ?, 'FROM')
+                """, (email_id, sender_sn))
 
-        # 3. Link recipients (TO) using SerialNumber
+        # 3. Link recipients (TO) using SerialNumber (only if user exists)
         for sn in email.get('recipient_sns', []):
-            cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
-                VALUES (?, ?, 'TO')
-            """, (email_id, sn))
+            cursor.execute("SELECT 1 FROM Users WHERE SerialNumber = ?", (sn,))
+            if cursor.fetchone():
+                cursor.execute("""
+                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
+                    VALUES (?, ?, 'TO')
+                """, (email_id, sn))
 
-        # 4. Link CC recipients using SerialNumber
+        # 4. Link CC recipients using SerialNumber (only if user exists)
         for sn in email.get('cc_sns', []):
-            cursor.execute("""
-                INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
-                VALUES (?, ?, 'CC')
-            """, (email_id, sn))
+            cursor.execute("SELECT 1 FROM Users WHERE SerialNumber = ?", (sn,))
+            if cursor.fetchone():
+                cursor.execute("""
+                    INSERT OR IGNORE INTO Junction_Email_Users (EmailID, SerialNumber, user_type)
+                    VALUES (?, ?, 'CC')
+                """, (email_id, sn))
 
         handle.connection.commit()
         log_debug(handle.logger, "Database", f"Stored email: {email_id.hex()}")
