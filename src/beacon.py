@@ -468,20 +468,10 @@ def _monitor_loop(handle: BeaconHandle):
                         if handle.on_mail_received:
                             handle.on_mail_received(tells)
                     else:
-                        # CASE B: THE INFINITE LOOP FIX (Old mail detected)
-                        current_time = int(time.time())
-                        log_warning(handle.logger_handle, "BeaconLoop", 
-                                    f"Old mail detected ({len(tells)}). Flushing RAIDA queue with PEEK...")
-                        
-                        # Calling do_peek (Command 63) forcerfully acknowledges/clears notifications on RAIDA
-                        do_peek(handle, since_timestamp=current_time)
-                        
-                        # Advance local timestamp to 'Now' to ensure we never see these again
-                        handle.last_tell_timestamp = current_time
-                        _save_state(handle)
-                        
-                        # Cooldown to prevent tight-looping
-                        handle.shutdown_event.wait(timeout=5.0)
+                        # CASE B: Old mail (already processed)
+                        # Silently ignore - TELLs expire server-side eventually
+                        log_debug(handle.logger_handle, "BeaconLoop", 
+                                    f"Ignoring {len(tells)} already-processed notification(s)")
                 else:
                     log_debug(handle.logger_handle, "BeaconLoop", "Long-poll timeout - no mail.")
                 
