@@ -387,12 +387,31 @@ async def _create_locker_async(
                     return ErrorCode.ERR_INTERNAL, b'', []
                 
                 # Case B: Too many fails - coins have wrong ANs, need healing
-                # Only heal if fails are the PRIMARY reason for failure
+                
                 if fail_count > 11:  # More than 11 fails = coins are bad
-                    log_warning(logger_handle, PAYMENT_CONTEXT,
-                                f"PUT failed - coins have wrong ANs on {fail_count} RAIDAs. "
-                                f"Moving to Fracked for healing.")
-                    return ErrorCode.ERR_INTERNAL, b'', coins  # Return coins for healing
+                    if pass_count >= 13:
+                        # Healable - move to Fracked
+                        log_warning(logger_handle, PAYMENT_CONTEXT,
+                                    f"PUT failed - coins have wrong ANs on {fail_count} RAIDAs. "
+                                    f"Moving to Fracked for healing.")
+                        return ErrorCode.ERR_INTERNAL, b'', coins  # Return coins for healing
+                    else:
+                        # <13 passes = Counterfeit (lost forever)
+                        log_error(logger_handle, PAYMENT_CONTEXT,
+                                  f"PUT failed - coins are COUNTERFEIT ({pass_count} passes < 13). "
+                                  f"Moving to Counterfeit folder.")
+                        # Move to Counterfeit instead of Fracked
+                        counterfeit_path = os.path.join(wallet_path, "Counterfeit")
+                        os.makedirs(counterfeit_path, exist_ok=True)
+                        for c in coins:
+                            try:
+                                if os.path.exists(c.file_path):
+                                    import shutil
+                                    dest = os.path.join(counterfeit_path, os.path.basename(c.file_path))
+                                    shutil.move(c.file_path, dest)
+                            except:
+                                pass
+                        return ErrorCode.ERR_INTERNAL, b'', []  # Empty list - don't try to heal
                 
                 # Case C: Mixed/inconclusive - retry without healing
                 # Could be temporary network + a few bad RAIDAs

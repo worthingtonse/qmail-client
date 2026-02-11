@@ -1305,24 +1305,18 @@ def generate_coin_filename(
     """
     Generate filename for CloudCoin .bin file.
 
-    Format per coin-file-format=9.md:
-        {formatted_value} CloudCoin #{serial_number} {tag}.bin
-    Example: 1 CloudCoin #12345678.bin
+    Format: {denomination}.{serial_number}.bin
+    Example: 1.12345678.bin
 
     Args:
         denomination: Coin denomination code (signed int8, -8 to +11)
         serial_number: Coin serial number
-        tag: Optional tag/memo for the coin
+        tag: Optional tag (ignored, kept for backward compatibility)
 
     Returns:
-        Filename string following documented convention
+        Filename string
     """
-    value_str = denomination_to_display_value(denomination)
-
-    if tag:
-        return f"{value_str} CloudCoin #{serial_number} {tag}.bin"
-    else:
-        return f"{value_str} CloudCoin #{serial_number}.bin"
+    return f"{denomination}.{serial_number}.bin"
 
 
 def write_coin_file(

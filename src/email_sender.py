@@ -243,104 +243,153 @@ async def create_recipient_locker(
     import string
     import os
     import math
+    import shutil
     
-    try:
-        # 1. Get coins (Could be a single large coin or a list of small coins)
-        coins = get_coins_by_value(wallet_path, amount, identity_sn=identity_sn)
-        
-        if not coins:
-            log_warning(logger_handle, "LockerCreate", 
-                        f"No spendable coins available for amount {amount}")
-            return 1, None
-        
-        final_coins_to_lock = []
-        total_value_selected = sum(parse_denomination_code(c.denomination) for c in coins)
+    CONTEXT = "LockerCreate"
+    MAX_ATTEMPTS = 5
+    MIN_PASSES = 13
+    
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            # 1. Get coins (Could be a single large coin or a list of small coins)
+            coins = get_coins_by_value(wallet_path, amount, identity_sn=identity_sn)
+            
+            if not coins:
+                log_warning(logger_handle, CONTEXT, 
+                            f"No spendable coins available for amount {amount}")
+                return 1, None
+            
+            final_coins_to_lock = []
+            total_value_selected = sum(parse_denomination_code(c.denomination) for c in coins)
 
-        # 2. Decide if we need to break or use the selection as-is
-        if abs(total_value_selected - amount) < 0.0001:
-            # Exact match (from aggregation or single coin)
-            final_coins_to_lock = coins
-        elif total_value_selected > amount:
-            # We picked a larger coin that MUST be broken
-            # Note: get_coins_by_value only returns 1 coin if it's a 'larger' case
-            coin_to_break = coins[0]
-            log_info(logger_handle, "LockerCreate",
-                    f"Breaking coin {total_value_selected} to get {amount}")
+            # 2. Decide if we need to break or use the selection as-is
+            if abs(total_value_selected - amount) < 0.0001:
+                # Exact match (from aggregation or single coin)
+                final_coins_to_lock = coins
+            elif total_value_selected > amount:
+                # We picked a larger coin that MUST be broken
+                coin_to_break = coins[0]
+                log_info(logger_handle, CONTEXT,
+                        f"Breaking coin {total_value_selected} to get {amount}")
+                
+                break_result = await break_coin(coin_to_break, wallet_path, None, logger_handle)
+                
+                broken_coins = []
+                if hasattr(break_result, 'new_coins'):
+                   broken_coins = break_result.new_coins
+                elif isinstance(break_result, list):
+                    broken_coins = break_result
+                
+                if not broken_coins:
+                    log_error(logger_handle, CONTEXT, "Failed to break coin (Empty result)")
+                    return 2, None
+                
+                if hasattr(break_result, 'success') and break_result.success:
+                  broken_coins = break_result.new_coins
+                
+                small_val = parse_denomination_code(broken_coins[0].denomination)
+                num_needed = int(math.ceil((amount - 0.000001) / small_val))
+                final_coins_to_lock = broken_coins[:num_needed]
+            else:
+                return 1, None
+
+            # 3. Generate random locker code in XXX-XXXX format
+            random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits)
+                                   for _ in range(7))
+            locker_code = random_chars[:3] + '-' + random_chars[3:]
             
-            # --- FIX: Handle BreakResult object correctly ---
-            break_result = await break_coin(coin_to_break, wallet_path, None, logger_handle)
+            # 4. Get 25 locker keys from code
+            locker_keys_25 = get_keys_from_locker_code(locker_code)
             
-            broken_coins = []
-            # Check if result is an object with .coins attribute (standard implementation)
-            if hasattr(break_result, 'new_coins'):
-               broken_coins = break_result.new_coins
-            # Fallback if it returns a list directly
-            elif isinstance(break_result, list):
-                broken_coins = break_result
+            # 5. Prepare coins for PUT payload
+            coins_for_put = []
+            for c in final_coins_to_lock:
+                coins_for_put.append(CoinForPut(
+                    denomination=c.denomination,
+                    serial_number=c.serial_number,
+                    ans=c.ans
+                ))
             
-            if not broken_coins:
-                log_error(logger_handle, "LockerCreate", "Failed to break coin (Empty result)")
+            # 6. Lock coins on RAIDA (Command 82)
+            result, raida_results = await put_to_locker(coins_for_put, locker_keys_25)
+            
+            # 7. Analyze PUT results
+            pass_count = sum(1 for s, _ in raida_results.values() if s == 241)
+            fail_count = sum(1 for s, _ in raida_results.values() if s == 242)
+            timeout_count = sum(1 for s, _ in raida_results.values() if s == -1)
+            
+            log_info(logger_handle, CONTEXT,
+                     f"PUT results: {pass_count} pass, {fail_count} fail, {timeout_count} timeout")
+            
+            # 8. SUCCESS: Need at least 13 passes
+            if pass_count >= MIN_PASSES:
+                log_info(logger_handle, CONTEXT,
+                         f"PUT SUCCESS with {pass_count}/25 passes")
+                
+                # Cleanup: Delete original coins from bank
+                for c in coins:
+                    try:
+                        if hasattr(c, 'file_path') and os.path.exists(c.file_path):
+                            os.remove(c.file_path)
+                    except:
+                        pass
+                
+                # Return locker code as 16-byte hex (null-padded)
+                locker_key_16 = locker_code.encode('ascii').ljust(16, b'\x00')
+                return 0, locker_key_16.hex()
+            
+            # 9. FAILURE: Handle based on pass count
+            log_warning(logger_handle, CONTEXT,
+                        f"PUT FAILED (attempt {attempt + 1}/{MAX_ATTEMPTS}): "
+                        f"{pass_count}p/{fail_count}f/{timeout_count}t")
+            
+            # Determine destination folder based on pass count
+            if pass_count < MIN_PASSES:
+                if fail_count > 11:
+                    # Coins have wrong ANs - check if healable
+                    if pass_count >= MIN_PASSES:
+                        # Healable - move to Fracked
+                        dest_folder = os.path.join(wallet_path, "Fracked")
+                        folder_name = "Fracked"
+                    else:
+                        # <13 passes = Counterfeit (lost forever)
+                        dest_folder = os.path.join(wallet_path, "Counterfeit")
+                        folder_name = "Counterfeit"
+                    
+                    os.makedirs(dest_folder, exist_ok=True)
+                    
+                    for c in final_coins_to_lock:
+                        try:
+                            if hasattr(c, 'file_path') and os.path.exists(c.file_path):
+                                dest = os.path.join(dest_folder, os.path.basename(c.file_path))
+                                shutil.move(c.file_path, dest)
+                                log_info(logger_handle, CONTEXT,
+                                         f"Moved SN={c.serial_number} to {folder_name}")
+                        except Exception as e:
+                            log_warning(logger_handle, CONTEXT, f"Failed to move coin: {e}")
+                    
+                    # Only heal if coins went to Fracked (not Counterfeit)
+                    if folder_name == "Fracked" and attempt < MAX_ATTEMPTS - 1:
+                        try:
+                            from heal import heal_wallet
+                            log_info(logger_handle, CONTEXT, "Healing wallet...")
+                            heal_wallet(wallet_path, max_iterations=2)
+                            import time
+                            time.sleep(1.0)
+                        except Exception as e:
+                            log_warning(logger_handle, CONTEXT, f"Healing failed: {e}")
+                
+                elif timeout_count > 11:
+                    # Network issue - don't move coins, just retry
+                    log_warning(logger_handle, CONTEXT, "Network issues - will retry")
+            
+        except Exception as e:
+            log_error(logger_handle, CONTEXT, f"Exception creating locker: {e}")
+            if attempt == MAX_ATTEMPTS - 1:
                 return 2, None
-            
-            if hasattr(break_result, 'success') and break_result.success:
-              broken_coins = break_result.new_coins
-            
-            # MATH FIX: Calculate how many small coins are needed
-            # e.g. If we broke a 1.0 to pay 0.3, broken_coins[0] is 0.1.
-            # num_needed = ceil(0.3 / 0.1) = 3
-            small_val = parse_denomination_code(broken_coins[0].denomination)
-            num_needed = int(math.ceil((amount - 0.000001) / small_val))
-            
-            # Take the specific number of coins needed to reach the amount
-            final_coins_to_lock = broken_coins[:num_needed]
-            
-            # The remaining broken_coins are already saved to the Bank by break_coin logic
-        else:
-            # Should not happen if get_coins_by_value logic is sound
-            return 1, None
-
-        # 3. Generate random locker code in XXX-XXXX format (matches Go GenerateTransmitCode)
-        # Generate 7 random alphanumeric chars, insert hyphen at position 3
-        random_chars = ''.join(secrets.choice(string.ascii_uppercase + string.digits)
-                               for _ in range(7))
-        locker_code = random_chars[:3] + '-' + random_chars[3:]  # e.g., "ABC-1234"
-        
-        # 4. Get 25 locker keys from code (MD5(raida_id + code))
-        locker_keys_25 = get_keys_from_locker_code(locker_code)
-        
-        # 5. Prepare coins for PUT payload
-        coins_for_put = []
-        for c in final_coins_to_lock:
-            coins_for_put.append(CoinForPut(
-                denomination=c.denomination,
-                serial_number=c.serial_number,
-                ans=c.ans
-            ))
-        
-        # 6. Lock coins on RAIDA (Command 82)
-        result, details = await put_to_locker(coins_for_put, locker_keys_25)
-        
-        if result != PutResult.SUCCESS:
-            log_error(logger_handle, "LockerCreate", f"PUT failed: {result}")
-            return 2, None
-        
-        # 7. Cleanup: Delete original coins from bank (if they were used directly)
-        # If we performed a 'break', the break_coin logic usually handles the original file
-        for c in coins:
-            try:
-                if os.path.exists(c.file_path):
-                    os.remove(c.file_path)
-            except:
-                pass
-        
-        # 8. Return locker code as 16-byte hex (null-padded)
-        # This is what goes into the TELL packet recipient entry
-        locker_key_16 = locker_code.encode('ascii').ljust(16, b'\x00')
-        return 0, locker_key_16.hex()
-        
-    except Exception as e:
-        log_error(logger_handle, "LockerCreate", f"Exception creating locker: {e}")
-        return 2, None
+    
+    # All attempts failed
+    return 2, None
 
 import json
 import socket

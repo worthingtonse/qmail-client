@@ -1276,23 +1276,24 @@ def stake_locker_identity(locker_code_bytes, app_context, target_wallet="Mailbox
         })()
 
         # STABLE NAMING: DN.SN.bin (e.g., 1.9572.bin)
-        # filename = f"{dn}.{sn}.bin"
-        # save_path = os.path.join(bank_path, filename)
-
-
-        
-        # STABLE NAMING: DN.SN.bin (e.g., 1.9572.bin)
         filename = f"{dn}.{sn}.bin"
         if fail_count == 0 and pass_count >= 13:
             # Healthy coin (no failures, enough passes) - goes to Bank
             save_path = os.path.join(bank_path, filename)
-        else:
-            # Fracked coin (has failures) - needs healing
+        elif pass_count >= 13:
+            # Fracked coin (healable - has 13+ passes) - needs healing
             fracked_path = f"Data/Wallets/{target_wallet}/Fracked"
             os.makedirs(fracked_path, exist_ok=True)
             save_path = os.path.join(fracked_path, filename)
             log_info(logger, "Staking",
-                     f"Saving {filename} to Fracked folder (pown: {pown_string})")
+                     f"Saving {filename} to Fracked folder for healing (pown: {pown_string})")
+        else:
+            # Counterfeit coin (< 13 passes, cannot heal) - lost
+            counterfeit_path = f"Data/Wallets/{target_wallet}/Counterfeit"
+            os.makedirs(counterfeit_path, exist_ok=True)
+            save_path = os.path.join(counterfeit_path, filename)
+            log_warning(logger, "Staking",
+                        f"Saving {filename} to Counterfeit folder - only {pass_count} passes, cannot heal")
         
         # Call your fixed write_coin_file
         from src.cloudcoin import write_coin_file
