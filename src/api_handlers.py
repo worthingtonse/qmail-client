@@ -937,15 +937,19 @@ def handle_import_credentials(request_handler, request_context):
                 if not identity_coin:
                     # Still not in Bank - check if still in Fracked (healing failed)
                     identity_coin = find_identity_coin(mailbox_fracked, None)
-                    if identity_coin:
-                        return request_handler.send_json_response(500, {
-                            "error": "Identity coin could not be healed. Please try again later.",
-                            "details": f"Fixed: {heal_result.total_fixed}, Failed: {heal_result.total_failed}"
-                        })
-                    else:
-                        return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
-            else:
-                return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
+                    # If not in Fracked either, continue to check Counterfeit below
+            
+            # Not in Bank and not in Fracked - check Counterfeit
+            if not identity_coin:
+                mailbox_counterfeit = "Data/Wallets/Mailbox/Counterfeit"
+                identity_coin = find_identity_coin(mailbox_counterfeit, None)
+                if identity_coin:
+                    return request_handler.send_json_response(400, {
+                        "error": "Coin verification failed. This coin cannot be recovered. Please request a new locker code.",
+                        "reason": "counterfeit"
+                    })
+                else:
+                    return request_handler.send_json_response(500, {"error": "Identity coin file not found on disk."})
 
        # FIX: Use .get() with fallback or correct key names
         sn = int(identity_coin.get('serial_number', identity_coin.get('sn', 0)))
@@ -991,13 +995,17 @@ def handle_import_credentials(request_handler, request_context):
         except Exception as e:
             log_error(logger, "ImportCredentials", f"Failed to update config: {e}")
 
+        # Check if coin is still in Fracked (needs healing)
+        needs_healing = find_identity_coin(mailbox_fracked, None) is not None
+
         return request_handler.send_json_response(200, {
-            "status": "success",
-            "message": "Credentials imported successfully.",
+            "status": "partial" if needs_healing else "success",
+            "message": "Credentials imported but coin needs healing." if needs_healing else "Credentials imported successfully.",
             "email_address": email_address,
             "pretty_address": pretty_address,
             "serial_number": sn,
-            "denomination": dn
+            "denomination": dn,
+            "needs_healing": needs_healing
         })
 
     except Exception as e:
