@@ -1156,6 +1156,36 @@ def handle_search_emails(request_handler, context):
         "count": len(results)
     })
 
+
+def handle_popular_contacts(request_handler, context):
+    """
+    GET /api/data/contacts/popular - Get most frequently contacted users
+    """
+    from src.database import get_popular_contacts, DatabaseErrorCode
+    
+    app_ctx = request_handler.server_instance.app_context
+    db_handle = app_ctx.db_handle
+
+    try:
+        limit = int(context.query_params.get('limit', ['10'])[0])
+        limit = max(1, min(limit, 50))
+    except (ValueError, TypeError, IndexError):
+        limit = 10
+
+    err, contacts = get_popular_contacts(db_handle, limit=limit)
+
+    if err != DatabaseErrorCode.SUCCESS:
+        return request_handler.send_json_response(500, {
+            "error": "Database error",
+            "status": "error"
+        })
+
+    return request_handler.send_json_response(200, {
+        "status": "success",
+        "contacts": contacts,
+        "count": len(contacts)
+    })
+
 def handle_search_users(request_handler, context):
     """
     GET /api/data/users/search - Search users for autocomplete (Pretty Format)
@@ -4188,9 +4218,9 @@ def register_all_routes(server):
 
     # Data operations
     server.register_route(
-        'GET', '/api/data/contacts/popular', handle_get_contacts)
-    server.register_route(
         'GET', '/api/data/emails/search', handle_search_emails)
+    server.register_route(
+        'GET', '/api/data/contacts/popular', handle_popular_contacts)
     server.register_route('GET', '/api/data/users/search', handle_search_users)
     server.register_route('GET', '/api/data/servers', handle_get_servers)
 

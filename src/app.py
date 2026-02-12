@@ -1189,85 +1189,67 @@ def main():
     print()
     print("API Endpoints:")
     print("\n[ Health & Status ]")
-    print(f"  GET  {base_url}/api/health                - Health check")
-    print(
-        f"  GET  {base_url}/api/qmail/ping            - Beacon check for new mail")
+    # print(f"  GET  {base_url}/api/health                   - Health check")
+    print(f"  GET  {base_url}/api/qmail/ping               - Beacon check for new mail")
+    print(f"  GET  {base_url}/api/admin/version-check      - Check client version")
+
+    print("\n[ Account & Identity ]")
+    print(f"  GET  {base_url}/api/account/identity         - Get your email address")
+    print(f"  POST {base_url}/api/account/heal-identity    - Heal identity coin")
 
     print("\n[ Mail Operations ]")
-    print(f"  POST {base_url}/api/mail/send             - Send email")
-    print(
-        f"  GET  {base_url}/api/mail/download/{{id}}    - Download email by GUID")
-    print(
-        f"  GET  {base_url}/api/mail/list             - List emails (inbox, sent, etc.)")
-    print(
-        f"  POST {base_url}/api/setup/import-credentials - Import credentials (first-time setup)")
-    print(
-        f"  GET  {base_url}/api/mail/folders          - List available mail folders")
-    print(
-        f"  GET  {base_url}/api/mail/count            - Get unread/total counts")
+    print(f"  POST {base_url}/api/mail/send                - Send email")
+    print(f"  GET  {base_url}/api/mail/download/{{id}}       - Download email by GUID")
+    print(f"  GET  {base_url}/api/mail/payment/{{id}}        - Download payment for email")
+    print(f"  GET  {base_url}/api/mail/list                - List emails (inbox, sent, etc.)")
+    print(f"  POST {base_url}/api/setup/import-credentials - Import credentials (first-time setup)")
+    print(f"  GET  {base_url}/api/mail/folders             - List available mail folders")
+    print(f"  GET  {base_url}/api/mail/count               - Get unread/total counts")
 
     print("\n[ Individual Email Management ]")
-    print(f"  GET  {base_url}/api/mail/{{id}}             - Get email metadata")
-    print(
-        f"  DELETE {base_url}/api/mail/{{id}}           - Move email to trash")
-    print(
-        f"  PUT  {base_url}/api/mail/{{id}}/move        - Move email to folder")
-    print(
-        f"  PUT  {base_url}/api/mail/{{id}}/read        - Mark email read/unread")
+    print(f"  GET    {base_url}/api/mail/{{id}}              - Get email metadata")
+    print(f"  DELETE {base_url}/api/mail/{{id}}              - Move email to trash (soft delete)")
+    print(f"  DELETE {base_url}/api/mail/{{id}}/permanent    - Permanently delete email")
+    print(f"  PUT    {base_url}/api/mail/{{id}}/move         - Move email to folder")
+    print(f"  PUT    {base_url}/api/mail/{{id}}/read         - Mark email read/unread")
 
     print("\n[ Attachments ]")
-    print(
-        f"  GET  {base_url}/api/mail/{{id}}/attachments     - List attachments for email")
-    print(
-        f"  GET  {base_url}/api/mail/{{id}}/attachment/{{n}} - Download specific attachment")
+    print(f"  GET  {base_url}/api/mail/{{id}}/attachments    - List attachments for email")
+    print(f"  GET  {base_url}/api/mail/{{id}}/attachment/{{n}} - Download specific attachment")
 
     print("\n[ Contacts & Users ]")
-    print(
-        f"  GET  {base_url}/api/contacts              - List/Search all contacts")
-    print(f"  POST {base_url}/api/contacts              - Add a new contact")
-    print(f"  DELETE {base_url}/api/contacts/{{id}}       - Delete a contact")
-    print(
-        f"  GET  {base_url}/api/data/contacts/popular - Get frequent contacts")
-    print(
-        f"  GET  {base_url}/api/data/users/search     - Search users for autocomplete")
+    print(f"  GET    {base_url}/api/contacts               - List/Search all contacts")
+    print(f"  POST   {base_url}/api/contacts               - Add a new contact")
+    print(f"  DELETE {base_url}/api/contacts/{{id}}          - Delete a contact")
+    print(f"  GET    {base_url}/api/data/contacts/popular  - Get frequent contacts")
+    print(f"  GET    {base_url}/api/data/users/search      - Search users for autocomplete")
 
     print("\n[ Drafts ]")
-    print(f"  GET  {base_url}/api/mail/drafts           - List all drafts")
-    print(f"  POST {base_url}/api/mail/draft            - Save a new draft")
-    print(
-        f"  PUT  {base_url}/api/mail/draft/{{id}}       - Update an existing draft")
+    print(f"  GET  {base_url}/api/mail/drafts              - List all drafts")
+    print(f"  POST {base_url}/api/mail/draft               - Save a new draft")
+    print(f"  PUT  {base_url}/api/mail/draft/{{id}}          - Update an existing draft")
 
-    print("\n[ System & Data ]")
-    print(
-        f"  GET  {base_url}/api/data/emails/search    - Full-text search (FTS5)")
-    print(
-        f"  GET  {base_url}/api/data/servers          - Get QMail/RAIDA server list")
-    print(
-        f"  GET  {base_url}/api/wallet/balance        - Get full wallet balance")
-    print(
-        f"  POST {base_url}/api/locker/download       - Manual coin download via code")
+    print("\n[ Search & Data ]")
+    print(f"  GET  {base_url}/api/data/emails/search       - Full-text search (FTS5)")
+    print(f"  GET  {base_url}/api/data/servers             - Get QMail/RAIDA server list")
+
+    print("\n[ Wallet & Payments ]")
+    print(f"  GET  {base_url}/api/wallet/balance           - Get full wallet balance")
+    print(f"  POST {base_url}/api/wallet/heal              - Heal fracked coins")
+    print(f"  GET  {base_url}/api/wallet/heal/status       - Get wallet health status")
+    print(f"  POST {base_url}/api/wallet/discover          - Discover Bank coin status")
+    print(f"  POST {base_url}/api/wallet/prepare-change    - Prepare coins for payment")
+    print(f"  POST {base_url}/api/wallet/deposit           - Deposit coins to wallet")
+    print(f"  POST {base_url}/api/locker/download          - Manual coin download via code")
 
     print("\n[ Administration & Sync ]")
-    print(
-        f"  POST {base_url}/api/admin/sync            - Trigger manual RAIDA data sync")
-    print(
-        f"  GET  {base_url}/api/admin/servers/parity  - Get current parity server")
-    print(
-        f"  POST {base_url}/api/admin/servers/parity  - Set parity server configuration")
+    print(f"  POST {base_url}/api/admin/sync               - Trigger manual RAIDA data sync")
+    print(f"  GET  {base_url}/api/admin/servers/parity     - Get current parity server")
+    print(f"  POST {base_url}/api/admin/servers/parity     - Set parity server configuration")
 
     print("\n[ Task Management ]")
-    print(
-        f"  GET  {base_url}/api/task/status/{{id}}      - Check async task status")
-    print(
-        f"  POST {base_url}/api/wallet/heal             - Manual coin healing")
-    print(
-        f"  GET  {base_url}/api/wallet/heal/status      - Wallet health status")
-    print(
-        f"  POST {base_url}/api/wallet/discover         - Discover Bank coin status")
-    print(
-        f"  GET  {base_url}/api/account/identity        - Get your email address") 
-    print(
-        f"  POST {base_url}/api/task/cancel/{{id}}      - Cancel a pending task")
+    print(f"  GET  {base_url}/api/task/status/{{id}}         - Check async task status")
+    print(f"  POST {base_url}/api/task/cancel/{{id}}         - Cancel a pending task")
     print()
     print("Press Ctrl+C to stop the server...")
     print()
