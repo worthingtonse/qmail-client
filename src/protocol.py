@@ -325,8 +325,13 @@ def parse_tell_response(
             # 4. File GUID (Offset +16, 16 bytes)
             tell.file_guid = response_body[offset + 16 : offset + 32]
             
-            # 5. Stripe Count (Offset +36, 4 bytes)
+            # 5. Total File Size (Offset +32, 4 bytes)
+            tell.total_file_size = struct.unpack('>I', response_body[offset + 32 : offset + 36])[0]
+            
+            # 6. Stripe Count (Offset +36, 4 bytes)
             tell.server_count = struct.unpack('>I', response_body[offset + 36 : offset + 40])[0]
+
+            offset += 40  # Move past the 40-byte header block
 
             offset += 40  # Move past the 40-byte header block
 
@@ -1296,6 +1301,10 @@ def build_tell_payload(
     # =========================================================================
     h_off = 48 
     payload[h_off : h_off + 16] = file_group_guid[:16]
+    # Total file size at offset 16-19 (4 bytes, Big Endian)
+    total_file_size = kwargs.get('total_file_size', 0)
+    struct.pack_into('>I', payload, h_off + 16, total_file_size)
+    # reserved_raid at offset 20-23 (4 bytes) - leave as zeros
     struct.pack_into('>I', payload, h_off + 24, timestamp)
     payload[h_off+28] = tell_type & 0xFF
     payload[h_off+29] = ac & 0xFF # Recipient Count

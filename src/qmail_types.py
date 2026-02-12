@@ -1058,6 +1058,7 @@ class TellNotification:
     sender_sn: int = 0  # <--- NEW: Crucial for Phase II Pretty Names
     timestamp: int = 0
     tell_type: int = 0
+    total_file_size: int = 0  # Original body size for exact trim after reassembly
     server_count: int = 0
     server_list: List[ServerLocation] = field(default_factory=list)
 

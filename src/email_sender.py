@@ -1336,8 +1336,31 @@ def send_email_async(
         encryption_key = all_ans_bytes[0:16]  # 16 bytes for AES
 
         # Prepare Body with dynamic stripe count
+        # Build JSON envelope with attachment metadata
+        import json as _json
+        attachment_metadata = []
+        for i, path in enumerate(request.attachment_paths or []):
+            is_valid, res = _validate_file_path(path, logger_handle)
+            if is_valid:
+                att_size = os.path.getsize(res)
+                att_name = os.path.basename(res)
+                attachment_metadata.append({
+                    "i": i,
+                    "name": att_name,
+                    "size": att_size
+                })
+        
+        envelope = {
+            "v": 1,
+            "subject": request.subject or "",
+            "body": request.email_file.decode('utf-8') if isinstance(request.email_file, bytes) else request.email_file,
+            "attachments": attachment_metadata
+        }
+        envelope_bytes = _json.dumps(envelope, ensure_ascii=False).encode('utf-8')
+        
+        # Prepare Body with dynamic stripe count
         err, body_info = prepare_file_for_upload(
-            request.email_file, "email_body.cbdf", FILE_INDEX_BODY,
+            envelope_bytes, "email_body.cbdf", FILE_INDEX_BODY,
             encryption_key, logger_handle,
             num_servers=num_servers  # Pass server count for stripe creation
         )
@@ -1353,6 +1376,10 @@ def send_email_async(
             
             with open(res, 'rb') as f: 
                 file_data = f.read()
+            
+            # Prepend 4-byte size header to attachments for exact trim on receive
+            original_size = len(file_data)
+            file_data = original_size.to_bytes(4, 'big') + file_data
             
             err, att_info = prepare_file_for_upload(
                 file_data, os.path.basename(res), FILE_INDEX_ATTACHMENT_START + i,
@@ -1621,11 +1648,14 @@ def send_email_async(
 
         # --- 7. NOTIFICATIONS & STORAGE (Success Path) ---
         update_state("NOTIFYING", 92, "Sending notifications...")
+        # Calculate original body size for receiver to trim correctly (envelope, not raw body)
+        original_body_size = len(envelope_bytes) if envelope_bytes else 0
         send_tell_notifications(
             request=request, file_group_guid=state.file_group_guid,
             servers=servers, identity=identity, logger_handle=logger_handle,
             db_handle=db_handle, cc_handle=cc_handle, locker_code=state.locker_code,
-            upload_results=result.upload_results
+            upload_results=result.upload_results,
+            total_file_size=original_body_size
         )
 
         update_state("STORING", 95, "Storing locally...")
@@ -1667,7 +1697,8 @@ def send_tell_notifications(
     db_handle: object = None,
     cc_handle: object = None,
     locker_code: bytes = None,
-    upload_results: List['UploadResult'] = None
+    upload_results: List['UploadResult'] = None,
+    total_file_size: int = 0
 ) -> ErrorCode:
     """
     Send Tell notifications to all recipients.
@@ -1847,7 +1878,8 @@ def send_tell_notifications(
             err = _send_single_tell(
                 beacon_raida_id, beacon_id, tell_recipient, file_group_guid,
                 tell_servers, beacon_locker_bytes, identity, timestamp, logger_handle,
-                beacon_ip_cache=_beacon_ip_cache
+                beacon_ip_cache=_beacon_ip_cache,
+                total_file_size=total_file_size
             )
 
             if err == ErrorCode.SUCCESS:
@@ -1971,7 +2003,8 @@ def _send_single_tell(
     identity: 'IdentityConfig',
     timestamp: int,
     logger_handle: Optional[object] = None,
-    beacon_ip_cache: Optional[Dict] = None
+    beacon_ip_cache: Optional[Dict] = None,
+    total_file_size: int = 0
 ) -> ErrorCode:
     """
     Deliver Tell notification with TCP-to-UDP fallback.
@@ -2006,7 +2039,8 @@ def _send_single_tell(
     tell_type=TELL_TYPE_QMAIL,
     recipients=[recipient],
     servers=servers,
-    logger_handle=logger_handle
+    logger_handle=logger_handle,
+    total_file_size=total_file_size
 )
 
     if err != 0:

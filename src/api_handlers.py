@@ -48,6 +48,7 @@ from database import (
     # Attachment functions
     get_attachments_for_email,
     get_attachment_data,
+    store_attachment,
     # Contact management functions
     get_all_contacts,
     get_contact_by_id,
@@ -378,6 +379,7 @@ def handle_mail_send(request_handler, context):
         request_obj.subject = email_data.get('subject', '')
         raw_recipients = email_data.get('to', [])
         request_obj.storage_weeks = int(email_data.get('storage_weeks', 8))
+        request_obj.attachment_paths = email_data.get('attachments', [])
 
     # --- 2. PRETTY ADDRESS RESOLUTION ---
     # Convert "Pretty Name" into actual QMail technical addresses for the protocol
@@ -471,11 +473,11 @@ def handle_mail_send(request_handler, context):
 def handle_mail_download(request_handler, context):
     """
     GET /api/mail/download/{id} - Download email by ID
-    Caches downloaded email in Emails table. Serves from cache on re-open.
-    Handles Status 200 to trigger Reactive Healing.
+    Parses JSON envelope, downloads attachments, stores everything.
     """
     import sqlite3
-    from database import store_email, DatabaseErrorCode
+    import json as _json
+    from database import store_email, store_attachment, DatabaseErrorCode
 
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
@@ -483,27 +485,34 @@ def handle_mail_download(request_handler, context):
 
     file_guid = context.path_params.get('id', '').replace('-', '').strip().upper()
     if len(file_guid) != 32:
-        request_handler.send_json_response(
-            400, {"error": "Invalid file_guid format"})
+        request_handler.send_json_response(400, {"error": "Invalid file_guid format"})
         return
 
     # --- SHORT-CIRCUIT: Already downloaded? Serve from Emails table ---
     try:
         db_handle.connection.row_factory = sqlite3.Row
         cursor = db_handle.connection.cursor()
-        cursor.execute("SELECT Body FROM Emails WHERE EmailID = ?",
+        cursor.execute("SELECT Subject, Body FROM Emails WHERE EmailID = ?",
                        (bytes.fromhex(file_guid),))
         cached_row = cursor.fetchone()
         if cached_row and cached_row['Body']:
-            body_text = cached_row['Body']
-            file_bytes = body_text.encode('utf-8') if isinstance(body_text, str) else body_text
-            request_handler.send_response(200)
-            request_handler.send_header('Content-Type', 'application/octet-stream')
-            request_handler.send_header('Content-Length', str(len(file_bytes)))
-            request_handler.send_header(
-                'Content-Disposition', f'attachment; filename="{file_guid}.bin"')
-            request_handler.end_headers()
-            request_handler.wfile.write(file_bytes)
+            # Get attachments from database
+            cursor.execute("""
+                SELECT Attachment_id, name, file_extension, size_bytes 
+                FROM Attachments WHERE EmailID = ?
+            """, (bytes.fromhex(file_guid),))
+            att_rows = cursor.fetchall()
+            attachments = [{"id": r['Attachment_id'], "name": r['name'], 
+                           "extension": r['file_extension'], "size": r['size_bytes']} 
+                          for r in att_rows]
+            
+            request_handler.send_json_response(200, {
+                "status": "success",
+                "email_id": file_guid,
+                "subject": cached_row['Subject'] or "",
+                "body": cached_row['Body'],
+                "attachments": attachments
+            })
             return
     except Exception:
         pass  # Cache miss or DB error — fall through to network download
@@ -513,15 +522,14 @@ def handle_mail_download(request_handler, context):
         identity = app_ctx.config.identity
         an = _get_an_for_download(app_ctx)
     except Exception as e:
-        request_handler.send_json_response(
-            500, {"error": "Configuration error", "details": str(e)})
+        request_handler.send_json_response(500, {"error": "Configuration error", "details": str(e)})
         return
 
     try:
         file_bytes, status = download_file_sync(
             db_handle=db_handle,
             file_guid=file_guid,
-            file_type=1,  # FIX: Body stripes stored as .qmail (type 1), NOT .meta (type 0)
+            file_type=1,  # Body stored as .qmail (type 1)
             denomination=identity.denomination,
             serial_number=identity.serial_number,
             device_id=getattr(identity, 'device_id', 0),
@@ -531,27 +539,31 @@ def handle_mail_download(request_handler, context):
         # --- REACTIVE HEALING INTEGRATION ---
         if status == 200:
             from app import move_identity_to_fracked
-            log_error(logger, "API",
-                      "Download failed (200). Initiating healing.")
+            log_error(logger, "API", "Download failed (200). Initiating healing.")
             move_identity_to_fracked(identity, app_ctx.beacon_handle, logger)
-            request_handler.send_json_response(
-                401, {"error": "Authentication failed - Coin fracked"})
+            request_handler.send_json_response(401, {"error": "Authentication failed - Coin fracked"})
             return
 
         if not file_bytes:
-            request_handler.send_json_response(
-                404, {"error": "Download returned empty"})
+            request_handler.send_json_response(404, {"error": "Download returned empty"})
             return
 
-        # --- PERSIST: Save to Emails table + mark tell as downloaded ---
+        # --- PARSE JSON ENVELOPE ---
         try:
+            envelope = _json.loads(file_bytes.decode('utf-8'))
+            subject = envelope.get('subject', '')
+            body_text = envelope.get('body', '')
+            attachment_metadata = envelope.get('attachments', [])
+        except (_json.JSONDecodeError, UnicodeDecodeError):
+            # Fallback for old emails without JSON envelope
             body_text = file_bytes.decode('utf-8', errors='replace')
-            # First line of body as subject (no subject in wire format yet)
-            subject_preview = body_text[:80].split('\n')[0].strip() or f"Mail {file_guid[:8]}"
+            subject = body_text[:80].split('\n')[0].strip() or f"Mail {file_guid[:8]}"
+            attachment_metadata = []
 
-            # Get timestamp from the tell
-            sender_sn = 0
-            received_ts = None
+        # --- GET SENDER INFO FROM TELL ---
+        sender_sn = 0
+        received_ts = None
+        try:
             cursor = db_handle.connection.cursor()
             cursor.execute(
                 "SELECT created_at, sender_sn FROM received_tells WHERE file_guid = ?",
@@ -560,39 +572,77 @@ def handle_mail_download(request_handler, context):
             if tell_row:
                 received_ts = tell_row['created_at'] if tell_row['created_at'] else None
                 sender_sn = tell_row['sender_sn'] if tell_row['sender_sn'] else 0
-                # Mark as downloaded so inbox shows real subject next time
                 cursor.execute(
                     "UPDATE received_tells SET download_status = 1 WHERE file_guid = ?",
                     (file_guid,))
                 db_handle.connection.commit()
-           
+        except Exception:
+            pass
 
-            store_email(db_handle, {
-                'email_id': file_guid,
-                'subject': subject_preview,
-                'body': body_text,
-                'sender_sn': sender_sn,
-                'recipient_sns': [],
-                'folder': 'inbox',
-                'is_read': 0,
-                'received_timestamp': received_ts
-            })
-        except Exception as persist_err:
-            log_error(logger, "API", f"Cache persist failed (non-fatal): {persist_err}")
+        # --- STORE EMAIL ---
+        store_email(db_handle, {
+            'email_id': file_guid,
+            'subject': subject,
+            'body': body_text,
+            'sender_sn': sender_sn,
+            'recipient_sns': [],
+            'folder': 'inbox',
+            'is_read': 0,
+            'received_timestamp': received_ts
+        })
 
-        # Return raw bytes to frontend
-        request_handler.send_response(200)
-        request_handler.send_header('Content-Type', 'application/octet-stream')
-        request_handler.send_header('Content-Length', str(len(file_bytes)))
-        request_handler.send_header(
-            'Content-Disposition', f'attachment; filename="{file_guid}.bin"')
-        request_handler.end_headers()
-        request_handler.wfile.write(file_bytes)
+        # --- DOWNLOAD AND STORE ATTACHMENTS ---
+        stored_attachments = []
+        for att in attachment_metadata:
+            att_index = att.get('i', 0)
+            att_name = att.get('name', f'attachment_{att_index}')
+            
+            try:
+                att_bytes, att_status = download_file_sync(
+                    db_handle=db_handle,
+                    file_guid=file_guid,
+                    file_type=10 + att_index,  # .0.bin, .1.bin, etc.
+                    denomination=identity.denomination,
+                    serial_number=identity.serial_number,
+                    device_id=getattr(identity, 'device_id', 0),
+                    an=an
+                )
+                
+                if att_bytes and att_status != 200:
+                    # Get file extension
+                    ext = att_name.rsplit('.', 1)[-1] if '.' in att_name else ''
+                    
+                    # Store attachment
+                    err, att_id = store_attachment(db_handle, bytes.fromhex(file_guid), {
+                        'name': att_name,
+                        'file_extension': ext,
+                        'storage_mode': 'INTERNAL',
+                        'data_blob': att_bytes,
+                        'size_bytes': len(att_bytes)
+                    })
+                    
+                    if err == DatabaseErrorCode.SUCCESS:
+                        stored_attachments.append({
+                            "id": att_id,
+                            "name": att_name,
+                            "extension": ext,
+                            "size": len(att_bytes)
+                        })
+            except Exception as att_err:
+                log_error(logger, "API", f"Attachment {att_index} download failed: {att_err}")
+
+        # --- RETURN JSON RESPONSE ---
+        request_handler.send_json_response(200, {
+            "status": "success",
+            "email_id": file_guid,
+            "subject": subject,
+            "body": body_text,
+            "attachments": stored_attachments
+        })
 
     except Exception as e:
         log_error(logger, "API", f"Download failed: {e}")
-        request_handler.send_json_response(
-            500, {"error": "Download failed", "details": str(e)})
+        request_handler.send_json_response(500, {"error": "Download failed", "details": str(e)})
 # DONT DELETE
 
 # def _get_an_for_download(app_ctx):
@@ -1075,7 +1125,7 @@ def handle_get_contacts(request_handler, context):
 
 def handle_search_emails(request_handler, context):
     """
-    GET /api/data/emails/search - Search emails with Pretty Context
+    GET /api/data/emails/search?q=test - Search emails with Pretty Context
     """
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
@@ -1646,6 +1696,73 @@ def handle_mail_delete(request_handler, context):
         "message": "Email moved to trash" if was_modified else "Email already in trash"
     }
     request_handler.send_json_response(200, response)
+
+def handle_mail_delete_permanent(request_handler, context):
+    """
+    DELETE /api/mail/{id}/permanent - Permanently delete an email from trash
+    
+    Only works on emails that are already trashed (is_trashed = 1).
+    This permanently removes the email from the database.
+    
+    Path parameter:
+        id: The email ID (hex string, 32 chars)
+    
+    Returns:
+        - 200 with success message
+        - 400 for invalid id format or email not in trash
+        - 404 if email not found
+        - 500 for database errors
+    """
+    from src.database import DatabaseErrorCode
+    from src.logger import log_info, log_error
+    
+    app_ctx = request_handler.server_instance.app_context
+    db_handle = app_ctx.db_handle
+    logger = app_ctx.logger
+    
+    # Validate email_id
+    email_id = context.path_params.get('id')
+    is_valid, clean_id, error_msg = _validate_email_id(email_id)
+    if not is_valid:
+        return request_handler.send_json_response(400, {
+            "error": "Invalid email_id format",
+            "details": error_msg
+        })
+    
+    try:
+        email_id_bytes = bytes.fromhex(clean_id)
+        cursor = db_handle.connection.cursor()
+        
+        # Check if email exists and is trashed
+        cursor.execute("SELECT is_trashed FROM Emails WHERE EmailID = ?", (email_id_bytes,))
+        row = cursor.fetchone()
+        
+        if row is None:
+            return request_handler.send_json_response(404, {"error": "Email not found"})
+        
+        if not row['is_trashed']:
+            return request_handler.send_json_response(400, {
+                "error": "Email must be in trash before permanent deletion. Use DELETE /api/mail/{id} first."
+            })
+        
+        # Permanently delete from all tables
+        cursor.execute("DELETE FROM Junction_Email_Users WHERE EmailID = ?", (email_id_bytes,))
+        cursor.execute("DELETE FROM Attachments WHERE EmailID = ?", (email_id_bytes,))
+        cursor.execute("DELETE FROM Emails WHERE EmailID = ?", (email_id_bytes,))
+        
+        db_handle.connection.commit()
+        
+        log_info(logger, "API", f"Permanently deleted email: {clean_id}")
+        return request_handler.send_json_response(200, {
+            "status": "success",
+            "message": "Email permanently deleted",
+            "email_id": clean_id
+        })
+        
+    except Exception as e:
+        log_error(logger, "API", f"Permanent delete failed: {e}")
+        db_handle.connection.rollback()
+        return request_handler.send_json_response(500, {"error": "Database error", "details": str(e)})
 
 
 def handle_mail_move(request_handler, context):
@@ -4059,6 +4176,7 @@ def register_all_routes(server):
     server.register_route('GET', '/api/mail/drafts', handle_drafts_list)
     server.register_route('GET', '/api/mail/{id}', handle_mail_get)
     server.register_route('DELETE', '/api/mail/{id}', handle_mail_delete)
+    server.register_route('DELETE', '/api/mail/{id}/permanent', handle_mail_delete_permanent)
     server.register_route('PUT', '/api/mail/{id}/move', handle_mail_move)
     server.register_route('PUT', '/api/mail/{id}/read', handle_mail_read)
 

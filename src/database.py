@@ -455,6 +455,12 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        try:
+            cursor.execute("ALTER TABLE received_tells ADD COLUMN total_file_size INTEGER DEFAULT 0")
+            log_info(logger, "Database", "Migrating: Adding total_file_size to received_tells")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         connection.commit()
         log_info(logger, "Database", f"Database initialized and migrated: {db_path}")
         
@@ -501,7 +507,7 @@ def close_database(handle: DatabaseHandle) -> bool:
 def store_email(handle: Any, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, Optional[bytes]]:
     """
     Store an email in the database.
-    FIXED: Uses SerialNumber for linking in Junction_Email_Users.
+    
 
     Args:
         handle: Database handle
@@ -537,15 +543,24 @@ def store_email(handle: Any, email: Dict[str, Any]) -> Tuple[DatabaseErrorCode, 
     try:
         cursor = handle.connection.cursor()
 
-        # 1. Insert into Emails table
+        # 1. Insert into Emails table (update if exists)
         folder = email.get('folder', 'inbox')
         is_read = email.get('is_read', 0)
         
         cursor.execute("""
-            INSERT OR IGNORE INTO Emails (
+            INSERT INTO Emails (
                 EmailID, Subject, Body, ReceivedTimestamp, 
                 SentTimestamp, Meta, Style, folder, is_read
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(EmailID) DO UPDATE SET
+                Subject = excluded.Subject,
+                Body = excluded.Body,
+                ReceivedTimestamp = COALESCE(excluded.ReceivedTimestamp, ReceivedTimestamp),
+                SentTimestamp = COALESCE(excluded.SentTimestamp, SentTimestamp),
+                Meta = COALESCE(excluded.Meta, Meta),
+                Style = COALESCE(excluded.Style, Style),
+                folder = excluded.folder,
+                is_read = excluded.is_read
         """, (
             email_id,
             email.get('subject', ''),
@@ -3339,43 +3354,6 @@ def is_guid_in_database(handle, file_guid):
     except Exception:
         return False
 
-# def store_received_tell(
-#     handle: DatabaseHandle,
-#     file_guid: str,
-#     locker_code: bytes,
-#     tell_type: int = 0,  # Changed from file_type
-#     version: int = 1,    # Keep for backward compatibility but don't use
-#     file_size: int = 0,  # Keep for backward compatibility but don't use
-#     status: str = 'pending'  # Keep for backward compatibility but don't use
-# ) -> Tuple[DatabaseErrorCode, int]:
-#     """Store a received tell notification in the database."""
-#     if handle is None or handle.connection is None:
-#         return DatabaseErrorCode.ERR_INVALID_PARAM, -1
-
-#     if not file_guid or locker_code is None:
-#         return DatabaseErrorCode.ERR_INVALID_PARAM, -1
-
-#     # Convert locker_code to hex string for storage
-#     locker_code_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
-
-#     try:
-#         cursor = handle.connection.cursor()
-#         cursor.execute("""
-#             INSERT OR REPLACE INTO received_tells
-#             (file_guid, locker_code, tell_type)
-#             VALUES (?, ?, ?)
-#         """, (file_guid, locker_code_hex, tell_type))
-
-#         handle.connection.commit()
-#         tell_id = cursor.lastrowid
-
-#         log_info(handle.logger, DB_CONTEXT, f"Stored received tell: {file_guid}, id={tell_id}")
-#         return DatabaseErrorCode.SUCCESS, tell_id
-
-#     except sqlite3.Error as e:
-#         log_error(handle.logger, DB_CONTEXT, "Failed to store received tell", str(e))
-#         handle.connection.rollback()
-#         return DatabaseErrorCode.ERR_QUERY_FAILED, -1
 
 def store_received_tell(
     handle: DatabaseHandle,
@@ -3385,7 +3363,8 @@ def store_received_tell(
     sender_sn: int = 0,
     version: int = 1,
     file_size: int = 0,
-    status: str = 'pending'
+    status: str = 'pending',
+    total_file_size: int = 0
 ) -> Tuple[DatabaseErrorCode, int]:
     """
     Store a received tell notification in the database.
@@ -3410,9 +3389,9 @@ def store_received_tell(
        
         cursor.execute("""
             INSERT OR REPLACE INTO received_tells
-            (file_guid, locker_code, tell_type, sender_sn)
-            VALUES (?, ?, ?, ?)
-        """, (guid_hex, locker_code_hex, tell_type, sender_sn))
+            (file_guid, locker_code, tell_type, sender_sn, total_file_size)
+            VALUES (?, ?, ?, ?, ?)
+        """, (guid_hex, locker_code_hex, tell_type, sender_sn, total_file_size))
 
         handle.connection.commit()
         tell_id = cursor.lastrowid

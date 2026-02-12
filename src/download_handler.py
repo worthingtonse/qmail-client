@@ -157,7 +157,8 @@ async def download_file(
         serial_number=serial_number,
         device_id=device_id,
         an=an or bytes(400), # Expecting full keyring block
-        logger_handle=db_handle.logger
+        logger_handle=db_handle.logger,
+        total_file_size=tell_info.get('total_file_size', 0)
     )
 
     if not result.success:
@@ -176,7 +177,8 @@ async def download_all_stripes(
     serial_number: int,
     device_id: int,
     an: bytes,
-    logger_handle: Optional[object] = None
+    logger_handle: Optional[object] = None,
+    total_file_size: int = 0
 ) -> DownloadResult:
     """
     Downloads all stripes in parallel and reassembles the file.
@@ -283,9 +285,21 @@ async def download_all_stripes(
         err, reassembled = striping.reassemble_upload_stripes(sorted_stripes, est_size, logger_handle)
         
         if err == striping.ErrorCode.SUCCESS:
-            # Strip bit-interleaving padding (trailing nulls from round-robin overshoot)
-            # Safe for UTF-8 text. For binary attachments, we need exact size from .tell header.
-            reassembled = reassembled.rstrip(b'\x00')
+            # Handle size trimming based on file type
+            if file_type >= 10:
+                # Attachments: extract size from 4-byte header prepended by sender
+                if len(reassembled) >= 4:
+                    att_original_size = int.from_bytes(reassembled[:4], 'big')
+                    if 0 < att_original_size <= len(reassembled) - 4:
+                        reassembled = reassembled[4:4 + att_original_size]
+                    else:
+                        reassembled = reassembled[4:].rstrip(b'\x00')
+            else:
+                # Body: use exact size from parameter if available
+                if total_file_size > 0 and total_file_size <= len(reassembled):
+                    reassembled = reassembled[:total_file_size]
+                else:
+                    reassembled = reassembled.rstrip(b'\x00')
             
             result.success = True
             result.data = reassembled

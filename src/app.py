@@ -1076,7 +1076,8 @@ def main():
                         file_guid=file_guid,
                         locker_code=locker_code,
                         tell_type=getattr(notification, 'tell_type', 0),
-                        sender_sn=sender_sn
+                        sender_sn=sender_sn,
+                        total_file_size=getattr(notification, 'total_file_size', 0)
                     )
 
                     if err != DatabaseErrorCode.SUCCESS:
