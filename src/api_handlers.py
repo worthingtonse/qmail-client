@@ -572,10 +572,28 @@ def handle_mail_download(request_handler, context):
             if tell_row:
                 received_ts = tell_row['created_at'] if tell_row['created_at'] else None
                 sender_sn = tell_row['sender_sn'] if tell_row['sender_sn'] else 0
-                cursor.execute(
-                    "UPDATE received_tells SET download_status = 1 WHERE file_guid = ?",
-                    (file_guid,))
-                db_handle.connection.commit()
+        except Exception:
+            pass
+
+        # --- STORE EMAIL ---
+        store_email(db_handle, {
+            'email_id': file_guid,
+            'subject': subject,
+            'body': body_text,
+            'sender_sn': sender_sn,
+            'recipient_sns': [],
+            'folder': 'inbox',
+            'is_read': 0,
+            'received_timestamp': received_ts
+        })
+
+        # --- MARK AS DOWNLOADED (only after successful store) ---
+        try:
+            cursor = db_handle.connection.cursor()
+            cursor.execute(
+                "UPDATE received_tells SET download_status = 1 WHERE file_guid = ?",
+                (file_guid,))
+            db_handle.connection.commit()
         except Exception:
             pass
 

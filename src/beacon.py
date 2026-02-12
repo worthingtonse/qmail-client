@@ -408,7 +408,9 @@ def _monitor_loop(handle: BeaconHandle):
     
     while not catchup_complete and not handle.shutdown_event.is_set():
         # do_peek clears the queue as it reads
-        err, tells = do_peek(handle, since_timestamp=handle.last_tell_timestamp)
+        # Allow 2 hour clock skew grace period
+        safe_timestamp = max(0, handle.last_tell_timestamp - 7200)
+        err, tells = do_peek(handle, since_timestamp=safe_timestamp)
         
         if err == NetworkErrorCode.SUCCESS:
             if tells:
@@ -536,7 +538,7 @@ def _do_one_ping_cycle(handle: BeaconHandle) -> Tuple[NetworkErrorCode, List[Tel
             serial_number=numeric_sn,
             device_id=handle.device_id,
             an=handle.encryption_key,
-            since_timestamp=handle.last_tell_timestamp, # <--- CRITICAL FIX
+            since_timestamp=max(0, handle.last_tell_timestamp - 7200),  # 2hr grace for clock ske
             encryption_type=0, 
             logger_handle=handle.logger_handle
         )
