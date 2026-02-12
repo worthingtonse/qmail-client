@@ -333,7 +333,7 @@ def parse_tell_response(
 
             offset += 40  # Move past the 40-byte header block
 
-            offset += 40  # Move past the 40-byte header block
+           
 
             # --- SERVER LIST PARSING (32 bytes per server) ---
             server_list = []

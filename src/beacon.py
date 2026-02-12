@@ -325,6 +325,8 @@ def do_peek(handle: BeaconHandle, since_timestamp: Optional[int] = None) -> Tupl
  
         if err != NetworkErrorCode.SUCCESS:
             return err, []
+        
+        log_info(handle.logger_handle, "Beacon", f"PEEK response: status={resp_header.status}, body_len={len(resp_body) if resp_body else 0}")
  
         # --- THE CRITICAL FIX: TRIGGER HEALING & STOP LOOP ---
         if resp_header.status == 200: # Status 200 = Invalid AN
@@ -401,37 +403,62 @@ def _monitor_loop(handle: BeaconHandle):
     _load_state(handle)
     
     # =========================================================================
-    # PHASE 1: INITIAL CATCHUP (Using PEEK)
+    # PHASE 1: INITIAL CATCHUP (Using PING)
     # =========================================================================
     log_info(handle.logger_handle, "BeaconLoop", "Phase 1: Catching up with new mail...")
     catchup_complete = False
+    previous_ts = handle.last_tell_timestamp  # Track if timestamp changes
+    no_progress_count = 0  # Track consecutive loops with no new mail stored
     
     while not catchup_complete and not handle.shutdown_event.is_set():
-        # do_peek clears the queue as it reads
-        # Allow 2 hour clock skew grace period
-        safe_timestamp = max(0, handle.last_tell_timestamp - 7200)
-        err, tells = do_peek(handle, since_timestamp=safe_timestamp)
+        # Use PING instead of PEEK - PEEK returns empty on this server
+        err, tells = _do_one_ping_cycle(handle)
         
         if err == NetworkErrorCode.SUCCESS:
             if tells:
                 log_info(handle.logger_handle, "BeaconLoop", f"Catchup: Received {len(tells)} pending notifications")
                 
-                latest_ts = max(t.timestamp for t in tells)
-                handle.last_tell_timestamp = latest_ts
-                _save_state(handle)
+                # Filter valid notifications (server_count > 0, valid sender_sn)
+                valid_tells = [t for t in tells if t.server_count > 0 and 0 < t.sender_sn < 16777216]
                 
-                # Process via callback in app.py
-                if handle.on_mail_received:
-                    try:
-                        handle.on_mail_received(tells)
-                    except Exception as e:
-                        log_error(handle.logger_handle, "BeaconLoop", f"Catchup callback failed: {e}")
+                if valid_tells:
+                    latest_ts = max(t.timestamp for t in valid_tells)
+                    handle.last_tell_timestamp = latest_ts
+                    _save_state(handle)
+                    
+                    # Process via callback in app.py
+                    # The callback returns info about what was stored
+                    stored_count = 0
+                    if handle.on_mail_received:
+                        try:
+                            result = handle.on_mail_received(tells)
+                            # If callback returns a count, use it
+                            if isinstance(result, int):
+                                stored_count = result
+                        except Exception as e:
+                            log_error(handle.logger_handle, "BeaconLoop", f"Catchup callback failed: {e}")
+                    
+                    # Check if we're making progress
+                    if latest_ts == previous_ts:
+                        no_progress_count += 1
+                        if no_progress_count >= 3:
+                            # Same notifications 3 times - they're all already in DB
+                            log_info(handle.logger_handle, "BeaconLoop", 
+                                     "Catchup complete (all notifications already processed)")
+                            catchup_complete = True
+                    else:
+                        no_progress_count = 0
+                        previous_ts = latest_ts
+                else:
+                    # All garbage notifications - mark catchup as complete
+                    log_warning(handle.logger_handle, "BeaconLoop", 
+                                f"Received {len(tells)} garbage notifications, skipping")
+                    catchup_complete = True
             else:
                 log_info(handle.logger_handle, "BeaconLoop", "Catchup complete.")
                 catchup_complete = True
         
         elif err == NetworkErrorCode.ERR_INVALID_AN:
-            # do_peek already handles the callback logic internally, so we just exit.
             log_error(handle.logger_handle, "BeaconLoop", "Catchup detected Fracked Identity. Exiting loop.")
             return
 
@@ -458,23 +485,30 @@ def _monitor_loop(handle: BeaconHandle):
                 retry_delay_sec = 1.0 # Reset backoff
                 
                 if tells:
-                    # Determine if mail is actually new or a re-send from server buffer
-                    latest_ts = max(t.timestamp for t in tells)
-                    is_old_mail = latest_ts <= handle.last_tell_timestamp
+                    # Filter valid notifications (server_count > 0, valid sender_sn)
+                    valid_tells = [t for t in tells if t.server_count > 0 and 0 < t.sender_sn < 16777216]
                     
-                    if not is_old_mail:
-                        # CASE A: Genuine new mail
-                        handle.last_tell_timestamp = latest_ts
-                        _save_state(handle)
+                    if valid_tells:
+                        latest_ts = max(t.timestamp for t in valid_tells)
+                        is_old_mail = latest_ts <= handle.last_tell_timestamp
                         
-                        if handle.on_mail_received:
-                            handle.on_mail_received(tells)
+                        if not is_old_mail:
+                            # CASE A: Genuine new mail
+                            handle.last_tell_timestamp = latest_ts
+                            _save_state(handle)
+                            
+                            if handle.on_mail_received:
+                                handle.on_mail_received(tells)
+                        else:
+                            # CASE B: Old mail (already processed)
+                            # Silently ignore - TELLs expire server-side eventually
+                            log_debug(handle.logger_handle, "BeaconLoop", 
+                                        f"Ignoring {len(tells)} already-processed notification(s)")
+                            # Cooldown to avoid tight-looping
+                            handle.shutdown_event.wait(timeout=10.0)
                     else:
-                        # CASE B: Old mail (already processed)
-                        # Silently ignore - TELLs expire server-side eventually
-                        log_debug(handle.logger_handle, "BeaconLoop", 
-                                    f"Ignoring {len(tells)} already-processed notification(s)")
-                        # Cooldown to avoid tight-looping
+                        # All garbage notifications - ignore
+                        log_debug(handle.logger_handle, "BeaconLoop", "Received only garbage notifications, ignoring")
                         handle.shutdown_event.wait(timeout=10.0)
                 else:
                     log_debug(handle.logger_handle, "BeaconLoop", "Long-poll timeout - no mail.")

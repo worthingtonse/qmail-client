@@ -597,18 +597,6 @@ def handle_mail_download(request_handler, context):
         except Exception:
             pass
 
-        # --- STORE EMAIL ---
-        store_email(db_handle, {
-            'email_id': file_guid,
-            'subject': subject,
-            'body': body_text,
-            'sender_sn': sender_sn,
-            'recipient_sns': [],
-            'folder': 'inbox',
-            'is_read': 0,
-            'received_timestamp': received_ts
-        })
-
         # --- DOWNLOAD AND STORE ATTACHMENTS ---
         stored_attachments = []
         for att in attachment_metadata:
@@ -626,7 +614,7 @@ def handle_mail_download(request_handler, context):
                     an=an
                 )
                 
-                if att_bytes and att_status != 200:
+                if att_bytes and att_status in [200, 250]:
                     # Get file extension
                     ext = att_name.rsplit('.', 1)[-1] if '.' in att_name else ''
                     
