@@ -341,7 +341,8 @@ CREATE TABLE IF NOT EXISTS received_tells (
     download_status INTEGER DEFAULT 0,
     read_status INTEGER DEFAULT 0,
     local_path TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    payment_status INTEGER DEFAULT 0
 );
 
 -- Table for tracking stripe locations
@@ -458,6 +459,12 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
         try:
             cursor.execute("ALTER TABLE received_tells ADD COLUMN total_file_size INTEGER DEFAULT 0")
             log_info(logger, "Database", "Migrating: Adding total_file_size to received_tells")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            cursor.execute("ALTER TABLE received_tells ADD COLUMN payment_status INTEGER DEFAULT 0")
+            log_info(logger, "Database", "Migrating: Adding payment_status to received_tells")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
@@ -2697,6 +2704,38 @@ def update_received_tell_status(
 
     except sqlite3.Error as e:
         log_error(handle.logger, DB_CONTEXT, "Failed to update tell status", str(e))
+        handle.connection.rollback()
+        return DatabaseErrorCode.ERR_QUERY_FAILED
+    
+def update_payment_status(
+    handle: DatabaseHandle,
+    file_guid: str,
+    payment_status: int
+) -> DatabaseErrorCode:
+    """
+    Update payment status for a received tell.
+    
+    Args:
+        handle: Database handle
+        file_guid: File GUID
+        payment_status: 0=no payment, 1=claimed, 2=failed
+    """
+    if handle is None or handle.connection is None:
+        return DatabaseErrorCode.ERR_INVALID_PARAM
+
+    try:
+        cursor = handle.connection.cursor()
+        cursor.execute("""
+            UPDATE received_tells
+            SET payment_status = ?
+            WHERE file_guid = ?
+        """, (payment_status, file_guid))
+
+        handle.connection.commit()
+        return DatabaseErrorCode.SUCCESS
+
+    except sqlite3.Error as e:
+        log_error(handle.logger, DB_CONTEXT, "Failed to update payment status", str(e))
         handle.connection.rollback()
         return DatabaseErrorCode.ERR_QUERY_FAILED
 

@@ -1126,6 +1126,7 @@ def main():
                     if locker_code and len(locker_code) >= 8:
                         # Check if it's not all zeros (no payment)
                         if locker_code != b'\x00' * len(locker_code):
+                            from database import update_payment_status
                             try:
                                 from download_handler import download_locker_payment
                                 log_info(logger, "Beacon", f"Claiming inbox fee for {file_guid[:8]}...")
@@ -1136,10 +1137,13 @@ def main():
                                 ))
                                 if err == 0:
                                     log_info(logger, "Beacon", f"✓ Inbox fee claimed for {file_guid[:8]}")
+                                    update_payment_status(app_context.db_handle, file_guid, 1)
                                 else:
                                     log_warning(logger, "Beacon", f"Failed to claim inbox fee: error {err}")
+                                    update_payment_status(app_context.db_handle, file_guid, 2)
                             except Exception as e:
                                 log_warning(logger, "Beacon", f"Inbox fee claim exception: {e}")
+                                update_payment_status(app_context.db_handle, file_guid, 2)
 
 
                 except Exception as e:
@@ -1189,7 +1193,6 @@ def main():
     print()
     print("API Endpoints:")
     print("\n[ Health & Status ]")
-    # print(f"  GET  {base_url}/api/health                   - Health check")
     print(f"  GET  {base_url}/api/qmail/ping               - Beacon check for new mail")
     print(f"  GET  {base_url}/api/admin/version-check      - Check client version")
 
@@ -1200,7 +1203,6 @@ def main():
     print("\n[ Mail Operations ]")
     print(f"  POST {base_url}/api/mail/send                - Send email")
     print(f"  GET  {base_url}/api/mail/download/{{id}}       - Download email by GUID")
-    print(f"  GET  {base_url}/api/mail/payment/{{id}}        - Download payment for email")
     print(f"  GET  {base_url}/api/mail/list                - List emails (inbox, sent, etc.)")
     print(f"  POST {base_url}/api/setup/import-credentials - Import credentials (first-time setup)")
     print(f"  GET  {base_url}/api/mail/folders             - List available mail folders")
@@ -1212,6 +1214,10 @@ def main():
     print(f"  DELETE {base_url}/api/mail/{{id}}/permanent    - Permanently delete email")
     print(f"  PUT    {base_url}/api/mail/{{id}}/move         - Move email to folder")
     print(f"  PUT    {base_url}/api/mail/{{id}}/read         - Mark email read/unread")
+
+    print("\n[ Email Payments ]")
+    print(f"  GET  {base_url}/api/mail/payment/{{id}}        - Get payment info for email")
+    print(f"  POST {base_url}/api/mail/payment/{{id}}/claim  - Manually claim payment (retry)")
 
     print("\n[ Attachments ]")
     print(f"  GET  {base_url}/api/mail/{{id}}/attachments    - List attachments for email")

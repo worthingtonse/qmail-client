@@ -799,18 +799,118 @@ def handle_mail_payment_download(request_handler, context):
         except (UnicodeDecodeError, AttributeError):
             locker_code_display = locker_hex
 
+        # Get payment status
+        cursor.execute("""
+            SELECT payment_status 
+            FROM received_tells 
+            WHERE file_guid = ?
+        """, (file_guid,))
+        status_row = cursor.fetchone()
+        payment_status = status_row['payment_status'] if status_row else 0
+
         request_handler.send_json_response(200, {
             "status": "success",
             "locker_code": locker_code_display,
             "locker_code_hex": locker_hex,
-            "message": "Use this code to download payment coins from RAIDA",
-            "note": "You can use either the locker_code or locker_code_hex format"
+            "payment_status": payment_status,
+            "payment_status_text": {0: "no_payment", 1: "claimed", 2: "failed"}.get(payment_status, "unknown"),
+            "can_retry": payment_status == 2,
+            "message": "Use POST /api/mail/payment/{id}/claim to retry" if payment_status == 2 else "Payment already claimed" if payment_status == 1 else "Use this code to download payment coins from RAIDA"
         })
 
     except Exception as e:
         log_error(app_ctx.logger, "API", f"Error getting payment locker: {e}")
         request_handler.send_json_response(500, {
             "error": "Database error",
+            "details": str(e),
+            "status": "error"
+        })
+
+def handle_mail_payment_claim(request_handler, context):
+    """
+    POST /api/mail/payment/{id}/claim
+    Manually retry downloading payment coins for a received email.
+    Use when automatic claim failed (payment_status = 2).
+    """
+    from database import update_payment_status
+    from download_handler import download_locker_payment
+    import asyncio
+
+    app_ctx = request_handler.server_instance.app_context
+    db_handle = app_ctx.db_handle
+    logger = app_ctx.logger
+
+    file_guid = context.path_params.get('id', '').replace('-', '').strip().upper()
+
+    if len(file_guid) != 32:
+        request_handler.send_json_response(400, {
+            "error": "Invalid file_guid format",
+            "status": "error"
+        })
+        return
+
+    # Check if email exists and has locker code
+    try:
+        cursor = db_handle.connection.cursor()
+        cursor.execute("""
+            SELECT locker_code, payment_status 
+            FROM received_tells 
+            WHERE file_guid = ?
+        """, (file_guid,))
+        row = cursor.fetchone()
+
+        if not row:
+            request_handler.send_json_response(404, {
+                "error": "Email not found",
+                "status": "error"
+            })
+            return
+
+        locker_code = row['locker_code']
+        current_status = row['payment_status']
+
+        if not locker_code or locker_code == b'\x00' * len(locker_code):
+            request_handler.send_json_response(400, {
+                "error": "No payment attached to this email",
+                "status": "error"
+            })
+            return
+
+        if current_status == 1:
+            request_handler.send_json_response(200, {
+                "status": "already_claimed",
+                "message": "Payment was already claimed successfully"
+            })
+            return
+
+        # Attempt to download payment
+        loop = asyncio.new_event_loop()
+        try:
+            err, _ = loop.run_until_complete(download_locker_payment(
+                app_ctx, file_guid, logger
+            ))
+        finally:
+            loop.close()
+
+        if err == 0:
+            update_payment_status(db_handle, file_guid, 1)
+            request_handler.send_json_response(200, {
+                "status": "success",
+                "message": "Payment claimed successfully",
+                "payment_status": 1
+            })
+        else:
+            update_payment_status(db_handle, file_guid, 2)
+            request_handler.send_json_response(200, {
+                "status": "failed",
+                "message": "Payment claim failed - locker may be empty or network error",
+                "payment_status": 2,
+                "error_code": err
+            })
+
+    except Exception as e:
+        request_handler.send_json_response(500, {
+            "error": "Claim failed",
             "details": str(e),
             "status": "error"
         })
@@ -4220,6 +4320,8 @@ def register_all_routes(server):
         'GET', '/api/mail/download/{id}', handle_mail_download)
     server.register_route(
         'GET', '/api/mail/payment/{id}', handle_mail_payment_download)
+    server.register_route("POST", "/api/mail/payment/{id}/claim", handle_mail_payment_claim),
+    
     server.register_route('GET', '/api/mail/list', handle_mail_list)
     server.register_route(
         'POST', '/api/setup/import-credentials', handle_import_credentials)
