@@ -1561,6 +1561,7 @@ def send_email_async(
                # Check consensus - need at least (num_servers - 1) for XOR parity reconstruction
                 if len(successful_body_stripes) >= min_required:
                     result.upload_results.extend(upload_results)
+                    body_only_results = list(upload_results)  # Save body results for TELL
                     break
                 
                 # Wait before retry if not done
@@ -1654,7 +1655,7 @@ def send_email_async(
             request=request, file_group_guid=state.file_group_guid,
             servers=servers, identity=identity, logger_handle=logger_handle,
             db_handle=db_handle, cc_handle=cc_handle, locker_code=state.locker_code,
-            upload_results=result.upload_results,
+            upload_results=body_only_results,  # Only body stripes, not attachments
             total_file_size=original_body_size
         )
 
