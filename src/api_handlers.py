@@ -2194,7 +2194,7 @@ def handle_mail_attachment_download(request_handler, context):
         return
 
     # Security: Verify attachment belongs to the specified email
-    if attachment.get('email_id') != clean_id:
+    if attachment.get('email_id', '').lower() != clean_id.lower():
         request_handler.send_json_response(404, {
             "error": "Attachment not found",
             "details": "Attachment does not belong to specified email",
