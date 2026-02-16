@@ -69,7 +69,7 @@ from data_sync import sync_all, SyncErrorCode, check_client_version
 from wallet_structure import initialize_wallet_structure
 
 # Beacon imports
-from beacon import do_peek
+from beacon import do_peek, log_warning
 from network import NetworkErrorCode
 
 # Download imports
@@ -549,6 +549,7 @@ def handle_mail_download(request_handler, context):
             return
 
         # --- PARSE JSON ENVELOPE ---
+        # --- PARSE JSON ENVELOPE ---
         try:
             envelope = _json.loads(file_bytes.decode('utf-8'))
             subject = envelope.get('subject', '')
@@ -559,6 +560,11 @@ def handle_mail_download(request_handler, context):
             body_text = file_bytes.decode('utf-8', errors='replace')
             subject = body_text[:80].split('\n')[0].strip() or f"Mail {file_guid[:8]}"
             attachment_metadata = []
+
+        # --- SECURITY: Sanitize HTML to prevent XSS ---
+        from html import escape as html_escape
+        subject = html_escape(subject)
+        body_text = html_escape(body_text)
 
         # --- GET SENDER INFO FROM TELL ---
         sender_sn = 0
@@ -598,10 +604,21 @@ def handle_mail_download(request_handler, context):
             pass
 
         # --- DOWNLOAD AND STORE ATTACHMENTS ---
+        DANGEROUS_EXTENSIONS = {'exe', 'bat', 'cmd', 'ps1', 'vbs', 'js', 'msi', 'scr', 'com', 'pif'}
         stored_attachments = []
         for att in attachment_metadata:
             att_index = att.get('i', 0)
             att_name = att.get('name', f'attachment_{att_index}')
+            # Security: Sanitize filename (remove path characters)
+            att_name = att_name.replace('/', '_').replace('\\', '_').replace('..', '_')
+            
+            
+            # Security: Flag dangerous file types
+            ext_lower = att_name.rsplit('.', 1)[-1].lower() if '.' in att_name else ''
+            is_dangerous = ext_lower in DANGEROUS_EXTENSIONS
+            if is_dangerous:
+                log_warning(logger, "API", f"Potentially dangerous and malicious attachment detected, avoid downloading if possible : {att_name}")
+        
             
             try:
                 att_bytes, att_status = download_file_sync(
@@ -632,7 +649,8 @@ def handle_mail_download(request_handler, context):
                             "id": att_id,
                             "name": att_name,
                             "extension": ext,
-                            "size": len(att_bytes)
+                            "size": len(att_bytes),
+                            "warning": "Potentially dangerous file type" if is_dangerous else None
                         })
             except Exception as att_err:
                 log_error(logger, "API", f"Attachment {att_index} download failed: {att_err}")
