@@ -320,7 +320,7 @@ async def _create_locker_async(
             diff = total_value_selected - amount
 
             # 2. Check for Match OR Acceptable Overpayment
-            acceptable_overpay = max(0.001, amount * 0.05)
+            acceptable_overpay = max(0.0001, amount * 0.05)
             
             if diff >= -0.00000001 and diff < acceptable_overpay:
                 
