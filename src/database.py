@@ -2620,7 +2620,7 @@ def get_received_tell_by_guid(handle: DatabaseHandle, file_guid: str) -> Tuple[D
         return DatabaseErrorCode.ERR_INVALID_PARAM, None
     try:
         cursor = handle.connection.cursor()
-        cursor.execute("SELECT * FROM received_tells WHERE file_guid = ?", (file_guid,))
+        cursor.execute("SELECT * FROM received_tells WHERE file_guid = ?", (file_guid.upper(),))
         row = cursor.fetchone()
         if row is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, None
