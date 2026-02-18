@@ -218,7 +218,8 @@ async def create_recipient_locker(
     wallet_path: str,
     amount: float,
     identity_sn: int,
-    logger_handle
+    logger_handle,
+    config=None
 ) -> Tuple[int, Optional[str]]:
     """
     Create a locker with coins for recipient payment.
@@ -272,7 +273,7 @@ async def create_recipient_locker(
                 log_info(logger_handle, CONTEXT,
                         f"Breaking coin {total_value_selected} to get {amount}")
                 
-                break_result = await break_coin(coin_to_break, wallet_path, None, logger_handle)
+                break_result = await break_coin(coin_to_break, wallet_path, config, logger_handle)
                 
                 broken_coins = []
                 if hasattr(break_result, 'new_coins'):
@@ -1656,7 +1657,8 @@ def send_email_async(
             servers=servers, identity=identity, logger_handle=logger_handle,
             db_handle=db_handle, cc_handle=cc_handle, locker_code=state.locker_code,
             upload_results=body_only_results,  # Only body stripes, not attachments
-            total_file_size=original_body_size
+            total_file_size=original_body_size,
+            config=config
         )
 
         update_state("STORING", 95, "Storing locally...")
@@ -1699,7 +1701,8 @@ def send_tell_notifications(
     cc_handle: object = None,
     locker_code: bytes = None,
     upload_results: List['UploadResult'] = None,
-    total_file_size: int = 0
+    total_file_size: int = 0,
+    config=None
 ) -> ErrorCode:
     """
     Send Tell notifications to all recipients.
@@ -1837,7 +1840,7 @@ def send_tell_notifications(
         try:
             # --- A. Create Locker for BEACON PAYMENT ---
             err_code, beacon_locker_hex = asyncio.run(create_recipient_locker(
-                wallet_path, beacon_fee, identity.serial_number, logger_handle
+                wallet_path, beacon_fee, identity.serial_number, logger_handle, config
             ))
 
             if err_code != 0 or not beacon_locker_hex:
@@ -1852,7 +1855,7 @@ def send_tell_notifications(
             recipient_locker_bytes = bytes(16)  # Default: no payment
             if inbox_fee > 0.00000001:
                 err_code, recipient_locker_hex = asyncio.run(create_recipient_locker(
-                    wallet_path, inbox_fee, identity.serial_number, logger_handle
+                    wallet_path, inbox_fee, identity.serial_number, logger_handle, config
                 ))
                 
                 if err_code != 0 or not recipient_locker_hex:

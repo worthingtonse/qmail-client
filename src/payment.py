@@ -298,7 +298,10 @@ async def _create_locker_async(
     import asyncio 
     
     MAX_LOOPS = 50
+    MAX_BREAK_FAILURES = 3  # Give up after 3 failed coin breaks
     MIN_PASSES_FOR_SUCCESS = 13 # Matches Go: MIN_PASSED_NUM_TO_BE_AUTHENTIC
+    
+    break_failure_count = 0
     
     try:
         for _ in range(MAX_LOOPS):
@@ -424,10 +427,11 @@ async def _create_locker_async(
             elif diff >= acceptable_overpay:
                 coins.sort(key=lambda x: parse_denomination_code(x.denomination), reverse=True)
                 coin_to_break = coins[0]
+                failed_sn = coin_to_break.serial_number
                 
                 log_info(logger_handle, PAYMENT_CONTEXT,
                          f"Have {total_value_selected:.8f}, need {amount:.8f}. "
-                         f"Breaking coin SN={coin_to_break.serial_number}")
+                         f"Breaking coin SN={failed_sn}")
                 
                 break_result = await break_coin(coin_to_break, wallet_path, config, logger_handle)
                 
@@ -438,8 +442,38 @@ async def _create_locker_async(
                     success = True
                 
                 if not success:
-                    log_error(logger_handle, PAYMENT_CONTEXT, "Coin break failed")
-                    return ErrorCode.ERR_INTERNAL, b'', []
+                    break_failure_count += 1
+                    log_warning(logger_handle, PAYMENT_CONTEXT, 
+                                f"Break failed for SN={failed_sn} ({break_failure_count}/{MAX_BREAK_FAILURES}). Healing and checking...")
+                    
+                    # Check if we've exceeded max break failures
+                    if break_failure_count >= MAX_BREAK_FAILURES:
+                        log_error(logger_handle, PAYMENT_CONTEXT,
+                                  f"Too many break failures ({break_failure_count}). RAIDA network may be unstable.")
+                        return ErrorCode.ERR_INTERNAL, b'', []
+                    
+                    # Heal the wallet
+                    await _attempt_heal_wallet(wallet_path, logger_handle)
+                    await asyncio.sleep(1.0)
+                    
+                    # Check if the failed coin is back in Bank (healed)
+                    bank_path = os.path.join(wallet_path, "Bank")
+                    coin_back_in_bank = False
+                    if os.path.exists(bank_path):
+                        for f in os.listdir(bank_path):
+                            if f.endswith('.bin') and str(failed_sn) in f:
+                                coin_back_in_bank = True
+                                break
+                    
+                    if coin_back_in_bank:
+                        log_info(logger_handle, PAYMENT_CONTEXT,
+                                 f"Coin SN={failed_sn} healed successfully. Retrying break...")
+                    else:
+                        log_warning(logger_handle, PAYMENT_CONTEXT,
+                                    f"Coin SN={failed_sn} still fracked. Will try different coin...")
+                    
+                    # Continue the loop - it will pick coins fresh from Bank
+                    continue
                 
                 await asyncio.sleep(0.5)
                 # Force filesystem sync on Windows

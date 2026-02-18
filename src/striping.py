@@ -21,8 +21,9 @@ C Notes:
     - CRC32 checksum via zlib in C
     - Consider mmap for very large files
 """
-
+import os
 import zlib
+import struct
 from typing import List, Optional, Tuple , Any
 
 # Import types from qmail_types
@@ -459,17 +460,25 @@ def create_upload_stripes(
             stripe_bytes.append(byte_val)
         stripes.append(bytes(stripe_bytes))
 
+    
     # Ensure all stripes are equal size (pad shorter ones)
     max_len = max(len(s) for s in stripes) if stripes else 0
     stripes = [s + b'\x00' * (max_len - len(s)) for s in stripes]
 
+    # Add CRC32 checksum to each stripe (4 bytes appended)
+    stripes_with_crc = []
+    for stripe in stripes:
+        crc = zlib.crc32(stripe) & 0xFFFFFFFF
+        stripe_with_crc = stripe + struct.pack('>I', crc)
+        stripes_with_crc.append(stripe_with_crc)
+
     log_debug(
         logger_handle, STRIPE_CONTEXT,
-        f"Created {len(stripes)} upload stripes of {max_len} bytes each "
-        f"from {len(data)} bytes using bit-by-bit interleaving"
+        f"Created {len(stripes_with_crc)} upload stripes of {max_len + 4} bytes each "
+        f"(including 4-byte CRC32) from {len(data)} bytes using bit-by-bit interleaving"
     )
 
-    return ErrorCode.SUCCESS, stripes
+    return ErrorCode.SUCCESS, stripes_with_crc
 
 
 def reassemble_upload_stripes(
@@ -507,12 +516,41 @@ def reassemble_upload_stripes(
                   "original_length must be positive")
         return ErrorCode.ERR_INVALID_PARAM, b''
 
-    num_stripes = len(stripes)
+    # Verify and strip CRC32 from each stripe
+    verified_stripes = []
+    for i, stripe in enumerate(stripes):
+        if len(stripe) < 4:
+            log_warning(logger_handle, STRIPE_CONTEXT, 
+                        f"Stripe {i} too short for CRC verification, using as-is")
+            verified_stripes.append(stripe)
+            continue
+        
+        # Check if stripe has CRC (last 4 bytes)
+        stripe_data = stripe[:-4]
+        stored_crc = struct.unpack('>I', stripe[-4:])[0]
+        computed_crc = zlib.crc32(stripe_data) & 0xFFFFFFFF
+        
+        if stored_crc == computed_crc:
+            log_debug(logger_handle, STRIPE_CONTEXT, f"Stripe {i} CRC verified ✓")
+            verified_stripes.append(stripe_data)
+        else:
+            # CRC mismatch - could be old stripe without CRC, try using full stripe
+            full_crc = zlib.crc32(stripe) & 0xFFFFFFFF
+            if full_crc == stored_crc:
+                # False alarm - use without CRC bytes
+                verified_stripes.append(stripe_data)
+            else:
+                # Likely old stripe without CRC - use as-is
+                log_warning(logger_handle, STRIPE_CONTEXT, 
+                            f"Stripe {i} has no valid CRC (old format?), using as-is")
+                verified_stripes.append(stripe)
+
+    num_stripes = len(verified_stripes)
     total_bits_needed = original_length * 8
 
     # Convert each stripe back to bits
     stripe_bits = []
-    for stripe in stripes:
+    for stripe in verified_stripes:
         bits = []
         for byte_val in stripe:
             for bit_pos in range(8):

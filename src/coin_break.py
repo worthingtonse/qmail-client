@@ -325,44 +325,50 @@ def _find_coin_to_break(
 # RAIDA COMMUNICATION
 # ============================================================================
 
+def _fetch_raida_servers_sync(config=None, logger_handle=None) -> List[Tuple[str, int]]:
+    """Fetch RAIDA server IPs ONCE (synchronous). Returns list of (ip, port) tuples."""
+    servers = [("", 50000 + i) for i in range(CC_RAIDA_COUNT)]
+    
+    try:
+        import urllib.request
+        url = "https://raida11.cloudcoin.global/service/raida_servers"
+        req = urllib.request.Request(url, headers={'User-Agent': 'QMail/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            lines = resp.read().decode('utf-8').strip().split('\n')
+            for i, line in enumerate(lines[:CC_RAIDA_COUNT]):
+                parts = line.strip().split(':')
+                servers[i] = (parts[0], int(parts[1]) if len(parts) > 1 else 50000 + i)
+        log_info(logger_handle, BREAK_CONTEXT, f"Fetched {len(lines)} RAIDA servers from URL")
+    except Exception as e:
+        log_warning(logger_handle, BREAK_CONTEXT, f"URL fetch failed: {e}, using config fallback")
+        if config and hasattr(config, 'raida_servers'):
+            for s in config.raida_servers:
+                idx = getattr(s, 'index', None)
+                if idx is not None and 0 <= idx < CC_RAIDA_COUNT:
+                    servers[idx] = (s.address, s.port)
+    
+    return servers
 
 async def _make_change_single_raida(
     raida_id: int,
     coin: CoinToBreak,
     starting_sn: int,
     pans: List[bytes],
+    server_tuple: Tuple[str, int],
     config: Optional[NetworkConfig] = None,
     logger_handle=None
 ) -> Tuple[int, int, str]:
     """
     Execute Make Change command on one RAIDA.
-    FIXED: Properly accesses ServerConfig object attributes instead of treating them as dicts.
     """
     from network import ServerInfo
     conn = None
     
-    # 1. RESOLVE SERVER INFO FROM CONFIG
-    server_address = ""
-    server_port = 50000 + raida_id  # Default fallback based on RAIDA ID
+    # Use pre-fetched server info
+    server_address, server_port = server_tuple
     
-    if config and hasattr(config, 'raida_servers'):
-        try:
-            # FIX: Access ServerConfig attributes directly, not as dict
-            # ServerConfig is a dataclass with .index, .address, .port attributes
-            server_entry = next(
-                (s for s in config.raida_servers if s.index == raida_id), 
-                None
-            )
-            
-            if server_entry:
-                server_address = server_entry.address  # Attribute access (not .get())
-                server_port = server_entry.port         # Attribute access (not .get())
-        except (AttributeError, TypeError) as e:
-            log_error(logger_handle, BREAK_CONTEXT, 
-                     f"Config error resolving RAIDA {raida_id}: {e}")
-
     if not server_address:
-        return (raida_id, 0, f"Server address for RAIDA {raida_id} not found in config")
+        return (raida_id, 0, f"Server address for RAIDA {raida_id} not found")
 
     try:
         # 2. Build complete request (Encryption Type 0)
@@ -381,14 +387,22 @@ async def _make_change_single_raida(
 
         # 3. CONNECT
         server_info = ServerInfo(host=server_address, port=server_port, raida_id=raida_id)
-        err_conn, conn = await connect_async(server_info, config, logger_handle)
+        err_conn, conn = await connect_async(
+            server_info=server_info,
+            config=config,
+            logger_handle=logger_handle
+        )
         
         if err_conn != NetworkErrorCode.SUCCESS or conn is None:
             return (raida_id, 0, f"Failed to connect to {server_address}:{server_port}")
 
         # 4. SEND Command 90 (Make Change)
         err_code, response_header, _ = await send_raw_request_async(
-            conn, request, DEFAULT_TIMEOUT_MS, config, logger_handle
+            conn=conn,
+            raw_request=request,
+            timeout_ms=DEFAULT_TIMEOUT_MS,
+            config=config,
+            logger_handle=logger_handle
         )
 
         if err_code != NetworkErrorCode.SUCCESS:
@@ -411,7 +425,6 @@ async def _make_change_single_raida(
     finally:
         if conn is not None:
             await disconnect_async(conn)
-
 async def _make_change_all_raidas(
     coin: CoinToBreak,
     starting_sn: int,
@@ -432,10 +445,13 @@ async def _make_change_all_raidas(
     Returns:
         List of (raida_id, status_code, error_message) for all 25 RAIDAs
     """
+    # Fetch servers ONCE before parallel tasks
+    servers = _fetch_raida_servers_sync(config, logger_handle)
+    
     tasks = []
     for raida_id in range(CC_RAIDA_COUNT):
         task = _make_change_single_raida(
-            raida_id, coin, starting_sn, pans[raida_id], config, logger_handle
+            raida_id, coin, starting_sn, pans[raida_id], servers[raida_id], config, logger_handle
         )
         tasks.append(task)
 
@@ -686,7 +702,27 @@ async def break_coin(
              f"Make Change results: {pass_count}/{CC_RAIDA_COUNT} passed")
 
     # Check consensus
+    # Check consensus
     if pass_count < MIN_CONSENSUS:
+        # Partial failure - coin may be in limbo state
+        # Move to Fracked so it doesn't get reused immediately
+        log_warning(logger_handle, BREAK_CONTEXT,
+                    f"Break failed ({pass_count}/{MIN_CONSENSUS}). Moving coin to Fracked...")
+        
+        try:
+            import shutil
+            fracked_path = os.path.join(wallet_path, "Fracked")
+            os.makedirs(fracked_path, exist_ok=True)
+            
+            if hasattr(coin, 'file_path') and coin.file_path and os.path.exists(coin.file_path):
+                dest = os.path.join(fracked_path, os.path.basename(coin.file_path))
+                shutil.move(coin.file_path, dest)
+                log_info(logger_handle, BREAK_CONTEXT,
+                         f"Moved partially-broken coin SN={coin.serial_number} to Fracked")
+        except Exception as e:
+            log_warning(logger_handle, BREAK_CONTEXT,
+                        f"Could not move coin to Fracked: {e}")
+        
         return BreakResult(
             success=False,
             original_coin=coin,

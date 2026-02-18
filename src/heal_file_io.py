@@ -160,11 +160,12 @@ class CloudCoinBin:
 
         if pass_count >= QUORUM_REQUIRED:
             # Has quorum (13+)
-            if fail_count > 0 or unknown_count > 0:
-                # Has fails or unknowns → fracked
+            if fail_count > 0:
+                # Has actual fails → fracked (needs healing)
                 return 'fracked'
             else:
-                # All 25 are 'p' → authentic
+                # No fails (may have unknowns from unreachable RAIDAs) → authentic
+                # Unknowns just mean RAIDA was unreachable, not that coin is bad
                 return 'authentic'
         elif fail_count >= QUORUM_REQUIRED:
             # More than 13 fails → counterfeit
