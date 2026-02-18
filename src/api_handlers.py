@@ -169,7 +169,8 @@ def handle_account_identity(request_handler, context):
 def handle_heal_identity(request_handler, context):
     """
     POST /api/account/heal-identity
-    Verify and heal the identity coin in the Mailbox wallet.
+    Discover current status of identity coin and heal if needed.
+    Uses same grading as heal_wallet: 25p/0f = healthy, ≥13p with f = fracked, <13p = counterfeit
     """
     app_ctx = request_handler.server_instance.app_context
     logger = getattr(app_ctx, 'logger', None)
@@ -179,41 +180,82 @@ def handle_heal_identity(request_handler, context):
         return request_handler.send_json_response(401, {"error": "no_identity_found"})
 
     try:
-        from heal import heal_wallet
         from coin_scanner import find_identity_coin
-
+        from heal import heal_wallet
+        
         mailbox_wallet = "Data/Wallets/Mailbox"
         mailbox_bank = os.path.join(mailbox_wallet, "Bank")
+        mailbox_fracked = os.path.join(mailbox_wallet, "Fracked")
+        mailbox_counterfeit = os.path.join(mailbox_wallet, "Counterfeit")
 
+        # 1. Find identity coin location
+        coin_location = None
+        coin = None
+        
         coin = find_identity_coin(mailbox_bank, identity.serial_number)
+        if coin:
+            coin_location = "Bank"
+        else:
+            coin = find_identity_coin(mailbox_fracked, identity.serial_number)
+            if coin:
+                coin_location = "Fracked"
+            else:
+                coin = find_identity_coin(mailbox_counterfeit, identity.serial_number)
+                if coin:
+                    return request_handler.send_json_response(200, {
+                        "status": "counterfeit",
+                        "message": "Identity coin is counterfeit (< 13 passes). Cannot heal.",
+                        "identity_sn": identity.serial_number
+                    })
+
         if not coin:
             return request_handler.send_json_response(404, {
                 "error": "identity_coin_not_found",
-                "message": f"No identity coin for SN {identity.serial_number} in Mailbox/Bank"
+                "message": f"Identity coin SN {identity.serial_number} not found"
             })
 
-        file_path = coin.get('file_path') if isinstance(coin, dict) else getattr(coin, 'file_path', None)
+        log_info(logger, "API", f"Identity coin found in {coin_location}. Running heal process...")
 
-        import shutil
-        fracked_dir = os.path.join(mailbox_wallet, "Fracked")
-        os.makedirs(fracked_dir, exist_ok=True)
-        dest = os.path.join(fracked_dir, os.path.basename(file_path))
-        shutil.move(file_path, dest)
-
-        log_info(logger, "API", "Identity coin moved to Fracked for healing")
-
+        # 2. Run heal_wallet - this will:
+        #    - Discover current RAIDA status for all coins
+        #    - Move fracked coins from Bank to Fracked
+        #    - Heal fracked coins
+        #    - Grade and move back to Bank if healthy
         heal_res = heal_wallet(mailbox_wallet, max_iterations=3)
 
-        healed_path = os.path.join(mailbox_bank, os.path.basename(file_path))
-        healed = os.path.exists(healed_path)
+        # 3. Check final location of identity coin
+        final_in_bank = find_identity_coin(mailbox_bank, identity.serial_number)
+        final_in_fracked = find_identity_coin(mailbox_fracked, identity.serial_number)
+        final_in_counterfeit = find_identity_coin(mailbox_counterfeit, identity.serial_number)
 
-        return request_handler.send_json_response(200, {
-            "status": "healed" if healed else "failed",
-            "total_fracked": heal_res.total_fracked,
-            "total_fixed": heal_res.total_fixed,
-            "total_failed": heal_res.total_failed,
-            "identity_in_bank": healed
-        })
+        if final_in_bank:
+            return request_handler.send_json_response(200, {
+                "status": "healthy",
+                "message": "Identity coin is healthy (in Bank)",
+                "identity_sn": identity.serial_number,
+                "was_healed": coin_location == "Fracked",
+                "total_fixed": heal_res.total_fixed
+            })
+        elif final_in_fracked:
+            return request_handler.send_json_response(200, {
+                "status": "still_fracked",
+                "message": "Identity coin still needs healing. Some RAIDA servers may be offline.",
+                "identity_sn": identity.serial_number,
+                "total_fracked": heal_res.total_fracked,
+                "total_fixed": heal_res.total_fixed
+            })
+        elif final_in_counterfeit:
+            return request_handler.send_json_response(200, {
+                "status": "counterfeit",
+                "message": "Identity coin is counterfeit (< 13 passes). Cannot recover.",
+                "identity_sn": identity.serial_number
+            })
+        else:
+            return request_handler.send_json_response(500, {
+                "status": "unknown",
+                "message": "Identity coin location unknown after healing",
+                "identity_sn": identity.serial_number
+            })
 
     except Exception as e:
         log_error(logger, "API", f"Identity heal error: {e}")
@@ -2407,6 +2449,7 @@ MAX_SUBJECT_LENGTH = 500
 MAX_BODY_LENGTH = 1000000  # 1MB
 MAX_DRAFTS_LIMIT = 200
 
+# draft validation function -- may use later
 
 def _validate_draft_subject(subject: Any, required: bool = False) -> Tuple[bool, Optional[str]]:
     """
@@ -3098,63 +3141,6 @@ def handle_wallet_balance(request_handler, context):
             "details": str(e)
         })
 
-
-def handle_stake_mailbox(request_handler, context):
-    """
-    POST /api/mail/stake - Manual Staking Flow (First Login)
-    Required to establish identity before the client can send mail.
-    """
-    import asyncio
-    from locker_download import download_from_locker, LockerDownloadResult
-    from wallet_structure import get_wallet_path, DEFAULT_WALLET
-    from heal_file_io import move_coin_file
-
-    app_ctx = request_handler.server_instance.app_context
-    data = context.json or {}
-
-    # 1. Capture and Clean Locker Code (AS8D-HJL)
-    raw_code = data.get('locker_code', '')
-    if not raw_code:
-        return request_handler.send_json_response(400, {"error": "Locker code required."})
-
-    # Preserve case and hyphen for Go compatibility
-    clean_code = raw_code.strip()
-    locker_bytes = clean_code.encode('ascii')
-
-    # 2. Call Command 8 (Download)
-    # NOTE: If this fails with insufficient responses, it confirms servers lack CCV3.
-    wallet_path = get_wallet_path(DEFAULT_WALLET)
-    try:
-        result, coins = asyncio.run(download_from_locker(
-            locker_code=locker_bytes,
-            wallet_path=wallet_path,
-            db_handle=app_ctx.db_handle
-        ))
-    except Exception as e:
-        return request_handler.send_json_response(500, {"error": f"Staking process crashed: {e}"})
-
-    if result != LockerDownloadResult.SUCCESS:
-        return request_handler.send_json_response(502, {
-            "error": "RAIDA Infrastructure Error",
-            "details": "Command 8 failed. Ensure CCV3 is rolled out on all RAIDAs."
-        })
-
-    # 3. Activate Identity: Move coin to Bank and update config
-    if coins:
-        target_path = os.path.join(wallet_path, "Bank")
-        move_coin_file(coins[0], target_path)
-
-        # Immediate update so user doesn't have to restart to send mail
-        app_ctx.config.identity.serial_number = coins[0].serial_number
-        app_ctx.config.identity.denomination = coins[0].denomination
-
-        return request_handler.send_json_response(200, {
-            "status": "success",
-            "serial_number": coins[0].serial_number,
-            "message": "Mailbox successfully staked."
-        })
-
-    return request_handler.send_json_response(404, {"error": "The provided locker was empty."})
 
 
 # ============================================================================
