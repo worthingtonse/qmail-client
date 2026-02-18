@@ -113,14 +113,27 @@ def handle_account_identity(request_handler, context):
             "message": "Use POST /api/setup/import-credentials to set up your identity"
         })
 
-    # --- 1. VERIFY IDENTITY COIN FILE EXISTS IN BANK ---
+    # --- 1. VERIFY IDENTITY COIN FILE EXISTS (Bank or Fracked) ---
     identity_file = None
-    mailbox_bank = "Data/Wallets/Mailbox/Bank"
+    identity_location = None
     
+    mailbox_bank = "Data/Wallets/Mailbox/Bank"
+    mailbox_fracked = "Data/Wallets/Mailbox/Fracked"
+    
+    # Check Bank first
     if os.path.exists(mailbox_bank):
         for f in os.listdir(mailbox_bank):
             if f.endswith('.bin') and str(identity.serial_number) in f:
                 identity_file = f
+                identity_location = "Bank"
+                break
+    
+    # Check Fracked if not found in Bank
+    if not identity_file and os.path.exists(mailbox_fracked):
+        for f in os.listdir(mailbox_fracked):
+            if f.endswith('.bin') and str(identity.serial_number) in f:
+                identity_file = f
+                identity_location = "Fracked"
                 break
 
     # --- 2. GET PRETTY EMAIL ADDRESS FROM DATABASE ---
@@ -163,6 +176,8 @@ def handle_account_identity(request_handler, context):
         "technical_address": technical_address,
         "display_name": display_name,
         "identity_file": identity_file,
+        "identity_location": identity_location,
+        "needs_healing": identity_location == "Fracked",
         "configured": True
     })
 
