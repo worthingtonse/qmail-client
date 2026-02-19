@@ -982,7 +982,7 @@ def main():
                      f"New mail detected: {len(notifications)} notification(s)")
 
             # Persist in memory for immediate UI/API access
-            app_context.add_notifications(notifications)
+            # app_context.add_notifications(notifications)
 
             successful_count = 0
             failed_count = 0
@@ -1011,7 +1011,7 @@ def main():
                     
                     log_info(logger, "BeaconLoop", f"✓ New mail from: {sender_display}")
                     
-                    # Memory mein sirf naye notifications add karein
+                    # only add new notifications to the memory
                     app_context.add_notifications([notification])
 
                     # 3. LOCKER CODE CLEANING (Format: AS8D-HJL -> AS8DHJL)

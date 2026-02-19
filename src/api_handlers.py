@@ -399,6 +399,29 @@ def handle_ping(request_handler, context):
     except Exception as e:
         log_error(logger, "API", f"Ping crash: {e}")
         request_handler.send_json_response(500, {"error": str(e)})
+
+def handle_mail_notifications(request_handler, context):
+    """
+    GET /api/mail/notifications - Get pending new mail notifications
+    """
+    app_ctx = request_handler.server_instance.app_context
+    
+    # Get and clear notifications (so they're only shown once)
+    notifications = app_ctx.get_and_clear_notifications()
+    
+    response = {
+        "status": "success", 
+        "count": len(notifications),
+        "notifications": [
+            {
+                "guid": n.file_guid.hex() if hasattr(n.file_guid, 'hex') else str(n.file_guid),
+                "sender_sn": getattr(n, 'sender_sn', None),
+                "timestamp": getattr(n, 'timestamp', None)
+            }
+            for n in notifications
+        ]
+    }
+    request_handler.send_json_response(200, response)
 # ============================================================================
 
 
@@ -4309,6 +4332,7 @@ def register_all_routes(server):
     # server.register_route('GET', '/api/health', handle_health)
     server.register_route("GET", '/api/admin/version-check', handle_version_check)
     server.register_route('GET', '/api/qmail/ping', handle_ping)
+    server.register_route('GET', '/api/mail/notifications', handle_mail_notifications)
 
     # Account / Identity
     server.register_route('GET', '/api/account/identity', handle_account_identity)
