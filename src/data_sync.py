@@ -454,6 +454,56 @@ def sync_servers(
     return SyncErrorCode.SUCCESS, synced_count
 
 
+def sync_raida_servers(
+    db_handle: DatabaseHandle,
+    url: str,
+    timeout_sec: int = 30,
+    logger_handle=None
+) -> Tuple[SyncErrorCode, int]:
+    """
+    Download RAIDA server IPs from URL and sync to database.
+    
+    URL returns plain text: IP:PORT per line (25 lines)
+    """
+    log_info(logger_handle, SYNC_CONTEXT, f"Syncing RAIDA servers from: {url}")
+    
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={'User-Agent': 'QMail/1.0'})
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+            text = response.read().decode('utf-8')
+    except Exception as e:
+        log_error(logger_handle, SYNC_CONTEXT, f"Failed to fetch RAIDA servers: {e}")
+        return SyncErrorCode.ERR_NETWORK, 0
+    
+    from database import upsert_raida_server, DatabaseErrorCode
+    
+    synced_count = 0
+    for i, line in enumerate(text.strip().split('\n')):
+        line = line.strip()
+        if not line:
+            continue
+        
+        if ':' in line:
+            parts = line.split(':')
+            ip = parts[0].strip()
+            try:
+                port = int(parts[1].strip())
+            except (ValueError, IndexError):
+                port = 50000 + i
+        else:
+            ip = line
+            port = 50000 + i
+        
+        if ip:
+            err = upsert_raida_server(db_handle, i, ip, port)
+            if err == DatabaseErrorCode.SUCCESS:
+                synced_count += 1
+    
+    log_info(logger_handle, SYNC_CONTEXT, f"Synced {synced_count} RAIDA servers")
+    return SyncErrorCode.SUCCESS, synced_count
+
+
 # ============================================================================
 # SYNC ALL
 # ============================================================================
@@ -462,6 +512,7 @@ def sync_all(
     db_handle: DatabaseHandle,
     users_url: str,
     servers_url: str,
+    raida_servers_url: str = "https://raida11.cloudcoin.global/service/raida_servers",
     timeout_sec: int = 30,
     logger_handle=None
 ) -> Tuple[SyncErrorCode, Dict[str, int]]:
@@ -486,7 +537,7 @@ def sync_all(
     """
     log_info(logger_handle, SYNC_CONTEXT, "Starting full data sync...")
 
-    result = {"users": 0, "servers": 0}
+    result = {"users": 0, "servers": 0, "raida_servers": 0}
     overall_error = SyncErrorCode.SUCCESS
 
     # Sync users
@@ -508,6 +559,18 @@ def sync_all(
         # Only update overall error if users didn't fail
         if overall_error == SyncErrorCode.SUCCESS:
             overall_error = servers_err
+
+    # Sync RAIDA servers
+    raida_err, raida_count = sync_raida_servers(
+        db_handle, raida_servers_url, timeout_sec, logger_handle)
+    result["raida_servers"] = raida_count
+    if raida_err != SyncErrorCode.SUCCESS:
+        log_warning(logger_handle, SYNC_CONTEXT,
+                    f"RAIDA server sync failed: {raida_err}")
+        if overall_error == SyncErrorCode.SUCCESS:
+            overall_error = raida_err
+
+    # Get final counts from database
 
     # Get final counts from database
     _, total_users = get_user_count(db_handle)

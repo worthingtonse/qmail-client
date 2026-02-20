@@ -453,6 +453,7 @@ class SyncConfig:
     """Configuration for data synchronization from RAIDA servers."""
     users_url: str = "https://raida11.cloudcoin.global/service/users"
     servers_url: str = "https://raida11.cloudcoin.global/service/qmail_servers"
+    raida_servers_url: str = "https://raida11.cloudcoin.global/service/raida_servers"
     timeout_sec: int = 30
 
 @dataclass

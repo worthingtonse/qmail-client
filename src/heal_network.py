@@ -195,10 +195,9 @@ def get_raida_servers(db_handle: Any = None) -> List[RaidaServer]:
     1. Cached servers (if available)
     2. Database query (if db_handle provided)
     3. URL fetch from RAIDA_SERVERS_URL
-    4. Default configuration (hardcoded)
 
     Args:
-        db_handle: Optional database handle with get_raida_servers() method
+        db_handle: Optional database handle
 
     Returns:
         List of 25 RaidaServer objects
@@ -213,33 +212,32 @@ def get_raida_servers(db_handle: Any = None) -> List[RaidaServer]:
         # Try database first
         if db_handle is not None:
             try:
-                if hasattr(db_handle, 'get_raida_servers'):
-                    db_servers = db_handle.get_raida_servers()
-                    if db_servers and len(db_servers) == RAIDA_COUNT:
-                        _raida_servers_cache = [
-                            RaidaServer(
-                                raida_id=s.raida_id if hasattr(s, 'raida_id') else i,
-                                host=s.host if hasattr(s, 'host') else s.get('host', ''),
-                                port=s.port if hasattr(s, 'port') else s.get('port', RAIDA_BASE_PORT + i)
-                            )
-                            for i, s in enumerate(db_servers)
-                        ]
-                        logger.debug("Using RAIDA servers from database")
-                        return _raida_servers_cache
+                from database import get_all_raida_servers, DatabaseErrorCode
+                err, db_servers = get_all_raida_servers(db_handle)
+                if err == DatabaseErrorCode.SUCCESS and len(db_servers) >= RAIDA_COUNT:
+                    _raida_servers_cache = [
+                        RaidaServer(
+                            raida_id=s['raida_index'],
+                            host=s['ip_address'],
+                            port=s['port']
+                        )
+                        for s in db_servers[:RAIDA_COUNT]
+                    ]
+                    logger.debug("Using RAIDA servers from database")
+                    return _raida_servers_cache
             except Exception as e:
-                logger.warning(f"Could not get servers from database: {e}")
+                logger.warning(f"Could not get RAIDA servers from database: {e}")
 
-        # Try URL fetch
+        # Try URL fetch as fallback
         url_servers = fetch_raida_servers_from_url()
         if url_servers:
             _raida_servers_cache = url_servers
             return _raida_servers_cache
 
-             # NO DNS FALLBACK - DNS names resolve to stale/wrong IPs
-        # If URL fetch fails, raise error so the problem is visible
+        # NO FALLBACK - raise error
         raise RuntimeError(
             f"FATAL: Cannot fetch RAIDA servers from {RAIDA_SERVERS_URL}. "
-            "Check network connectivity. Will not fall back to DNS names."
+            "Check network connectivity."
         )
 
 def clear_server_cache() -> None:

@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS Servers (
     );
 
 -- ==========================================
+-- RAIDA Servers (25 RAIDA nodes)
+-- ==========================================
+CREATE TABLE IF NOT EXISTS RaidaServers (
+    RaidaIndex INTEGER PRIMARY KEY,
+    IPAddress TEXT NOT NULL,
+    Port INTEGER DEFAULT 50000,
+    LastUpdated INTEGER
+);
+
+-- ==========================================
 -- 2. Users (Contacts)
 -- ==========================================
 CREATE TABLE IF NOT EXISTS Users (
@@ -2607,6 +2617,49 @@ def get_server_count(handle: Any) -> Tuple[DatabaseErrorCode, int]:
     except sqlite3.Error as e:
         log_error(handle.logger, DB_CONTEXT, "Failed to get server count", str(e))
         return DatabaseErrorCode.ERR_QUERY_FAILED, 0
+
+
+def upsert_raida_server(handle: Any, raida_index: int, ip_address: str, port: int) -> DatabaseErrorCode:
+    """Insert or update a RAIDA server entry."""
+    if handle is None or handle.connection is None:
+        return DatabaseErrorCode.ERR_NOT_OPEN
+    
+    try:
+        import time
+        cursor = handle.connection.cursor()
+        cursor.execute("""
+            INSERT INTO RaidaServers (RaidaIndex, IPAddress, Port, LastUpdated)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(RaidaIndex) DO UPDATE SET
+                IPAddress = excluded.IPAddress,
+                Port = excluded.Port,
+                LastUpdated = excluded.LastUpdated
+        """, (raida_index, ip_address, port, int(time.time())))
+        handle.connection.commit()
+        return DatabaseErrorCode.SUCCESS
+    except Exception as e:
+        return DatabaseErrorCode.ERR_QUERY_FAILED
+
+
+def get_all_raida_servers(handle: Any) -> Tuple[DatabaseErrorCode, List[Dict[str, Any]]]:
+    """Get all RAIDA servers from database."""
+    if handle is None or handle.connection is None:
+        return DatabaseErrorCode.ERR_NOT_OPEN, []
+    
+    try:
+        cursor = handle.connection.cursor()
+        cursor.execute("""
+            SELECT RaidaIndex, IPAddress, Port FROM RaidaServers
+            ORDER BY RaidaIndex
+        """)
+        rows = cursor.fetchall()
+        servers = [
+            {"raida_index": r[0], "ip_address": r[1], "port": r[2]}
+            for r in rows
+        ]
+        return DatabaseErrorCode.SUCCESS, servers
+    except Exception as e:
+        return DatabaseErrorCode.ERR_QUERY_FAILED, []
 
 # ============================================================================
 # INCOMING EMAIL/DOWNLOAD FUNCTIONS

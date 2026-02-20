@@ -879,15 +879,16 @@ def main():
             app_context.db_handle,
             config.sync.users_url,
             config.sync.servers_url,
+            config.sync.raida_servers_url,
             config.sync.timeout_sec,
             logger
         )
 
         if sync_err == SyncErrorCode.SUCCESS:
             print(
-                f"[INIT] Data sync complete: {sync_result['users']} users, {sync_result['servers']} servers")
+                f"[INIT] Data sync complete: {sync_result['users']} users, {sync_result['servers']} servers, {sync_result['raida_servers']} RAIDA servers")
             log_info(
-                logger, "App", f"Data sync complete: {sync_result['users']} users, {sync_result['servers']} servers")
+                logger, "App", f"Data sync complete: {sync_result['users']} users, {sync_result['servers']} servers, {sync_result['raida_servers']} RAIDA servers")
         else:
             print(
                 f"[WARNING] Data sync failed (error {sync_err}) - continuing with cached data")
