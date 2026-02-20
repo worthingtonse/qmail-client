@@ -256,7 +256,7 @@ CREATE TABLE IF NOT EXISTS Junction_Email_QMailServers (
     stripe_index INTEGER,
     PRIMARY KEY (EmailID, QMailServerID),
     FOREIGN KEY(EmailID) REFERENCES Emails(EmailID) ON DELETE CASCADE,
-    FOREIGN KEY(QMailServerID) REFERENCES QMailServers(QMailServerID)
+    FOREIGN KEY(QMailServerID) REFERENCES Servers(ServerID)
 );
 
 -- ==========================================
@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS Session (
     SessionEncryptionKey BLOB,
     created_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     expires_timestamp DATETIME,
-    FOREIGN KEY(QMailServerID) REFERENCES QMailServers(QMailServerID)
+    FOREIGN KEY(QMailServerID) REFERENCES Servers(ServerID)
 );
 
 -- ==========================================
@@ -375,7 +375,7 @@ CREATE INDEX IF NOT EXISTS idx_emails_folder ON Emails(folder);
 CREATE INDEX IF NOT EXISTS idx_users_name ON Users(FirstName, LastName);
 CREATE INDEX IF NOT EXISTS idx_users_address ON Users(auto_address);
 CREATE INDEX IF NOT EXISTS idx_attachments_email ON Attachments(EmailID);
-CREATE INDEX IF NOT EXISTS idx_servers_available ON QMailServers(is_available);
+CREATE INDEX IF NOT EXISTS idx_servers_available ON Servers(IsAvailable);
 CREATE INDEX IF NOT EXISTS idx_servers_parity ON QMailServers(use_for_parity);
 CREATE INDEX IF NOT EXISTS idx_pending_tells_status ON PendingTells(Status);
 CREATE INDEX IF NOT EXISTS idx_received_tells_download_status ON received_tells(download_status);
@@ -1820,7 +1820,7 @@ def get_database_stats(handle: DatabaseHandle) -> Tuple[DatabaseErrorCode, Dict[
 
         # SAFETY NOTE: This list is hardcoded - no user input can affect table names.
         # The f-string below is SAFE because 'table' comes only from this constant list.
-        tables = ['Emails', 'Users', 'Attachments', 'QMailServers', 'Session', 'Locker_Keys']
+        tables = ['Emails', 'Users', 'Attachments', 'Servers', 'Session', 'Locker_Keys']
 
         for table in tables:
             cursor.execute(f"SELECT COUNT(*) FROM {table}")
@@ -3038,7 +3038,7 @@ def get_stripe_locations(
             SELECT jes.QMailServerID, jes.stripe_index,
                    qs.IPAddress, qs.PortNumb, qs.is_available
             FROM Junction_Email_QMailServers jes
-            LEFT JOIN QMailServers qs ON jes.QMailServerID = qs.QMailServerID
+            LEFT JOIN Servers qs ON jes.QMailServerID = qs.ServerID
             WHERE jes.EmailID = ?
             ORDER BY jes.stripe_index
         """, (file_group_guid,))

@@ -293,15 +293,19 @@ def initialize_application(args):
         return None, None
 
     # Initialize thread pool
+    print("[DEBUG] Creating thread pool...")
     thread_pool = create_pool(config.threading.pool_size, logger)
     if thread_pool is None:
+        print("[ERROR] Thread pool creation failed")
         close_database(db_handle)
         close_logger(logger)
         return None, None
 
     # Initialize task manager
+    print("[DEBUG] Creating task manager...")
     task_manager = init_task_manager(logger_handle=logger)
     if task_manager is None:
+        print("[ERROR] Task manager creation failed")
         destroy_pool(thread_pool)
         close_database(db_handle)
         close_logger(logger)
