@@ -376,7 +376,7 @@ CREATE INDEX IF NOT EXISTS idx_users_name ON Users(FirstName, LastName);
 CREATE INDEX IF NOT EXISTS idx_users_address ON Users(auto_address);
 CREATE INDEX IF NOT EXISTS idx_attachments_email ON Attachments(EmailID);
 CREATE INDEX IF NOT EXISTS idx_servers_available ON Servers(IsAvailable);
-CREATE INDEX IF NOT EXISTS idx_servers_parity ON QMailServers(use_for_parity);
+CREATE INDEX IF NOT EXISTS idx_servers_parity ON Servers(UseForParity);
 CREATE INDEX IF NOT EXISTS idx_pending_tells_status ON PendingTells(Status);
 CREATE INDEX IF NOT EXISTS idx_received_tells_download_status ON received_tells(download_status);
 CREATE INDEX IF NOT EXISTS idx_received_tells_file_guid ON received_tells(file_guid);
