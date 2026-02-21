@@ -1500,10 +1500,12 @@ def handle_sync(request_handler, context):
     logger = app_ctx.logger
 
     # Perform sync
+    # Perform sync
     sync_err, sync_result = sync_all(
         db_handle,
         config.sync.users_url,
         config.sync.servers_url,
+        config.sync.raida_servers_url,
         config.sync.timeout_sec,
         logger
     )
@@ -1517,6 +1519,7 @@ def handle_sync(request_handler, context):
             "status": "success",
             "users_synced": sync_result['users'],
             "servers_synced": sync_result['servers'],
+            "raida_servers_synced": sync_result['raida_servers'],
             "timestamp": int(time.time())
         }
         request_handler.send_json_response(200, response)

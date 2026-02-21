@@ -144,7 +144,7 @@ class ServerPayment:
 # PUBLIC API FUNCTIONS
 # ============================================================================
 
-def calculate_storage_cost(
+def calculate_storage_cost( ## do not delete , kept here for safety
     total_file_size_bytes: int,
     storage_weeks: int,
     server_fees: List[ServerFees] 
@@ -172,6 +172,81 @@ def calculate_storage_cost(
         total_storage_cost += (mb_cost + time_cost)
         
     return total_storage_cost
+
+
+def estimate_storage_cost(
+    db_handle,
+    total_file_size_bytes: int,
+    storage_weeks: int,
+    logger_handle=None
+) -> float:
+    """
+    Estimate total storage cost across all servers.
+    Uses same calculation logic as prepare_server_payments.
+    Returns: Total CC needed for storage payments
+    """
+    from database import get_all_servers, DatabaseErrorCode
+    
+    err, db_servers = get_all_servers(db_handle, available_only=True)
+    if err != DatabaseErrorCode.SUCCESS or not db_servers:
+        log_warning(logger_handle, "CostEstimate", "No servers found, using fallback estimate")
+        return 8 * 0.00001  # Minimal fallback
+    
+    size_mb = total_file_size_bytes / (1024 * 1024)
+    duration_blocks = storage_weeks / 8.0
+    
+    total_cost = 0.0
+    for srv in db_servers:
+        cost_per_mb = float(srv.get('cost_per_mb', 1.0) or 1.0)
+        cost_per_8_weeks = float(srv.get('cost_per_8_weeks', 1.0) or 1.0)
+        
+        amount = (size_mb * cost_per_mb) + (duration_blocks * cost_per_8_weeks)
+        total_cost += amount
+    
+    # Add 5% buffer matching acceptable_overpay logic
+    buffer = max(0.0001, total_cost * 0.05)
+    total_cost += buffer
+    
+    return total_cost
+
+
+def get_wallet_balance(wallet_path: str, identity_sn: int = None) -> float:
+    """
+    Get total available balance in wallet Bank folder.
+    Excludes identity coin if identity_sn provided.
+    Returns: Total CC available
+    """
+    import os
+    
+    bank_path = os.path.join(wallet_path, "Bank")
+    if not os.path.exists(bank_path):
+        return 0.0
+    
+    total = 0.0
+    for filename in os.listdir(bank_path):
+        if not filename.endswith('.bin'):
+            continue
+        
+        filepath = os.path.join(bank_path, filename)
+        
+        try:
+            # Parse denomination from filename: DN.SN.bin
+            parts = filename.replace('.bin', '').split('.')
+            if len(parts) >= 2:
+                dn = int(parts[0])
+                sn = int(parts[1])
+                
+                # Skip identity coin
+                if identity_sn and sn == identity_sn:
+                    continue
+                
+                # Calculate value from denomination
+                value = parse_denomination_code(dn)
+                total += value
+        except:
+            continue
+    
+    return total
 
 def calculate_recipient_fees(db_handle, recipients_list) -> float:
     """

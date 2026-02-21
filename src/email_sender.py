@@ -56,6 +56,44 @@ from locker_put import put_to_locker, CoinForPut, PutResult
 from key_manager import get_keys_from_locker_code
 
 
+
+def _calculate_tell_fees(
+    to_addresses: List[str],
+    cc_addresses: List[str],
+    db_handle,
+    logger_handle=None
+) -> float:
+    """
+    Calculate total Tell notification fees for all recipients.
+    Returns: Total fees needed (beacon + inbox for all recipients)
+    """
+    from database import get_contact_by_id, DatabaseErrorCode
+    
+    total_fees = 0.0
+    all_addresses = (to_addresses or []) + (cc_addresses or [])
+    
+    for address in all_addresses:
+        beacon_fee = 0.1  # Default beacon fee for all users
+        inbox_fee = 0.0   # Default no inbox fee
+        
+        # Try to get user-specific fees from database
+        if db_handle:
+            try:
+                _, _, sn = _parse_qmail_address(address)
+                err, user = get_contact_by_id(db_handle, sn)
+                if err == DatabaseErrorCode.SUCCESS and user:
+                    if user.get('inbox_fee') is not None:
+                        try:
+                            inbox_fee = float(user['inbox_fee'])
+                        except:
+                            inbox_fee = 0.0
+            except:
+                pass
+        
+        total_fees += beacon_fee + inbox_fee
+    
+    return total_fees
+
 async def _attempt_refund_async(
     locker_code: bytes,
     wallet_path: str,
@@ -1393,6 +1431,50 @@ def send_email_async(
         # ============================================================
         # STEP 5: PREPARE PER-SERVER STORAGE PAYMENTS (RAIDA Interaction)
         # ============================================================
+        # ============================================================
+        # PRE-CHECK: Calculate TOTAL costs (Storage + Tell fees) BEFORE any payment
+        # ============================================================
+        update_state("CALCULATING", 10, "Calculating total costs...")
+        
+        # Calculate storage cost
+        file_sizes = [body_info.file_size] + [att.file_size for att in prepared_attachments]
+        total_size = sum(file_sizes)
+        
+        # Calculate Tell notification fees
+        tell_fees = _calculate_tell_fees(
+            to_addresses=request.to_recipients,
+            cc_addresses=request.cc_recipients,
+            db_handle=db_handle,
+            logger_handle=logger_handle
+)
+        
+        # Calculate storage fees estimate
+        from payment import estimate_storage_cost, get_wallet_balance
+        storage_fees = estimate_storage_cost(
+            db_handle=db_handle,
+            total_file_size_bytes=total_size,
+            storage_weeks=request.storage_weeks,
+            logger_handle=logger_handle
+        )
+        
+        total_needed = storage_fees + tell_fees
+        
+        # Verify we have enough coins for EVERYTHING
+        available_balance = get_wallet_balance("Data/Wallets/Default", identity.serial_number)
+        
+        if available_balance < total_needed:
+            log_error(logger_handle, SENDER_CONTEXT, 
+                      f"Insufficient balance: have {available_balance:.8f} CC, need {total_needed:.8f} CC "
+                      f"(Storage: {storage_fees:.8f}, Tell: {tell_fees:.8f})")
+            result.error_message = f"Insufficient CloudCoins. Need {total_needed:.8f} CC but only have {available_balance:.8f} CC."
+            result.error_code = SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS
+            update_state("FAILED", 0, result.error_message)
+            return SendEmailErrorCode.ERR_INSUFFICIENT_FUNDS, result
+        
+        log_info(logger_handle, SENDER_CONTEXT, 
+                 f"Balance check passed: {available_balance:.8f} CC available, need {total_needed:.8f} CC "
+                 f"(Storage: {storage_fees:.8f}, Tell: {tell_fees:.8f})")
+
         update_state("CALCULATING", 15, "Calculating and preparing per-server payments...")
         
         # Calculate total file size from ENCRYPTED sizes
