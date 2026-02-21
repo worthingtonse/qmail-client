@@ -404,22 +404,42 @@ def handle_mail_notifications(request_handler, context):
     """
     GET /api/mail/notifications - Get pending new mail notifications
     """
+    from database import get_contact_by_id, DatabaseErrorCode
+    from data_sync import convert_to_custom_base32
+    
     app_ctx = request_handler.server_instance.app_context
+    db_handle = app_ctx.db_handle
     
     # Get and clear notifications (so they're only shown once)
     notifications = app_ctx.get_and_clear_notifications()
     
+    result_notifications = []
+    for n in notifications:
+        sender_sn = getattr(n, 'sender_sn', None)
+        
+        sender_address = None
+        if sender_sn and db_handle:
+            # Check Users table (synced from host file)
+            err, user = get_contact_by_id(db_handle, sender_sn)
+            if err == DatabaseErrorCode.SUCCESS and user:
+                sender_address = user.get('auto_address')
+        
+        # Fallback to User.User@Unregistered#SN.Class format
+        if not sender_address and sender_sn:
+            base32_sn = convert_to_custom_base32(sender_sn)
+            sender_address = f"User.User@Unregistered#{base32_sn}.Bit"
+        
+        result_notifications.append({
+            "guid": n.file_guid.hex() if hasattr(n.file_guid, 'hex') else str(n.file_guid),
+            "sender_sn": sender_sn,
+            "sender_address": sender_address,
+            "timestamp": getattr(n, 'timestamp', None)
+        })
+    
     response = {
         "status": "success", 
-        "count": len(notifications),
-        "notifications": [
-            {
-                "guid": n.file_guid.hex() if hasattr(n.file_guid, 'hex') else str(n.file_guid),
-                "sender_sn": getattr(n, 'sender_sn', None),
-                "timestamp": getattr(n, 'timestamp', None)
-            }
-            for n in notifications
-        ]
+        "count": len(result_notifications),
+        "notifications": result_notifications
     }
     request_handler.send_json_response(200, response)
 # ============================================================================
