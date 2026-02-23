@@ -437,7 +437,7 @@ def initialize_application(args):
     return app_context, server
 
 
-def find_identity_coin_for_beacon(logger_handle=None):
+def find_identity_coin_for_beacon(logger_handle=None):  ## NOT USED, DEAD CODE . NOT DELETING FOR REFERENCE PURPOSES
     """
     Find identity coin for beacon initialization.
     Priority: Mailbox/Bank > Mailbox/Fracked > Default/Bank (legacy migration)

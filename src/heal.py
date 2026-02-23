@@ -606,7 +606,7 @@ def discover_bank_coin_status(wallet_path: str) -> Tuple[HealErrorCode, int, int
             # Coin is good, update file in place
             from heal_file_io import write_coin_file
             write_coin_file(coin.file_path, coin)
-            logger.info(f"     Updated in Bank (all 25 pass)")
+            logger.info(f"     Updated in Bank (all pass)")
         elif status == 'fracked':
             # Move to Fracked folder for healing
             err = move_coin_file(coin, fracked_folder)

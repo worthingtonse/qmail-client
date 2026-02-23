@@ -460,7 +460,6 @@ def get_coins_by_value(wallet_path: str, target_value: float, identity_sn: int =
     Get coins from wallet that total the target value.
     
     STRATEGY: 
-    1. Only select coins with 25/25 pass status (no 'f', 'u', or 'n' in POWN)
     2. Greedy fit - largest coins that FIT first
     3. Minimizes overpayment and avoids breaking coins
     """

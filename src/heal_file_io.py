@@ -459,7 +459,7 @@ def load_coins_from_folder(folder_path: str) -> Tuple[HealErrorCode, List[CloudC
         return HealErrorCode.ERR_IO_ERROR, coins
 
 
-def get_wallet_folder(wallet_path: str, folder_name: str) -> str:
+def get_wallet_folder(wallet_path: str, folder_name: str) -> str: ## dead code , dont delete kept here for reference
     """
     Get full path to a wallet subfolder.
 
@@ -544,7 +544,7 @@ def check_wallet_folders_exist(wallet_path: str) -> Tuple[bool, List[str]]:
     return len(missing) == 0, missing
 
 
-def move_coin_to_fracked(coin: CloudCoinBin, wallet_path: str = "Data/Wallets/Default") -> bool:
+def move_coin_to_fracked(coin: CloudCoinBin, wallet_path: str = "Data/Wallets/Default") -> bool: ## dead code , dont delete kept here for reference
     """
     Move a coin from Bank to Fracked folder within specified wallet.
     Works for both Default (payment) and Mailbox (identity) wallets.
@@ -579,7 +579,7 @@ def move_coin_to_fracked(coin: CloudCoinBin, wallet_path: str = "Data/Wallets/De
         return False
 
 
-def move_coin_to_bank(coin: CloudCoinBin, wallet_path: str = "Data/Wallets/Default") -> bool:
+def move_coin_to_bank(coin: CloudCoinBin, wallet_path: str = "Data/Wallets/Default") -> bool: ## dead code , dont delete kept here for reference
     """
     Move a healed coin from Fracked back to Bank folder within specified wallet.
     Works for both Default (payment) and Mailbox (identity) wallets.
