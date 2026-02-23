@@ -531,7 +531,7 @@ def reassemble_upload_stripes(
         computed_crc = zlib.crc32(stripe_data) & 0xFFFFFFFF
         
         if stored_crc == computed_crc:
-            log_debug(logger_handle, STRIPE_CONTEXT, f"Stripe {i} CRC verified ✓")
+            log_info(logger_handle, STRIPE_CONTEXT, f"Stripe {i} CRC verified ✓")
             verified_stripes.append(stripe_data)
         else:
             # CRC mismatch - could be old stripe without CRC, try using full stripe

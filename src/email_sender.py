@@ -55,42 +55,46 @@ from coin_break import break_coin
 from locker_put import put_to_locker, CoinForPut, PutResult
 from key_manager import get_keys_from_locker_code
 
-
+# Default fees for unregistered users
+DEFAULT_BEACON_FEE = 0.1
+DEFAULT_INBOX_FEE = 0.0  # Change this to charge unregistered users / ragistered users are charged according to the set by the reciepients in the user host file 
 
 def _calculate_tell_fees(
     to_addresses: List[str],
     cc_addresses: List[str],
+    bcc_addresses: List[str],
     db_handle,
     logger_handle=None
 ) -> float:
     """
     Calculate total Tell notification fees for all recipients.
+    Matches logic in send_tell_notifications().
     Returns: Total fees needed (beacon + inbox for all recipients)
     """
-    from database import get_contact_by_id, DatabaseErrorCode
+    from database import get_user_by_address, DatabaseErrorCode
     
     total_fees = 0.0
-    all_addresses = (to_addresses or []) + (cc_addresses or [])
+    all_addresses = (to_addresses or []) + (cc_addresses or []) + (bcc_addresses or [])
     
     for address in all_addresses:
-        beacon_fee = 0.1  # Default beacon fee for all users
-        inbox_fee = 0.0   # Default no inbox fee
+        beacon_fee = DEFAULT_BEACON_FEE
+        inbox_fee = DEFAULT_INBOX_FEE
         
-        # Try to get user-specific fees from database
-        if db_handle:
-            try:
-                _, _, sn = _parse_qmail_address(address)
-                err, user = get_contact_by_id(db_handle, sn)
-                if err == DatabaseErrorCode.SUCCESS and user:
-                    if user.get('inbox_fee') is not None:
-                        try:
-                            inbox_fee = float(user['inbox_fee'])
-                        except:
-                            inbox_fee = 0.0
-            except:
-                pass
+        # Try to get user-specific inbox_fee from database
+        if db_handle and address:
+            err, user = get_user_by_address(db_handle, address)
+            if err == DatabaseErrorCode.SUCCESS and user:
+                # Registered user - use their inbox_fee
+                if user.get('inbox_fee'):
+                    try:
+                        inbox_fee = float(user['inbox_fee'])
+                    except:
+                        inbox_fee = DEFAULT_INBOX_FEE
+            # Unregistered user - inbox_fee stays DEFAULT_INBOX_FEE
         
-        total_fees += beacon_fee + inbox_fee
+        total_fees += beacon_fee
+        if inbox_fee > 0.00000001:
+            total_fees += inbox_fee
     
     return total_fees
 
@@ -1444,9 +1448,10 @@ def send_email_async(
         tell_fees = _calculate_tell_fees(
             to_addresses=request.to_recipients,
             cc_addresses=request.cc_recipients,
+            bcc_addresses=request.bcc_recipients,
             db_handle=db_handle,
             logger_handle=logger_handle
-)
+        )
         
         # Calculate storage fees estimate
         from payment import estimate_storage_cost, get_wallet_balance
@@ -1856,8 +1861,8 @@ def send_tell_notifications(
     
     for address, r_type in all_recipients:
         beacon_id = 'raida11'
-        beacon_fee = 0.1
-        inbox_fee = 0.0
+        beacon_fee = DEFAULT_BEACON_FEE
+        inbox_fee = DEFAULT_INBOX_FEE
         
         err, user = get_user_by_address(db_handle, address)
         if err == DatabaseErrorCode.SUCCESS and user:
@@ -1867,12 +1872,12 @@ def send_tell_notifications(
                 try:
                     beacon_fee = float(user['beacon_fee'])
                 except:
-                    beacon_fee = 0.1
+                    beacon_fee = DEFAULT_BEACON_FEE
             if user.get('inbox_fee'):
                 try:
                     inbox_fee = float(user['inbox_fee'])
                 except:
-                    inbox_fee = 0.0
+                    inbox_fee = DEFAULT_INBOX_FEE
         
         total_fees_needed += beacon_fee
         if inbox_fee > 0.00000001:
