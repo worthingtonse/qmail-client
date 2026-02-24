@@ -1857,10 +1857,10 @@ def _validate_email_id(email_id_str):
 
 def handle_mail_get(request_handler, context):
     """
-    GET /api/mail/{id} - Get email metadata (Pretty Format aware)
+    GET /api/mail/{id} - Get email metadata and body (Pretty Format aware)
     """
     from src.logger import log_error
-    from src.database import get_email_metadata, DatabaseErrorCode
+    from src.database import retrieve_email, get_attachments_for_email, DatabaseErrorCode
 
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
@@ -1870,17 +1870,34 @@ def handle_mail_get(request_handler, context):
     if not is_valid:
         return request_handler.send_json_response(400, {"error": "Invalid id", "details": error_msg})
 
-    # 1. Try downloaded emails (cached in Emails table after first download)
-    err, metadata = get_email_metadata(db_handle, clean_id)
+    # --- THE CRITICAL FIX: Convert hex string to bytes for retrieve_email ---
+    clean_id_bytes = bytes.fromhex(clean_id)
+
+    # 1. Try downloaded emails using the bytes ID so SQLite BLOB search works!
+    err, email_data = retrieve_email(db_handle, clean_id_bytes)
 
     if err == DatabaseErrorCode.SUCCESS:
-        metadata['downloaded'] = True
-        return request_handler.send_json_response(200, metadata)
+        email_data['downloaded'] = True
+        
+        # Fetch attachment metadata
+        att_err, attachments = get_attachments_for_email(db_handle, clean_id_bytes)
+        if att_err == DatabaseErrorCode.SUCCESS:
+            email_data['attachments'] = attachments
+        else:
+            email_data['attachments'] = []
 
-    # 2. Check pending tells
+        # Prevent "Object of type bytes is not JSON serializable" crashes
+        for key, value in list(email_data.items()):
+            if isinstance(value, bytes):
+                email_data[key] = value.hex()
+
+        return request_handler.send_json_response(200, email_data)
+
+    # 2. Check pending tells (Fallback for undownloaded mail)
     if err == DatabaseErrorCode.ERR_NOT_FOUND:
         try:
             cursor = db_handle.connection.cursor()
+            # received_tells uses TEXT for file_guid, so clean_id (string) is correct here
             cursor.execute("SELECT file_guid, created_at, locker_code FROM received_tells WHERE file_guid = ?", (clean_id,))
             row = cursor.fetchone()
             if row:
@@ -1894,7 +1911,9 @@ def handle_mail_get(request_handler, context):
                     "is_read": False,
                     "downloaded": False,
                     "locker_code": locker_hex,
-                    "folder": "inbox"
+                    "folder": "inbox",
+                    "body": "", 
+                    "attachments": []
                 })
         except Exception as e:
             log_error(app_ctx.logger, "API", f"Error checking tells: {e}")
