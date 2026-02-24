@@ -731,8 +731,35 @@ def retrieve_email(handle: Any, email_id: bytes) -> Tuple[DatabaseErrorCode, Opt
             WHERE j.EmailID = ? AND j.user_type = 'FROM'
         """, (email_id,))
         s_row = cursor.fetchone()
+        
         if s_row:
             email['sender'] = dict(s_row)
+        else:
+            # --- CRITICAL FIX: Fallback to received_tells for unregistered senders ---
+            cursor.execute("SELECT sender_sn FROM received_tells WHERE file_guid = ?", (email_id.hex().upper(),))
+            tell_row = cursor.fetchone()
+            
+            if tell_row and tell_row['sender_sn']:
+                sender_sn = tell_row['sender_sn']
+                
+                # Check directory one last time, just in case
+                cursor.execute("SELECT auto_address, FirstName, LastName FROM Users WHERE SerialNumber = ?", (sender_sn,))
+                u_row = cursor.fetchone()
+                
+                if u_row:
+                    email['sender'] = dict(u_row)
+                else:
+                    try:
+                        from data_sync import convert_to_custom_base32
+                        b32 = convert_to_custom_base32(sender_sn)
+                    except ImportError:
+                        b32 = str(sender_sn)
+                    
+                    email['sender'] = {
+                        'auto_address': f"User.User@Unregistered#{b32}.Bit",
+                        'FirstName': 'Unregistered',
+                        'LastName': 'User'
+                    }
 
         # 3. Get Pretty Recipients (TO & CC)
         cursor.execute("""
@@ -1861,25 +1888,43 @@ def list_emails(
         # Inbox logic pulls from received_tells (notifications)
         if folder == 'inbox':
             cursor.execute("""
-                SELECT file_guid as EmailID, tell_type, created_at as ReceivedTimestamp, download_status
-                FROM received_tells
-                ORDER BY created_at DESC
+                SELECT r.file_guid as EmailID, r.tell_type, r.created_at as ReceivedTimestamp, 
+                       r.download_status, r.sender_sn, u.auto_address as contact_pretty
+                FROM received_tells r
+                LEFT JOIN Users u ON r.sender_sn = u.SerialNumber
+                ORDER BY r.created_at DESC
                 LIMIT ? OFFSET ?
             """, (limit, offset))
             rows = cursor.fetchall()
             
+            # Helper for unregistered users
+            try:
+                from data_sync import convert_to_custom_base32
+            except ImportError:
+                convert_to_custom_base32 = lambda sn: str(sn)
+            
             emails = []
             for row in rows:
+                sender_address = row['contact_pretty']
+                sender_sn = row['sender_sn']
+                
+                # Format sender exactly like notifications API
+                if not sender_address and sender_sn:
+                    base32_sn = convert_to_custom_base32(sender_sn)
+                    sender_address = f"User.User@Unregistered#{base32_sn}.Bit"
+                elif not sender_address:
+                    sender_address = "Unknown Sender"
+                
                 emails.append({
                     'EmailID': row['EmailID'],
                     'Subject': f"New Mail ({row['EmailID'][:8]})",
                     'ReceivedTimestamp': row['ReceivedTimestamp'],
                     'is_read': bool(row['download_status']),
-                    'folder': 'inbox'
+                    'folder': 'inbox',
+                    'sender': sender_address  # Added sender mapping here
                 })
         else:
             # Sent/Drafts/Trash query with JOIN to get Pretty Name
-            # We join with Junction table to find the main contact for the summary
             cursor.execute("""
                 SELECT 
                     e.EmailID, e.Subject, e.ReceivedTimestamp, e.SentTimestamp,
@@ -1897,11 +1942,14 @@ def list_emails(
             """, (folder, int(include_trashed), limit, offset))
             
             rows = cursor.fetchall()
-            emails = [dict(row) for row in rows]
-            for e in emails:
+            emails = []
+            for row in rows:
+                e = dict(row)
                 e['is_read'] = bool(e['is_read'])
                 e['is_starred'] = bool(e['is_starred'])
                 e['is_trashed'] = bool(e['is_trashed'])
+                e['sender'] = e.get('contact_pretty') or "Unknown Sender" # Added sender mapping here
+                emails.append(e)
 
         log_debug(handle.logger, "Database", f"Listed {len(emails)} emails from '{folder}'")
         return DatabaseErrorCode.SUCCESS, emails

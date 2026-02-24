@@ -1897,12 +1897,30 @@ def handle_mail_get(request_handler, context):
     if err == DatabaseErrorCode.ERR_NOT_FOUND:
         try:
             cursor = db_handle.connection.cursor()
-            # received_tells uses TEXT for file_guid, so clean_id (string) is correct here
-            cursor.execute("SELECT file_guid, created_at, locker_code FROM received_tells WHERE file_guid = ?", (clean_id,))
+            # FIX: Added sender_sn to the SELECT query
+            cursor.execute("SELECT file_guid, created_at, locker_code, sender_sn FROM received_tells WHERE file_guid = ?", (clean_id,))
             row = cursor.fetchone()
+            
             if row:
                 locker_code = row['locker_code']
                 locker_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
+
+                # FIX: Build the sender object dynamically
+                sender_sn = row['sender_sn']
+                sender_address = "Unknown Sender"
+                
+                if sender_sn:
+                    cursor.execute("SELECT auto_address FROM Users WHERE SerialNumber = ?", (sender_sn,))
+                    u_row = cursor.fetchone()
+                    if u_row:
+                        sender_address = u_row['auto_address']
+                    else:
+                        try:
+                            from data_sync import convert_to_custom_base32
+                            b32_sn = convert_to_custom_base32(sender_sn)
+                        except ImportError:
+                            b32_sn = str(sender_sn)
+                        sender_address = f"User.User@Unregistered#{b32_sn}.Bit"
 
                 return request_handler.send_json_response(200, {
                     "EmailID": row['file_guid'],
@@ -1913,7 +1931,9 @@ def handle_mail_get(request_handler, context):
                     "locker_code": locker_hex,
                     "folder": "inbox",
                     "body": "", 
-                    "attachments": []
+                    "attachments": [],
+                    # FIX: Inject sender object so React's getEmailById maps it correctly!
+                    "sender": {"auto_address": sender_address}
                 })
         except Exception as e:
             log_error(app_ctx.logger, "API", f"Error checking tells: {e}")
