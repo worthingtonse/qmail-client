@@ -1090,11 +1090,19 @@ def handle_mail_list(request_handler, context):
                 eid = email.get('EmailID', '')
                 if isinstance(eid, str) and len(eid) == 32:
                     cursor.execute(
-                        "SELECT Subject FROM Emails WHERE EmailID = ?",
+                        "SELECT Subject, Body FROM Emails WHERE EmailID = ?",
                         (bytes.fromhex(eid),))
                     row = cursor.fetchone()
                     if row and row['Subject']:
                         email['Subject'] = row['Subject']
+                        
+                        # FIX: Safely decode the BLOB Body into text for the preview
+                        body_raw = row['Body']
+                        if isinstance(body_raw, bytes):
+                            email['preview'] = body_raw.decode('utf-8', errors='ignore')[:100]
+                        else:
+                            email['preview'] = str(body_raw)[:100] if body_raw else "No preview available..."
+                            
                         email['downloaded'] = True
                     else:
                         email['downloaded'] = False
@@ -2484,6 +2492,9 @@ def handle_mail_attachment_download(request_handler, context):
         'Content-Disposition', f'attachment; filename="{filename}"')
     request_handler.send_header('X-Attachment-ID', str(attachment_id))
     request_handler.send_header('X-Email-ID', clean_id)
+    # --- FIX: Manually inject CORS headers for the binary response ---
+    request_handler.send_header('Access-Control-Allow-Origin', '*')
+    request_handler.send_header('Access-Control-Expose-Headers', 'Content-Disposition, Content-Type, Content-Length')
     request_handler.end_headers()
     request_handler.wfile.write(file_data)
 
