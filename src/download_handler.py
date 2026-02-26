@@ -144,22 +144,49 @@ async def download_file(
             'is_parity': stripe.get('is_parity', False)
         })
 
-    # 3. Download Stripes (Encryption Type 0 / Plaintext)
+    # 4. Infer total data stripes from parity index
+    # Parity stripe index = num_data_stripes (e.g., parity at index 7 means 7 data stripes 0-6)
+    data_servers = [s for s in servers if not s['is_parity']]
+    parity_servers = [s for s in servers if s['is_parity']]
+    
+    # Determine expected number of data stripes
+    if parity_servers:
+        # Parity index tells us total data stripes (parity is always last)
+        parity_index = parity_servers[0]['stripe_id']
+        expected_data_stripes = parity_index  # e.g., parity at 7 means 7 data stripes (0-6)
+    else:
+        # No parity - assume all stripes are data
+        expected_data_stripes = len(data_servers)
+    
+    # Find which data stripe indices are missing from the Tell
+    available_indices = set(s['stripe_id'] for s in data_servers)
+    expected_indices = set(range(expected_data_stripes))
+    missing_from_tell = expected_indices - available_indices
+    
+    if missing_from_tell:
+        log_warning(db_handle.logger, DOWNLOAD_CONTEXT, 
+                    f"Stripe(s) {missing_from_tell} missing from Tell (upload failed). "
+                    f"Will use parity if only 1 missing during download.")
+
+    # 5. Download Stripes (Encryption Type 0 / Plaintext)
     file_guid_bytes = bytes.fromhex(file_guid.replace('-', ''))
     
     result = await download_all_stripes(
-        data_servers=[s for s in servers if not s['is_parity']],
-        parity_servers=[s for s in servers if s['is_parity']],
+        data_servers=data_servers,
+        parity_servers=parity_servers,
         file_guid=file_guid_bytes,
         locker_code=locker_code,
         file_type=file_type,
         denomination=denomination,
         serial_number=serial_number,
         device_id=device_id,
-        an=an or bytes(400), # Expecting full keyring block
+        an=an or bytes(400),
         logger_handle=db_handle.logger,
-        total_file_size=tell_info.get('total_file_size', 0)
+        total_file_size=tell_info.get('total_file_size', 0),
+        expected_data_stripes=expected_data_stripes,  # NEW PARAMETER
+        missing_from_tell=missing_from_tell  # NEW PARAMETER
     )
+    
 
     if not result.success:
         return b'', result.status
@@ -178,17 +205,42 @@ async def download_all_stripes(
     device_id: int,
     an: bytes,
     logger_handle: Optional[object] = None,
-    total_file_size: int = 0
+    total_file_size: int = 0,
+    expected_data_stripes: int = 0,  # Total data stripes used during encoding
+    missing_from_tell: set = None  # Stripe indices missing from Tell (upload failed)
 ) -> DownloadResult:
     """
     Downloads all stripes in parallel and reassembles the file.
     FIXED: Implements XOR parity recovery and propagates status codes for healing.
+    FIXED: Detects missing stripes from Tell (upload failures) and uses parity to recover.
     """
     result = DownloadResult(success=False, status=250)
     all_stripe_data = {}
     failed_stripes = []
     
-# 1. Parallel Execution of Data Stripe Downloads
+    # ========================================================================
+    # STEP 0: Use passed parameters or calculate from parity index
+    # ========================================================================
+    # Initialize missing_from_tell if not provided
+    if missing_from_tell is None:
+        missing_from_tell = set()
+    
+    # If expected_data_stripes not provided, calculate from parity index
+    if expected_data_stripes <= 0:
+        if parity_servers:
+            parity_index = parity_servers[0]['stripe_id']
+            expected_data_stripes = parity_index
+        else:
+            expected_data_stripes = len(data_servers) + len(missing_from_tell)
+    
+    if missing_from_tell:
+        log_warning(logger_handle, DOWNLOAD_CONTEXT, 
+                    f"Stripe(s) {missing_from_tell} missing from Tell (upload failed). "
+                    f"Will attempt parity recovery.")
+
+    # ========================================================================
+    # STEP 1: Parallel Download of Available Data Stripes
+    # ========================================================================
     async def _download_one(server):
         stripe_id = server['stripe_id']
         rid = server.get('raida_id', stripe_id)
@@ -232,12 +284,24 @@ async def download_all_stripes(
             log_warning(logger_handle, DOWNLOAD_CONTEXT,
                         f"Stripe {stripe_id} failed with status {getattr(stripe_res, 'status', 0)}")
 
-    # 2. Parity Recovery: If exactly one data stripe is missing
-    if len(failed_stripes) == 1 and parity_servers:
-        log_info(logger_handle, DOWNLOAD_CONTEXT, f"Attempting recovery for missing stripe {failed_stripes[0]}")
+    # ========================================================================
+    # STEP 2: Combine all missing stripes (from Tell + from download failures)
+    # ========================================================================
+    all_missing = missing_from_tell.union(set(failed_stripes))
+    
+    log_info(logger_handle, DOWNLOAD_CONTEXT,
+             f"Stripe status: {len(all_stripe_data)} downloaded, {len(all_missing)} missing "
+             f"(from Tell: {missing_from_tell}, from download: {set(failed_stripes)}), "
+             f"expected: {expected_data_stripes}")
+
+    # ========================================================================
+    # STEP 3: Parity Recovery (if exactly 1 stripe is missing total)
+    # ========================================================================
+    if len(all_missing) == 1 and parity_servers:
+        missing_id = list(all_missing)[0]
+        log_info(logger_handle, DOWNLOAD_CONTEXT, f"Attempting parity recovery for stripe {missing_id}")
         
         # Download the parity stripe
-    # Download the parity stripe
         parity_server = parity_servers[0]
         p_res = await download_stripe_with_pagination(
             server_info=parity_server['info'],
@@ -254,32 +318,48 @@ async def download_all_stripes(
         )
         
         if p_res.success:
-            missing_id = failed_stripes[0]
-            # Perform XOR Recovery Math
+            # Perform XOR Recovery: missing = parity XOR (all other stripes)
             recovered = await recover_stripe_with_parity(
                 available_stripes=all_stripe_data,
                 parity_data=p_res.data,
                 missing_stripe_id=missing_id,
-                total_data_stripes=len(data_servers),
+                total_data_stripes=expected_data_stripes,
                 logger_handle=logger_handle
             )
             
             if recovered:
                 all_stripe_data[missing_id] = recovered
                 result.stripes_recovered += 1
-                log_info(logger_handle, DOWNLOAD_CONTEXT, f"Stripe {missing_id} successfully recovered.")
+                all_missing.discard(missing_id)
+                log_info(logger_handle, DOWNLOAD_CONTEXT, 
+                         f"Stripe {missing_id} successfully recovered via parity ✓")
+            else:
+                log_error(logger_handle, DOWNLOAD_CONTEXT, 
+                          f"Parity recovery computation failed for stripe {missing_id}")
         else:
-            log_error(logger_handle, DOWNLOAD_CONTEXT, "Parity server also failed. Cannot recover.")
+            log_error(logger_handle, DOWNLOAD_CONTEXT, 
+                      f"Parity server also failed (status {p_res.status}). Cannot recover.")
+    
+    elif len(all_missing) > 1:
+        log_error(logger_handle, DOWNLOAD_CONTEXT, 
+                  f"Cannot recover: {len(all_missing)} stripes missing {all_missing}. "
+                  f"Parity can only recover 1 missing stripe.")
 
-    # 3. Final Reassembly (Bit-Interleaving)
-    if len(all_stripe_data) >= len(data_servers):
-        # Sort stripes by index (0, 1, 2, 3) for the Weaver
-        sorted_stripes = [all_stripe_data[sid] for sid in sorted(all_stripe_data.keys())]
+    # ========================================================================
+    # STEP 4: Final Reassembly (Bit-Interleaving)
+    # ========================================================================
+    if len(all_stripe_data) >= expected_data_stripes:
+        # Sort stripes by index (0, 1, 2, ...) for correct bit-interleaving
+        # Only include data stripes (indices 0 to expected_data_stripes-1)
+        sorted_stripes = []
+        for sid in range(expected_data_stripes):
+            if sid in all_stripe_data:
+                sorted_stripes.append(all_stripe_data[sid])
+            else:
+                log_error(logger_handle, DOWNLOAD_CONTEXT, f"Missing stripe {sid} for reassembly!")
+                result.error_message = f"Missing stripe {sid} for reassembly"
+                return result
         
-        # FIX: Bit-interleaving padding means sum(stripe_sizes) >= original_size.
-        # The difference is at most (num_stripes - 1) bits worth of padding.
-        # We reassemble with est_size then strip trailing null padding bytes.
-        # For proper binary support, sender should set total_file_size in .tell header.
         est_size = sum(len(s) for s in sorted_stripes)
         
         err, reassembled = striping.reassemble_upload_stripes(sorted_stripes, est_size, logger_handle)
@@ -306,11 +386,11 @@ async def download_all_stripes(
             if result.status != 200:
                 result.status = 250 
             log_info(logger_handle, DOWNLOAD_CONTEXT,
-                     f"Reassembled {len(sorted_stripes)} stripes -> {len(reassembled)} bytes")
+                     f"Reassembled {len(sorted_stripes)} stripes -> {len(reassembled)} bytes ✓")
         else:
             result.error_message = f"Reassembly failed with error {err}"
     else:
-        result.error_message = f"Insufficient stripes: {len(all_stripe_data)}/{len(data_servers)}"
+        result.error_message = f"Insufficient stripes: {len(all_stripe_data)}/{expected_data_stripes}"
 
     return result
 

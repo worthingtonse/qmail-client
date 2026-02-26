@@ -818,6 +818,47 @@ def start_periodic_healer(wallet_paths: List[str], logger: Any, interval_hours: 
     healer_thread.start()
 
 
+
+def start_pending_tells_processor(app_context: AppContext, interval_seconds: int = 300):
+    """
+    Background thread that periodically processes pending Tell notifications.
+    
+    Args:
+        app_context: Application context with db_handle, logger, config
+        interval_seconds: Seconds between retry cycles (default 5 minutes)
+    """
+    import time
+    from email_sender import process_pending_tells_background
+    
+    def processor_loop():
+        # Wait 60 seconds after app start before first check
+        time.sleep(60)
+        
+        while True:
+            try:
+                if app_context.db_handle and app_context.config:
+                    identity = app_context.config.identity
+                    if identity and identity.serial_number:
+                        processed, failed_permanent = process_pending_tells_background(
+                            db_handle=app_context.db_handle,
+                            identity=identity,
+                            logger_handle=app_context.logger,
+                            max_retries=5
+                        )
+                        if processed > 0 or failed_permanent > 0:
+                            log_info(app_context.logger, "PendingTells", 
+                                     f"Background retry: {processed} sent, {failed_permanent} permanently failed")
+            except Exception as e:
+                log_error(app_context.logger, "PendingTells", f"Background processor error: {e}")
+            
+            time.sleep(interval_seconds)
+    
+    processor_thread = threading.Thread(
+        target=processor_loop, name="PendingTellsProcessor", daemon=True)
+    processor_thread.start()
+    log_info(app_context.logger, "App", f"Started pending tells processor (interval: {interval_seconds}s)")
+
+
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
@@ -869,6 +910,9 @@ def main():
         logger=app_context.logger,
         interval_hours=1
     )
+
+    # Start background pending tells processor
+    start_pending_tells_processor(app_context, interval_seconds=300)
 
     # Shortcuts for common context items
     config = app_context.config

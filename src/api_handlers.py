@@ -445,6 +445,113 @@ def handle_mail_notifications(request_handler, context):
 # ============================================================================
 
 
+def handle_pending_tells_status(request_handler, context):
+    """
+    GET /api/mail/pending-tells - Get pending Tell notification status
+    """
+    from database import get_pending_tells, DatabaseErrorCode
+    
+    app_ctx = request_handler.server_instance.app_context
+    db_handle = app_ctx.db_handle
+    
+    # Get pending tells (currently retrying)
+    err, pending = get_pending_tells(db_handle, 'pending', limit=50)
+    pending_count = len(pending) if err == DatabaseErrorCode.SUCCESS else 0
+    
+    # Get failed tells (gave up)
+    err, failed = get_pending_tells(db_handle, 'failed', limit=50)
+    failed_count = len(failed) if err == DatabaseErrorCode.SUCCESS else 0
+    
+    # Get successfully sent tells (retries that worked)
+    err, sent = get_pending_tells(db_handle, 'sent', limit=50)
+    sent_count = len(sent) if err == DatabaseErrorCode.SUCCESS else 0
+    
+    response = {
+        "status": "success",
+        "pending_count": pending_count,
+        "failed_count": failed_count,
+        "sent_count": sent_count,
+        "pending": [
+            {
+                "tell_id": t['tell_id'],
+                "recipient": t['recipient_address'],
+                "retry_count": t['retry_count'],
+                "created": t['created_timestamp'],
+                "last_error": t.get('error_message', '')
+            }
+            for t in (pending if err == DatabaseErrorCode.SUCCESS else [])
+        ],
+        "failed": [
+            {
+                "tell_id": t['tell_id'],
+                "recipient": t['recipient_address'],
+                "retry_count": t['retry_count'],
+                "error": t.get('error_message', ''),
+                "file_guid": t['file_group_guid'].hex() if t.get('file_group_guid') else None
+            }
+            for t in (failed if err == DatabaseErrorCode.SUCCESS else [])
+        ],
+        "sent": [
+            {
+                "tell_id": t['tell_id'],
+                "recipient": t['recipient_address'],
+                "retry_count": t['retry_count'],
+                "completed": t['last_attempt_timestamp']
+            }
+            for t in (sent if err == DatabaseErrorCode.SUCCESS else [])
+        ]
+    }
+    request_handler.send_json_response(200, response)
+
+
+def handle_retry_failed_tell(request_handler, context):
+    """
+    POST /api/mail/pending-tells/{tell_id}/retry - Manually retry a failed Tell
+    """
+    from database import get_pending_tells, update_pending_tell_status, DatabaseErrorCode
+    
+    app_ctx = request_handler.server_instance.app_context
+    tell_id = int(request_handler.path_params.get('tell_id', 0))
+    
+    if not tell_id:
+        return request_handler.send_json_response(400, {"error": "tell_id required"})
+    
+    # Reset status to pending so background processor picks it up
+    err = update_pending_tell_status(
+        app_ctx.db_handle, tell_id, 'pending',
+        "Manual retry requested", increment_retry=False
+    )
+    
+    if err == DatabaseErrorCode.SUCCESS:
+        request_handler.send_json_response(200, {
+            "status": "success", 
+            "message": "Tell queued for retry"
+        })
+    else:
+        request_handler.send_json_response(404, {"error": "Tell not found"})
+
+def handle_clear_sent_tells(request_handler, context):
+    """
+    DELETE /api/mail/pending-tells/sent - Clear successfully sent tells from history
+    """
+    from database import get_pending_tells, delete_pending_tell, DatabaseErrorCode
+    
+    app_ctx = request_handler.server_instance.app_context
+    db_handle = app_ctx.db_handle
+    
+    err, sent = get_pending_tells(db_handle, 'sent', limit=100)
+    if err == DatabaseErrorCode.SUCCESS:
+        for t in sent:
+            delete_pending_tell(db_handle, t['tell_id'])
+    
+    request_handler.send_json_response(200, {
+        "status": "success",
+        "cleared": len(sent) if err == DatabaseErrorCode.SUCCESS else 0
+    })
+
+
+
+
 def handle_mail_send(request_handler, context):
     """
     POST /api/mail/send - Send an email
@@ -1034,7 +1141,7 @@ def _get_an_for_download(app_ctx):
             return an_bytes[:400]
 
     # 2. Scanner check
-    for bank in ["Data/Wallets/Mailbox/Bank", "Data/Wallets/Default/Bank"]:
+    for bank in ["Data/Wallets/Mailbox/Bank"]:
         coin = find_identity_coin(bank, numeric_sn)
         if coin:
             # Standardize based on what scanner returns (dict or object)
@@ -4406,6 +4513,9 @@ def register_all_routes(server):
     server.register_route("GET", '/api/admin/version-check', handle_version_check)
     server.register_route('GET', '/api/qmail/ping', handle_ping)
     server.register_route('GET', '/api/mail/notifications', handle_mail_notifications)
+    server.register_route('GET', '/api/mail/pending-tells', handle_pending_tells_status)
+    server.register_route('POST', '/api/mail/pending-tells/{tell_id}/retry', handle_retry_failed_tell)
+    server.register_route('DELETE', '/api/mail/pending-tells/sent', handle_clear_sent_tells)
 
     # Account / Identity
     server.register_route('GET', '/api/account/identity', handle_account_identity)

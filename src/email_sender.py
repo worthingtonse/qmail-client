@@ -55,6 +55,13 @@ from coin_break import break_coin
 from locker_put import put_to_locker, CoinForPut, PutResult
 from key_manager import get_keys_from_locker_code
 
+
+# Tell retry configuration
+TELL_IMMEDIATE_RETRIES = 2      # Retry immediately this many times
+TELL_IMMEDIATE_BACKOFF = 2.0    # Seconds between immediate retries
+TELL_MAX_BACKGROUND_RETRIES = 5 # Max retries in background processor
+TELL_BACKGROUND_INTERVAL = 300  # Seconds between background retry cycles (5 minutes)
+
 # Default fees for unregistered users
 DEFAULT_BEACON_FEE = 0.1
 DEFAULT_INBOX_FEE = 0.0  # Change this to charge unregistered users / ragistered users are charged according to the set by the reciepients in the user host file 
@@ -1737,13 +1744,13 @@ def send_email_async(
 
         # --- 7. NOTIFICATIONS & STORAGE (Success Path) ---
         update_state("NOTIFYING", 92, "Sending notifications...")
-        # Calculate original body size for receiver to trim correctly (envelope, not raw body)
         original_body_size = len(envelope_bytes) if envelope_bytes else 0
-        send_tell_notifications(
+        
+        _, tells_sent, tells_failed = send_tell_notifications(
             request=request, file_group_guid=state.file_group_guid,
             servers=servers, identity=identity, logger_handle=logger_handle,
             db_handle=db_handle, cc_handle=cc_handle, locker_code=state.locker_code,
-            upload_results=body_only_results,  # Only body stripes, not attachments
+            upload_results=body_only_results,
             total_file_size=original_body_size,
             config=config
         )
@@ -1752,8 +1759,15 @@ def send_email_async(
         store_sent_email(request, state.file_group_guid, result.upload_results, db_handle, logger_handle)
 
         result.success = True
-        result.error_code = SendEmailErrorCode.SUCCESS
-        update_state("COMPLETED", 100, "Email sent successfully")
+        
+        # Check if any notifications failed (stored in PendingTells for background retry)
+        if tells_failed > 0:
+            result.error_code = SendEmailErrorCode.SUCCESS  # Email uploaded successfully
+            result.error_message = f"Email sent. {tells_failed} recipient notification(s) pending retry."
+            update_state("COMPLETED", 100, f"Email sent ({tells_failed} notification(s) pending)")
+        else:
+            result.error_code = SendEmailErrorCode.SUCCESS
+            update_state("COMPLETED", 100, "Email sent successfully")
 
         return SendEmailErrorCode.SUCCESS, result
 
@@ -1775,9 +1789,7 @@ def send_email_async(
         update_state("FAILED", 0, str(e))
         return SendEmailErrorCode.ERR_PARTIAL_FAILURE, result
 # ============================================================================
-# STUB FUNCTIONS (to be implemented)
 # ============================================================================
-
 def send_tell_notifications(
     request: 'SendEmailRequest',
     file_group_guid: bytes,
@@ -1790,28 +1802,37 @@ def send_tell_notifications(
     upload_results: List['UploadResult'] = None,
     total_file_size: int = 0,
     config=None
-) -> ErrorCode:
+) -> Tuple[ErrorCode, int, int]:
     """
     Send Tell notifications to all recipients.
     
     IMPROVED: Pre-flight coin verification before recipient payment loop.
+    IMPROVED: Mid-tell healing on status 200 (same as stripe upload).
     
     Flow:
     1. Collect all recipients
     2. Calculate TOTAL fees needed (beacon + inbox for all)
     3. PRE-FLIGHT: Verify Bank coins, heal if needed
     4. Process each recipient (payment + send)
+    5. On status 200: Heal identity and retry
+    
+    Returns:
+        Tuple of (ErrorCode, tells_sent, tells_failed)
     """
     import asyncio
     import time
     import json
     import os
+    import shutil
     
     from qmail_types import ErrorCode, TellRecipient, TellServer
     from logger import log_info, log_debug, log_warning, log_error
     from database import get_user_by_address, insert_pending_tell, DatabaseErrorCode
 
     SENDER_CONTEXT = "TellNotify"
+    
+    # Track if we've already attempted healing this send
+    identity_healed_this_session = False
 
     # ================================================================
     # 1. Collect Recipients
@@ -1826,7 +1847,7 @@ def send_tell_notifications(
 
     if not all_recipients:
         log_debug(logger_handle, SENDER_CONTEXT, "No recipients for Tell notifications")
-        return ErrorCode.SUCCESS
+        return ErrorCode.SUCCESS, 0, 0
 
     log_info(logger_handle, SENDER_CONTEXT, 
              f"Processing Tell notifications for {len(all_recipients)} recipients")
@@ -1845,12 +1866,12 @@ def send_tell_notifications(
     # ================================================================
     if db_handle is None:
         log_warning(logger_handle, SENDER_CONTEXT, "No database handle - cannot look up beacons")
-        return ErrorCode.SUCCESS 
+        return ErrorCode.SUCCESS, 0, 0
     
     if locker_code is None or len(locker_code) < 8:
         log_warning(logger_handle, SENDER_CONTEXT, 
                     "No File Locker Code - recipients will not be able to download")
-        return ErrorCode.SUCCESS
+        return ErrorCode.SUCCESS, 0, 0
 
     # ================================================================
     # 4. Calculate TOTAL fees needed for PRE-FLIGHT
@@ -1890,6 +1911,7 @@ def send_tell_notifications(
              f"({len(all_recipients)} recipients) — "
              f"Beacon: {sum(bf for _, _, _, bf, _ in recipient_fee_info):.8f} CC, "
              f"Inbox: {sum(inf for _, _, _, _, inf in recipient_fee_info):.8f} CC")
+    
     # ================================================================
     # 5. PRE-FLIGHT: Verify Bank coins and heal if needed
     # ================================================================
@@ -1976,19 +1998,98 @@ def send_tell_notifications(
             if err == ErrorCode.SUCCESS:
                 tells_sent += 1
                 log_debug(logger_handle, SENDER_CONTEXT, f"Tell sent to {address} via {beacon_id}")
+                
             elif err == ErrorCode.ERR_INVALID_AN:
-                # Identity fracked - trigger healing and abort tells
+                # ============================================================
+                # MID-TELL REACTIVE HEALING (Same as stripe upload)
+                # Status 200 = Identity AN is fracked on beacon RAIDA
+                # Heal and retry, just like we do for stripe uploads
+                # ============================================================
                 tells_failed += 1
-                log_error(logger_handle, SENDER_CONTEXT, 
-                          f"Identity coin fracked (status 200). Triggering healing...")
-                try:
-                    from app import move_identity_to_fracked
-                    move_identity_to_fracked(identity, None, logger_handle)
-                except Exception as heal_ex:
-                    log_error(logger_handle, SENDER_CONTEXT, f"Healing trigger failed: {heal_ex}")
-                # Don't continue sending tells - identity needs healing first
-                break
+                log_warning(logger_handle, SENDER_CONTEXT, 
+                          f"Identity coin fracked on beacon (status 200). Attempting mid-tell healing...")
+                
+                if not identity_healed_this_session:
+                    try:
+                        from heal import heal_wallet
+                        from coin_scanner import find_identity_coin, load_coin_from_file
+                        
+                        mailbox_wallet = "Data/Wallets/Mailbox"
+                        mailbox_bank = os.path.join(mailbox_wallet, "Bank")
+                        
+                        # Find the identity coin
+                        id_coin = find_identity_coin(mailbox_bank, identity.serial_number)
+                        if id_coin:
+                            id_path = id_coin.get('file_path') if isinstance(id_coin, dict) else getattr(id_coin, 'file_path', None)
+                            
+                            if id_path and os.path.exists(id_path):
+                                # Move to Fracked folder
+                                fracked_dir = os.path.join(mailbox_wallet, "Fracked")
+                                os.makedirs(fracked_dir, exist_ok=True)
+                                shutil.move(id_path, os.path.join(fracked_dir, os.path.basename(id_path)))
+                                
+                                # Heal the wallet
+                                heal_res = heal_wallet(mailbox_wallet, max_iterations=3)
+                                log_info(logger_handle, SENDER_CONTEXT,
+                                         f"Mid-tell heal: {heal_res.total_fixed}/{heal_res.total_fracked} fixed")
+                                
+                                # Reload fresh ANs into the identity object
+                                healed_path = os.path.join(mailbox_bank, os.path.basename(id_path))
+                                if os.path.exists(healed_path):
+                                    healed_coin = load_coin_from_file(healed_path)
+                                    if healed_coin and healed_coin.ans:
+                                        hex_an_list = [an.hex() if isinstance(an, bytes) else str(an)
+                                                       for an in healed_coin.ans]
+                                        identity.authenticity_number = "".join(hex_an_list)
+                                        log_info(logger_handle, SENDER_CONTEXT,
+                                                 "Identity healed mid-tell ✓ — retrying with fresh ANs")
+                                        
+                                        # Clear beacon IP cache (force fresh lookup)
+                                        _beacon_ip_cache.clear()
+                                        
+                                        # RETRY this recipient with healed ANs
+                                        retry_err = _send_single_tell(
+                                            beacon_raida_id, beacon_id, tell_recipient, file_group_guid,
+                                            tell_servers, beacon_locker_bytes, identity, timestamp, logger_handle,
+                                            beacon_ip_cache=_beacon_ip_cache,
+                                            total_file_size=total_file_size,
+                                            max_retries=0  # Single attempt with healed ANs
+                                        )
+                                        
+                                        if retry_err == ErrorCode.SUCCESS:
+                                            tells_failed -= 1  # Undo the failed increment
+                                            tells_sent += 1
+                                            log_info(logger_handle, SENDER_CONTEXT, 
+                                                     f"Tell succeeded after healing for {address}")
+                                            identity_healed_this_session = True
+                                            continue  # Move to next recipient
+                        
+                        identity_healed_this_session = True  # Don't try healing again
+                        
+                    except Exception as heal_ex:
+                        log_error(logger_handle, SENDER_CONTEXT, f"Mid-tell healing failed: {heal_ex}")
+                        identity_healed_this_session = True  # Don't retry healing
+                
+                # Healing didn't help or already tried - store for background retry
+                if db_handle:
+                    server_list_json = json.dumps([{
+                        'stripe_index': s.stripe_index,
+                        'stripe_type': s.stripe_type,
+                        'ip_address': s.ip_address,
+                        'port': s.port
+                    } for s in tell_servers])
+                    
+                    insert_pending_tell(
+                        db_handle, file_group_guid, address, r_type,
+                        beacon_id, locker_code, server_list_json,
+                        beacon_locker_hex=beacon_locker_bytes.hex(),
+                        inbox_locker_hex=recipient_locker_bytes.hex()
+                    )
+                
+                # DON'T break - continue to next recipient (ANs now healed, others may succeed)
+                
             else:
+                # Network error or other failure - store for retry
                 tells_failed += 1
                 log_warning(logger_handle, SENDER_CONTEXT, f"Tell failed for {address} via {beacon_id}")
 
@@ -2014,8 +2115,7 @@ def send_tell_notifications(
 
     log_info(logger_handle, SENDER_CONTEXT, 
              f"Tell notifications: {tells_sent} sent, {tells_failed} failed")
-    return ErrorCode.SUCCESS
-
+    return ErrorCode.SUCCESS, tells_sent, tells_failed
 
 def _preflight_verify_for_tells(
     wallet_path: str,
@@ -2095,96 +2195,96 @@ def _send_single_tell(
     timestamp: int,
     logger_handle: Optional[object] = None,
     beacon_ip_cache: Optional[Dict] = None,
-    total_file_size: int = 0
+    total_file_size: int = 0,
+    max_retries: int = TELL_IMMEDIATE_RETRIES
 ) -> ErrorCode:
     """
-    Deliver Tell notification with TCP-to-UDP fallback.
+    Deliver Tell notification with retry logic 
     """
     from network import ServerInfo, connect_to_server, send_raw_request, disconnect, NetworkErrorCode
     from protocol import build_complete_tell_request, TELL_TYPE_QMAIL, validate_tell_response
     
-    # 1. Prepare AN for this specific RAIDA (Used for Packet Authentication)
-    target_an = bytes(16)
+    last_error = ErrorCode.ERR_NETWORK
     
-    hex_an = getattr(identity, 'authenticity_number', '')
-    if hex_an and len(hex_an) >= 800:
-        try:
-            start_idx = raida_id * 32 # 32 hex chars = 16 bytes
-            an_slice_hex = hex_an[start_idx : start_idx + 32]
-            target_an = bytes.fromhex(an_slice_hex)
-        except Exception:
-            pass 
+    for attempt in range(max_retries + 1):  # +1 for initial attempt
+        if attempt > 0:
+            log_info(logger_handle, "EmailSender", 
+                     f"Tell retry {attempt}/{max_retries} for RAIDA {raida_id}")
+            time.sleep(TELL_IMMEDIATE_BACKOFF * attempt)  # Exponential backoff
+        
+        # 1. Prepare AN for this specific RAIDA
+        target_an = bytes(16)
+        hex_an = getattr(identity, 'authenticity_number', '')
+        if hex_an and len(hex_an) >= 800:
+            try:
+                start_idx = raida_id * 32
+                an_slice_hex = hex_an[start_idx : start_idx + 32]
+                target_an = bytes.fromhex(an_slice_hex)
+            except Exception:
+                pass 
 
-    # 2. Build the request
-    # locker_code: The File Access Code (allows recipient to download file)
-    # recipient.locker_payment_key: The Notification Fee (0.1 CC for this Tell)
-    err, request_bytes, challenge, nonce = build_complete_tell_request(
-    raida_id=raida_id,
-    denomination=getattr(identity, 'denomination', 1),
-    serial_number=getattr(identity, 'serial_number', 0),
-    device_id=0,
-    an=target_an,
-    file_group_guid=file_group_guid,
-    beacon_payment_locker=locker_code,  # This is the beacon payment (was just 'locker_code')
-    timestamp=timestamp,
-    tell_type=TELL_TYPE_QMAIL,
-    recipients=[recipient],
-    servers=servers,
-    logger_handle=logger_handle,
-    total_file_size=total_file_size
-)
+        # 2. Build the request
+        err, request_bytes, challenge, nonce = build_complete_tell_request(
+            raida_id=raida_id,
+            denomination=getattr(identity, 'denomination', 1),
+            serial_number=getattr(identity, 'serial_number', 0),
+            device_id=0,
+            an=target_an,
+            file_group_guid=file_group_guid,
+            beacon_payment_locker=locker_code,
+            timestamp=timestamp,
+            tell_type=TELL_TYPE_QMAIL,
+            recipients=[recipient],
+            servers=servers,
+            logger_handle=logger_handle,
+            total_file_size=total_file_size
+        )
 
-    if err != 0:
-        return ErrorCode.ERR_PROTOCOL
+        if err != 0:
+            last_error = ErrorCode.ERR_PROTOCOL
+            continue
 
-    # 3. Try TCP Port 50000+
-    # host = f"{beacon_id}.cloudcoin.global"
-    # s_info = ServerInfo(host=host, port=50000 + raida_id, raida_id=raida_id)
-    # 3. Try TCP Port 50000+ (resolve beacon IP from host file, not DNS)
-   # 3. Resolve beacon IP (cached across recipients)
-    import urllib.request as _urlreq
-    _beacon_ip = (beacon_ip_cache or {}).get(raida_id)
-    if not _beacon_ip:
-        try:
-            _req = _urlreq.Request("https://raida11.cloudcoin.global/service/raida_servers",
-                                   headers={'User-Agent': 'QMail-Tell/1.0'})
-            with _urlreq.urlopen(_req, timeout=10) as _resp:
-                _lines = _resp.read().decode('utf-8').strip().split('\n')
-                if raida_id < len(_lines):
-                    _beacon_ip = _lines[raida_id].strip().split(':')[0]
-                    if beacon_ip_cache is not None:
-                        beacon_ip_cache[raida_id] = _beacon_ip
-        except Exception:
-            pass
-    if not _beacon_ip:
-        return ErrorCode.ERR_NETWORK
-    s_info = ServerInfo(host=_beacon_ip, port=50000 + raida_id, raida_id=raida_id)
-    err_conn, conn = connect_to_server(s_info, logger_handle=logger_handle)
-    
-    if err_conn == NetworkErrorCode.SUCCESS and conn:
-        try:
-            net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
-            if net_err == NetworkErrorCode.SUCCESS and resp:
-                if resp.status == 250:
-                    return ErrorCode.SUCCESS
-                elif resp.status == 200:
-                    # Identity coin fracked - return specific error
-                    log_warning(logger_handle, "EmailSender", f"TELL failed: Invalid AN (status 200) on RAIDA {raida_id}")
-                    return ErrorCode.ERR_INVALID_AN
-        finally:
-            disconnect(conn)
+        # 3. Resolve beacon IP
+        import urllib.request as _urlreq
+        _beacon_ip = (beacon_ip_cache or {}).get(raida_id)
+        if not _beacon_ip:
+            try:
+                _req = _urlreq.Request("https://raida11.cloudcoin.global/service/raida_servers",
+                                       headers={'User-Agent': 'QMail-Tell/1.0'})
+                with _urlreq.urlopen(_req, timeout=10) as _resp:
+                    _lines = _resp.read().decode('utf-8').strip().split('\n')
+                    if raida_id < len(_lines):
+                        _beacon_ip = _lines[raida_id].strip().split(':')[0]
+                        if beacon_ip_cache is not None:
+                            beacon_ip_cache[raida_id] = _beacon_ip
+            except Exception:
+                pass
+        
+        if not _beacon_ip:
+            last_error = ErrorCode.ERR_NETWORK
+            continue
+            
+        s_info = ServerInfo(host=_beacon_ip, port=50000 + raida_id, raida_id=raida_id)
+        err_conn, conn = connect_to_server(s_info, logger_handle=logger_handle)
+        
+        if err_conn == NetworkErrorCode.SUCCESS and conn:
+            try:
+                net_err, resp, _ = send_raw_request(conn, request_bytes, logger_handle=logger_handle)
+                if net_err == NetworkErrorCode.SUCCESS and resp:
+                    if resp.status == 250:
+                        return ErrorCode.SUCCESS  # Success! Exit immediately
+                    elif resp.status == 200:
+                        log_warning(logger_handle, "EmailSender", 
+                                    f"TELL failed: Invalid AN (status 200) on RAIDA {raida_id}")
+                        return ErrorCode.ERR_INVALID_AN  # Don't retry - identity issue
+                    else:
+                        last_error = ErrorCode.ERR_NETWORK
+            finally:
+                disconnect(conn)
+        else:
+            last_error = ErrorCode.ERR_NETWORK
 
-    return ErrorCode.ERR_NETWORK
-
-    # # 4. FALLBACK: UDP Port 19000
-    # log_info(logger_handle, "EmailSender", f"TCP failed, trying UDP for {beacon_id}")
-    
-    # # Assuming _send_udp_request is available in the module scope
-    # response = _send_udp_request(host, 19000, request_bytes, logger_handle)
-    # if response:
-    #     _, status, _ = validate_tell_response(response, challenge, logger_handle)
-    #     if status == 250:
-    #         return ErrorCode.SUCCESS
+    return last_error  # All retries exhausted
 
    
 
@@ -2501,6 +2601,142 @@ def _process_pending_tells(
                  f"Processed {sent_count} pending tells successfully")
 
     return sent_count
+
+
+def process_pending_tells_background(
+    db_handle: object,
+    identity: 'IdentityConfig',
+    logger_handle: Optional[object] = None,
+    max_retries: int = 5
+) -> Tuple[int, int]:
+    """
+    Background processor for pending Tell notifications.
+    
+    Args:
+        db_handle: Database handle
+        identity: User identity
+        logger_handle: Optional logger handle
+        max_retries: Maximum retry attempts before marking permanently failed
+        
+    Returns:
+        Tuple of (successfully_sent_count, permanently_failed_count)
+    """
+    from database import get_pending_tells, update_pending_tell_status, delete_pending_tell, DatabaseErrorCode
+    
+    err, pending = get_pending_tells(db_handle, 'pending', limit=20)
+    if err != DatabaseErrorCode.SUCCESS or not pending:
+        return 0, 0
+    
+    log_info(logger_handle, "PendingTells", 
+             f"Processing {len(pending)} pending Tell notifications")
+    
+    sent_count = 0
+    failed_permanent_count = 0
+    timestamp = int(time.time())
+    _beacon_ip_cache = {}
+    
+    for tell in pending:
+        tell_id = tell['tell_id']
+        retry_count = tell.get('retry_count', 0)
+        
+        # Check if exceeded max retries
+        if retry_count >= max_retries:
+            update_pending_tell_status(
+                db_handle, tell_id, 'failed',
+                f"Permanently failed after {max_retries} retries"
+            )
+            failed_permanent_count += 1
+            log_warning(logger_handle, "PendingTells", 
+                        f"Tell {tell_id} permanently failed after {max_retries} retries")
+            continue
+        
+        # Get stored locker codes
+        beacon_locker_hex = tell.get('beacon_locker_hex')
+        inbox_locker_hex = tell.get('inbox_locker_hex')
+        
+        if not beacon_locker_hex:
+            # No stored payment - need to create fresh (this costs coins)
+            log_warning(logger_handle, "PendingTells",
+                        f"Tell {tell_id} has no stored beacon locker - creating fresh payment")
+            try:
+                err_code, new_hex = asyncio.run(create_recipient_locker(
+                    "Data/Wallets/Default", DEFAULT_BEACON_FEE, 
+                    identity.serial_number, logger_handle
+                ))
+                if err_code != 0 or not new_hex:
+                    update_pending_tell_status(
+                        db_handle, tell_id, 'pending',
+                        f"Retry {retry_count + 1}: Could not create beacon payment",
+                        increment_retry=True
+                    )
+                    continue
+                beacon_locker_hex = new_hex
+            except Exception as e:
+                log_error(logger_handle, "PendingTells", f"Payment creation failed: {e}")
+                continue
+        
+        beacon_locker_bytes = bytes.fromhex(beacon_locker_hex)[:8]
+        inbox_locker_bytes = bytes.fromhex(inbox_locker_hex)[:16] if inbox_locker_hex else bytes(16)
+        
+        # Get beacon info
+        beacon_id = tell['beacon_server_id']
+        raida_id = _beacon_id_to_raida_index(beacon_id)
+        
+        # Parse server list
+        try:
+            server_list = json.loads(tell['server_list_json'])
+            tell_servers = [TellServer(
+                stripe_index=s.get('stripe_index', 0),
+                stripe_type=s.get('stripe_type', 0),
+                ip_address=s.get('ip_address', ''),
+                port=s.get('port', DEFAULT_BEACON_PORT),
+                locker_code=beacon_locker_bytes[:8]
+            ) for s in server_list]
+        except (json.JSONDecodeError, TypeError):
+            tell_servers = []
+        
+        # Build recipient
+        coin_id, denom, serial = _parse_qmail_address(tell['recipient_address'])
+        recipient = TellRecipient(
+            address_type=tell.get('recipient_type', 0),
+            coin_id=coin_id,
+            denomination=denom,
+            serial_number=serial,
+            locker_payment_key=inbox_locker_bytes
+        )
+        
+        # Send Tell (no immediate retries - background processor handles retries)
+        err = _send_single_tell(
+            raida_id, beacon_id, recipient, tell['file_group_guid'],
+            tell_servers, beacon_locker_bytes, identity, timestamp, logger_handle,
+            beacon_ip_cache=_beacon_ip_cache,
+            max_retries=0  # No immediate retries in background
+        )
+        
+        if err == ErrorCode.SUCCESS:
+            # Mark as 'sent' instead of deleting - so user can see it succeeded
+            update_pending_tell_status(
+                db_handle, tell_id, 'sent',
+                f"Successfully sent on retry {retry_count + 1}"
+            )
+            sent_count += 1
+            log_info(logger_handle, "PendingTells", 
+                     f"Pending tell {tell_id} sent successfully on retry {retry_count + 1}")
+        elif err == ErrorCode.ERR_INVALID_AN:
+            # Identity issue - don't keep retrying
+            update_pending_tell_status(
+                db_handle, tell_id, 'failed',
+                "Identity coin fracked - requires healing"
+            )
+            failed_permanent_count += 1
+        else:
+            update_pending_tell_status(
+                db_handle, tell_id, 'pending',
+                f"Retry {retry_count + 1} failed: network error",
+                increment_retry=True
+            )
+    
+    return sent_count, failed_permanent_count
 
 def verify_an_loading(mailbox_file: str, logger_handle: Optional[object] = None):
     """
