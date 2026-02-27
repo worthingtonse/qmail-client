@@ -2144,22 +2144,42 @@ def handle_mail_delete_permanent(request_handler, context):
         email_id_bytes = bytes.fromhex(clean_id)
         cursor = db_handle.connection.cursor()
         
-        # Check if email exists and is trashed
+        # Check if email exists and is trashed (could be in Emails table, received_tells, or both)
+        email_hex = clean_id.upper()
         cursor.execute("SELECT is_trashed FROM Emails WHERE EmailID = ?", (email_id_bytes,))
         row = cursor.fetchone()
         
-        if row is None:
+        cursor.execute("SELECT is_trashed FROM received_tells WHERE file_guid = ?", (email_hex,))
+        tell_row = cursor.fetchone()
+        
+        if row is None and tell_row is None:
             return request_handler.send_json_response(404, {"error": "Email not found"})
         
-        if not row['is_trashed']:
+        # Check trashed status - must be trashed in whichever table it exists in
+        is_trashed = False
+        if row and row['is_trashed']:
+            is_trashed = True
+        if tell_row and tell_row['is_trashed']:
+            is_trashed = True
+        
+        if not is_trashed:
             return request_handler.send_json_response(400, {
                 "error": "Email must be in trash before permanent deletion. Use DELETE /api/mail/{id} first."
             })
+        
         
         # Permanently delete from all tables
         cursor.execute("DELETE FROM Junction_Email_Users WHERE EmailID = ?", (email_id_bytes,))
         cursor.execute("DELETE FROM Attachments WHERE EmailID = ?", (email_id_bytes,))
         cursor.execute("DELETE FROM Emails WHERE EmailID = ?", (email_id_bytes,))
+        
+        # Also delete from received_tells and received_stripes
+        email_hex = clean_id.upper()
+        cursor.execute("SELECT id FROM received_tells WHERE file_guid = ?", (email_hex,))
+        tell_row = cursor.fetchone()
+        if tell_row:
+            cursor.execute("DELETE FROM received_stripes WHERE tell_id = ?", (tell_row['id'],))
+            cursor.execute("DELETE FROM received_tells WHERE id = ?", (tell_row['id'],))
         
         db_handle.connection.commit()
         

@@ -478,6 +478,12 @@ def init_database(db_path: str, logger: Any = None) -> Tuple[DatabaseErrorCode, 
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        try:
+            cursor.execute("ALTER TABLE received_tells ADD COLUMN is_trashed INTEGER DEFAULT 0")
+            log_info(logger, "Database", "Migrating: Adding is_trashed to received_tells")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         connection.commit()
         log_info(logger, "Database", f"Database initialized and migrated: {db_path}")
         
@@ -1610,24 +1616,38 @@ def delete_email(
 
     try:
         cursor = handle.connection.cursor()
+        email_hex = email_id.hex().upper()
 
-        # Check if email exists and get current trashed status
+        # Check Emails table first
         cursor.execute("""
             SELECT is_trashed FROM Emails WHERE EmailID = ?
         """, (email_id,))
-
         row = cursor.fetchone()
-        if row is None:
+
+        # Also check received_tells (inbox emails may only exist here)
+        cursor.execute("""
+            SELECT is_trashed FROM received_tells WHERE file_guid = ?
+        """, (email_hex,))
+        tell_row = cursor.fetchone()
+
+        if row is None and tell_row is None:
             return DatabaseErrorCode.ERR_NOT_FOUND, False
 
-        # If already trashed, return success but not modified
-        if row['is_trashed']:
+        # If already trashed in both places, return not modified
+        emails_trashed = row['is_trashed'] if row else True
+        tells_trashed = tell_row['is_trashed'] if tell_row else True
+        if emails_trashed and tells_trashed:
             return DatabaseErrorCode.SUCCESS, False
-
         # Set is_trashed = 1 (soft delete)
         cursor.execute("""
             UPDATE Emails SET is_trashed = 1 WHERE EmailID = ?
         """, (email_id,))
+
+        # Also mark in received_tells (inbox emails live here)
+        email_hex = email_id.hex().upper()
+        cursor.execute("""
+            UPDATE received_tells SET is_trashed = 1 WHERE file_guid = ?
+        """, (email_hex,))
 
         handle.connection.commit()
 
@@ -1892,6 +1912,7 @@ def list_emails(
                        r.download_status, r.sender_sn, u.auto_address as contact_pretty
                 FROM received_tells r
                 LEFT JOIN Users u ON r.sender_sn = u.SerialNumber
+                WHERE (r.is_trashed = 0 OR r.is_trashed IS NULL)
                 ORDER BY r.created_at DESC
                 LIMIT ? OFFSET ?
             """, (limit, offset))
@@ -1923,8 +1944,73 @@ def list_emails(
                     'folder': 'inbox',
                     'sender': sender_address  # Added sender mapping here
                 })
+        elif folder == 'trash':
+            # Trash: pull trashed emails from Emails table
+            cursor.execute("""
+                SELECT 
+                    e.EmailID, e.Subject, e.ReceivedTimestamp, e.SentTimestamp,
+                    e.is_read, e.is_starred, e.is_trashed, e.folder,
+                    u.auto_address as contact_pretty
+                FROM Emails e
+                LEFT JOIN Junction_Email_Users j ON e.EmailID = j.EmailID 
+                LEFT JOIN Users u ON j.SerialNumber = u.SerialNumber
+                WHERE e.is_trashed = 1
+                  AND (j.user_type = 'TO' OR j.user_type = 'FROM')
+                GROUP BY e.EmailID
+                ORDER BY e.ReceivedTimestamp DESC
+                LIMIT ? OFFSET ?
+            """, (limit, offset))
+            
+            rows = cursor.fetchall()
+            emails = []
+            seen_ids = set()
+            for row in rows:
+                e = dict(row)
+                e['is_read'] = bool(e['is_read'])
+                e['is_starred'] = bool(e['is_starred'])
+                e['is_trashed'] = True
+                e['folder'] = 'trash'
+                e['sender'] = e.get('contact_pretty') or "Unknown Sender"
+                emails.append(e)
+                # Track EmailID to avoid duplicates with received_tells
+                eid = e['EmailID']
+                seen_ids.add(eid.hex().upper() if isinstance(eid, bytes) else str(eid).upper())
+
+            # Also pull trashed inbox emails from received_tells
+            try:
+                from data_sync import convert_to_custom_base32
+            except ImportError:
+                convert_to_custom_base32 = lambda sn: str(sn)
+
+            cursor.execute("""
+                SELECT r.file_guid as EmailID, r.tell_type, r.created_at as ReceivedTimestamp,
+                       r.download_status, r.sender_sn, u.auto_address as contact_pretty
+                FROM received_tells r
+                LEFT JOIN Users u ON r.sender_sn = u.SerialNumber
+                WHERE r.is_trashed = 1
+                ORDER BY r.created_at DESC
+            """)
+            for row in cursor.fetchall():
+                if row['EmailID'] and row['EmailID'].upper() not in seen_ids:
+                    sender_address = row['contact_pretty']
+                    sender_sn = row['sender_sn']
+                    if not sender_address and sender_sn:
+                        base32_sn = convert_to_custom_base32(sender_sn)
+                        sender_address = f"User.User@Unregistered#{base32_sn}.Bit"
+                    elif not sender_address:
+                        sender_address = "Unknown Sender"
+                    emails.append({
+                        'EmailID': row['EmailID'],
+                        'Subject': f"New Mail ({row['EmailID'][:8]})",
+                        'ReceivedTimestamp': row['ReceivedTimestamp'],
+                        'is_read': bool(row['download_status']),
+                        'is_trashed': True,
+                        'folder': 'trash',
+                        'sender': sender_address
+                    })
+
         else:
-            # Sent/Drafts/Trash query with JOIN to get Pretty Name
+            # Sent/Drafts query with JOIN to get Pretty Name
             cursor.execute("""
                 SELECT 
                     e.EmailID, e.Subject, e.ReceivedTimestamp, e.SentTimestamp,
@@ -1948,7 +2034,7 @@ def list_emails(
                 e['is_read'] = bool(e['is_read'])
                 e['is_starred'] = bool(e['is_starred'])
                 e['is_trashed'] = bool(e['is_trashed'])
-                e['sender'] = e.get('contact_pretty') or "Unknown Sender" # Added sender mapping here
+                e['sender'] = e.get('contact_pretty') or "Unknown Sender"
                 emails.append(e)
 
         log_debug(handle.logger, "Database", f"Listed {len(emails)} emails from '{folder}'")
@@ -2183,12 +2269,12 @@ def get_folder_counts(
                 counts[folder]['total'] = row['total']
                 counts[folder]['unread'] = row['unread'] or 0
 
-        # Query 2: Pending tells (not yet downloaded) - count as inbox
+        # Query 2: Pending tells (not yet downloaded, not trashed) - count as inbox
         cursor.execute("""
             SELECT COUNT(*) as total,
                    SUM(CASE WHEN read_status = 0 THEN 1 ELSE 0 END) as unread
             FROM received_tells
-            WHERE download_status = 0
+            WHERE download_status = 0 AND (is_trashed = 0 OR is_trashed IS NULL)
         """)
 
         tells_row = cursor.fetchone()
@@ -2196,6 +2282,7 @@ def get_folder_counts(
             counts['inbox']['total'] += tells_row['total'] or 0
             counts['inbox']['unread'] += tells_row['unread'] or 0
 
+        # Query 3: Trash folder - count all trashed emails regardless of original folder
         # Query 3: Trash folder - count all trashed emails regardless of original folder
         cursor.execute("""
             SELECT COUNT(*) as total,
@@ -2208,6 +2295,18 @@ def get_folder_counts(
         if trash_row:
             counts['trash']['total'] = trash_row['total'] or 0
             counts['trash']['unread'] = trash_row['unread'] or 0
+
+        # Also count trashed received_tells
+        cursor.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN read_status = 0 THEN 1 ELSE 0 END) as unread
+            FROM received_tells
+            WHERE is_trashed = 1
+        """)
+        trash_tells_row = cursor.fetchone()
+        if trash_tells_row:
+            counts['trash']['total'] += trash_tells_row['total'] or 0
+            counts['trash']['unread'] += trash_tells_row['unread'] or 0
 
         return DatabaseErrorCode.SUCCESS, counts
 
