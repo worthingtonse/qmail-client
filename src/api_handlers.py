@@ -1976,54 +1976,55 @@ def handle_mail_get(request_handler, context):
     """
     from src.logger import log_error
     from src.database import retrieve_email, get_attachments_for_email, DatabaseErrorCode
-
+ 
     app_ctx = request_handler.server_instance.app_context
     db_handle = app_ctx.db_handle
-
+ 
     email_id = context.path_params.get('id')
     is_valid, clean_id, error_msg = _validate_email_id(email_id)
     if not is_valid:
         return request_handler.send_json_response(400, {"error": "Invalid id", "details": error_msg})
-
+ 
     # --- THE CRITICAL FIX: Convert hex string to bytes for retrieve_email ---
     clean_id_bytes = bytes.fromhex(clean_id)
-
+ 
     # 1. Try downloaded emails using the bytes ID so SQLite BLOB search works!
     err, email_data = retrieve_email(db_handle, clean_id_bytes)
-
+ 
     if err == DatabaseErrorCode.SUCCESS:
         email_data['downloaded'] = True
-        
+        # Ensure the frontend knows this is trashed so it shows "Delete Permanently"
+        if email_data.get('is_trashed'):
+            email_data['folder'] = 'trash'
+            email_data['isTrashed'] = True
         # Fetch attachment metadata
         att_err, attachments = get_attachments_for_email(db_handle, clean_id_bytes)
         if att_err == DatabaseErrorCode.SUCCESS:
             email_data['attachments'] = attachments
         else:
             email_data['attachments'] = []
-
+ 
         # Prevent "Object of type bytes is not JSON serializable" crashes
         for key, value in list(email_data.items()):
             if isinstance(value, bytes):
                 email_data[key] = value.hex()
-
+ 
         return request_handler.send_json_response(200, email_data)
-
+ 
     # 2. Check pending tells (Fallback for undownloaded mail)
     if err == DatabaseErrorCode.ERR_NOT_FOUND:
         try:
             cursor = db_handle.connection.cursor()
-            # FIX: Added sender_sn to the SELECT query
-            cursor.execute("SELECT file_guid, created_at, locker_code, sender_sn FROM received_tells WHERE file_guid = ?", (clean_id,))
+            # FIX: Added sender_sn AND is_trashed to the SELECT query
+            cursor.execute("SELECT file_guid, created_at, locker_code, sender_sn, is_trashed FROM received_tells WHERE file_guid = ?", (clean_id.upper(),))
             row = cursor.fetchone()
-            
             if row:
                 locker_code = row['locker_code']
                 locker_hex = locker_code.hex() if isinstance(locker_code, bytes) else str(locker_code)
-
+ 
                 # FIX: Build the sender object dynamically
                 sender_sn = row['sender_sn']
                 sender_address = "Unknown Sender"
-                
                 if sender_sn:
                     cursor.execute("SELECT auto_address FROM Users WHERE SerialNumber = ?", (sender_sn,))
                     u_row = cursor.fetchone()
@@ -2036,16 +2037,20 @@ def handle_mail_get(request_handler, context):
                         except ImportError:
                             b32_sn = str(sender_sn)
                         sender_address = f"User.User@Unregistered#{b32_sn}.Bit"
-
+ 
+                is_trashed = bool(row['is_trashed']) if row['is_trashed'] is not None else False
+ 
                 return request_handler.send_json_response(200, {
                     "EmailID": row['file_guid'],
                     "Subject": f"New Mail ({row['file_guid'][:8]})",
                     "ReceivedTimestamp": row['created_at'],
                     "is_read": False,
-                    "downloaded": False,
+                    # Pretend it's downloaded if trashed so the Download button vanishes
+                    "downloaded": True if is_trashed else False,
                     "locker_code": locker_hex,
-                    "folder": "inbox",
-                    "body": "", 
+                    "folder": "trash" if is_trashed else "inbox",
+                    "isTrashed": is_trashed,
+                    "body": "This undownloaded email was moved to trash." if is_trashed else "",
                     "attachments": [],
                     # FIX: Inject sender object so React's getEmailById maps it correctly!
                     "sender": {"auto_address": sender_address}
@@ -2053,7 +2058,7 @@ def handle_mail_get(request_handler, context):
         except Exception as e:
             log_error(app_ctx.logger, "API", f"Error checking tells: {e}")
             return request_handler.send_json_response(500, {"error": "Database error"})
-
+ 
     return request_handler.send_json_response(404, {"error": "Email not found"})
 def handle_mail_delete(request_handler, context):
     """
